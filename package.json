@@ -1,0 +1,95 @@
+{
+  "name": "@dee-wan/cache",
+  "version": "0.0.0-development",
+  "description": "Prisma read cache for Cloudflare Workers and D1, coordinated by a Durable Object",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./cloudflare": {
+      "types": "./dist/cloudflare/index.d.ts",
+      "import": "./dist/cloudflare/index.js",
+      "default": "./dist/cloudflare/index.js"
+    },
+    "./generator": {
+      "types": "./dist/generator/config.d.ts",
+      "import": "./dist/generator/config.js",
+      "default": "./dist/generator/config.js"
+    }
+  },
+  "bin": {
+    "dee-wan-cache-generator": "./dist/generator/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "docs/*.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dee-wan-cms/cache.git"
+  },
+  "bugs": {
+    "url": "https://github.com/dee-wan-cms/cache/issues"
+  },
+  "homepage": "https://github.com/dee-wan-cms/cache#readme",
+  "scripts": {
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsup",
+    "typecheck": "npm run test:prepare && tsc --noEmit -p tsconfig.json && tsc -p test/tsconfig.worker.json && tsc -p test/tsconfig.node.json",
+    "test": "npm run test:unit && npm run test:workerd",
+    "test:unit": "vitest run --config vitest.unit.config.ts",
+    "test:workerd": "vitest run --config vitest.workerd.config.ts",
+    "prepublishOnly": "npm run build",
+    "release": "semantic-release",
+    "test:deployed": "vitest run --config vitest.deployed.config.ts",
+    "test:prepare": "npm run build && cd test/workerd && prisma generate --schema prisma/schema.prisma",
+    "lint": "eslint .",
+    "test:consumer": "vitest run --config vitest.consumer.config.ts"
+  },
+  "dependencies": {
+    "@prisma/generator-helper": "~6.19.3"
+  },
+  "peerDependencies": {
+    "@prisma/client": ">=6.19.3 <7"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260730.1",
+    "@eslint/js": "^9.39.5",
+    "@prisma/adapter-d1": "6.19.3",
+    "@prisma/client": "6.19.3",
+    "@semantic-release/changelog": "^6.0.3",
+    "@semantic-release/git": "^10.0.1",
+    "@types/node": "^24.3.0",
+    "eslint": "^9.39.5",
+    "miniflare": "4.20260730.0",
+    "prisma": "6.19.3",
+    "semantic-release": "^25.0.2",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.67.0",
+    "vitest": "^3.2.4",
+    "wrangler": "4.116.0"
+  },
+  "allowScripts": {
+    "@prisma/client": false,
+    "@prisma/engines@6.19.3": true,
+    "esbuild@0.27.7": true,
+    "esbuild@0.28.1": true,
+    "fsevents": false,
+    "prisma@6.19.3": true,
+    "workerd@1.20260730.1": true
+  }
+}

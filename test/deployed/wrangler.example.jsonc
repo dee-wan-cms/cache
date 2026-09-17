@@ -1,0 +1,9 @@
+{
+  "name": "dee-wan-cache-smoke",
+  "main": "../workerd/worker/a.ts",
+  "compatibility_date": "2025-08-01",
+  "workers_dev": true,
+  "d1_databases": [{ "binding": "DB", "database_name": "dee-wan-cache-smoke", "database_id": "<disposable D1 database id>" }],
+  "durable_objects": { "bindings": [{ "name": "COORDINATOR", "class_name": "CacheCoordinator" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["CacheCoordinator"] }]
+}

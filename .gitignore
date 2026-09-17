@@ -1,0 +1,7 @@
+node_modules
+dist
+coverage
+.wrangler
+test/workerd/.build
+test/workerd/generated
+test/deployed/.smoke

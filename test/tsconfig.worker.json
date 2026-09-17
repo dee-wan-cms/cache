@@ -1,0 +1,9 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["@cloudflare/workers-types"],
+    "paths": { "@dee-wan/cache": ["../src/index.ts"] }
+  },
+  "include": ["workerd/worker/**/*.ts", "workerd/generated/cache/*.ts"]
+}

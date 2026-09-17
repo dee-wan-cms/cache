@@ -1,0 +1,10 @@
+export const MAX_LOCK_MS = 300_000;
+export const MAX_LEASE_MS = 600_000;
+export const MAX_VALUE_BYTES = 1_900_000;
+export const MAX_GENERATION_LENGTH = 256;
+export const MAX_COORDINATOR_GENERATION_LENGTH = 512;
+export const MAX_TTL_MS = 366 * 24 * 60 * 60 * 1000;
+export const TTL_JITTER_RATIO = 0.1;
+export const MAX_SHAPE_TTL_SECONDS = Math.floor(MAX_TTL_MS / 1000 / (1 + TTL_JITTER_RATIO));
+export const CONFIG_FORMAT = 2;
+export const PLANNER_VERSION = 2;

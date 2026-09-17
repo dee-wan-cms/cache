@@ -1,0 +1,67 @@
+generator client {
+  provider        = "prisma-client-js"
+  output          = "../generated/prisma"
+}
+
+generator cache {
+  provider = "node ../../dist/generator/index.js"
+  output   = "../generated/cache"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./unused.db"
+}
+
+model User {
+  id        Int      @id @default(autoincrement())
+  email     String   @unique
+  name      String
+  posts     Post[]
+  managerId Int?
+  manager   User?    @relation("Management", fields: [managerId], references: [id])
+  reports   User[]   @relation("Management")
+  profile   Profile?
+}
+
+model Profile {
+  id     Int   @id
+  bio    String
+  userId Int?  @unique
+  user   User? @relation(fields: [userId], references: [id])
+}
+
+model Post {
+  id       Int    @id @default(autoincrement())
+  title    String
+  authorId Int
+  author   User   @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  tags     Tag[]
+}
+
+model Tag {
+  id    Int    @id @default(autoincrement())
+  label String @unique
+  posts Post[]
+}
+
+/// @cache.skip
+model Secret {
+  id    Int    @id @default(autoincrement())
+  value String
+}
+
+/// @cache.skip
+model Barrier {
+  name  String @id
+  state String
+}
+
+model Measure {
+  id     Int      @id
+  amount Decimal
+  big    BigInt
+  at     DateTime
+  blob   Bytes
+  meta   Json?
+}
