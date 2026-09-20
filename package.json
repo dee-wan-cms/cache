@@ -1,6 +1,6 @@
 {
   "name": "@dee-wan/cache",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Prisma read cache for Cloudflare Workers and D1, coordinated by a Durable Object",
   "license": "MIT",
   "type": "module",
