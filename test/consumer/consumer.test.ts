@@ -55,6 +55,8 @@ model Note {
 const WORKER = `
 import { PrismaD1 } from "@prisma/adapter-d1";
 import { createCacheExtension } from "@dee-wan/cache";
+import { cacheD1Env, cacheD1Read, cacheD1JsonRead, fenceD1Writes, d1PrismaCacheExtension, withD1PrismaCache, wrapD1Handler } from "@dee-wan/cache/d1";
+import { d1CacheProblem } from "@dee-wan/cache/d1/config";
 import { createDurableObjectStore, type CacheCoordinator } from "@dee-wan/cache/cloudflare";
 import { cacheConfig } from "../generated/cache/cache-config";
 import { PrismaClient } from "../generated/prisma";
@@ -68,19 +70,32 @@ interface Env {
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const profile = { envPrefix: "CONSUMER_CACHE", bindingNames: ["DB"], bindingPrefixes: [], coordinatorNamePrefix: "consumer:", coordinatorClass: "CacheCoordinator", readModels: ["Note"], unfencedWriteTables: [] };
+    if (d1CacheProblem({}, profile) !== null) throw new Error("disabled config should be accepted");
+    const checked = cacheD1Env(env, profile);
+    const probe = await cacheD1Read(checked.DB, { key: "consumer-probe", scope: "consumer" }, async () => 7);
+    const jsonProbe = await cacheD1JsonRead(checked.DB, { key: "consumer-json", scope: "consumer", request }, async () => new Response("{}", { headers: { "content-type": "application/json" } }));
+    if (probe !== 7 || jsonProbe.status !== 200) throw new Error("disabled explicit read changed behavior");
+    const wrappedHandler = wrapD1Handler((_event: string, _env: Env, _context: null) => true, profile);
+    if (!wrappedHandler("", checked, null) || d1PrismaCacheExtension(checked.DB, cacheConfig) !== undefined) throw new Error("disabled runtime changed");
     let statements = 0;
-    const db = new Proxy(env.DB, {
+    const db = new Proxy(checked.DB, {
       get(target, property) {
         if (property === "prepare") return (query: string) => (statements++, target.prepare(query));
         const value: unknown = Reflect.get(target, property);
         return typeof value === "function" ? value.bind(target) : value;
       },
     });
-    const prisma = new PrismaClient({ adapter: new PrismaD1(db) }).$extends(
+    const store = createDurableObjectStore(env.CACHE_COORDINATOR, { locationHint: "apac", name: "notes-db" });
+    const fenced = fenceD1Writes(db, { store, generation: "consumer", policy: profile });
+    const base = new PrismaClient({ adapter: new PrismaD1(fenced) });
+    if (withD1PrismaCache(base, checked.DB, cacheConfig) !== base) throw new Error("disabled runtime changed client");
+    const prisma = base.$extends(
       createCacheExtension({
         config: cacheConfig,
         generation: "consumer",
-        store: createDurableObjectStore(env.CACHE_COORDINATOR, { locationHint: "apac", name: "notes-db" }),
+        coordinationGeneration: "consumer",
+        store,
         waitUntil: (promise) => ctx.waitUntil(promise),
       }),
     );

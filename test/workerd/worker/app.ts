@@ -5,12 +5,14 @@ import type { CacheShape, CacheStore, CacheTestHooks, InvalidationTarget } from 
 
 import { createDurableObjectStore } from "../../../dist/cloudflare/index.js";
 import { createCacheExtension } from "../../../dist/index.js";
+import { createD1CacheRuntime, fenceD1Writes, withD1PrismaCache } from "../../../dist/d1/index.js";
 import { cacheConfig } from "../generated/cache/cache-config";
 import { Prisma, PrismaClient } from "../generated/prisma";
 
 export interface Env {
   COORDINATOR: DurableObjectNamespace<CacheCoordinator>;
   DB: D1Database;
+  OTHER: D1Database;
   SMOKE_TOKEN?: string;
 }
 
@@ -21,7 +23,8 @@ type Step =
   | { metaIs: "DbNull" | "JsonNull" }
   | { transaction: "batch" | "interactive"; steps: Array<{ args?: unknown; model: string; op: string }> }
   | { invalidate: InvalidationTarget }
-  | { params?: Array<number | string>; raw: string; rawTarget?: InvalidationTarget };
+  | { params?: Array<number | string>; raw: string; rawTarget?: InvalidationTarget }
+  | { rawDependency: string };
 
 interface RunRequest {
   locationHint?: CoordinatorLocationHint;
@@ -32,6 +35,12 @@ interface RunRequest {
   coordinatorName?: string;
   enabled?: boolean;
   generation?: string;
+  coordinationGeneration?: string;
+  fencedRaw?: boolean;
+  rawBarrier?: string;
+  dependencyScope?: string;
+  primaryOnly?: boolean;
+  barrierOnHit?: string;
   innerProbe?: "inside" | "outside";
   tenantName?: string;
   leaseMs?: number;
@@ -98,6 +107,7 @@ async function runStep(client: object, base: PrismaClient, env: Env, step: Step)
       },
     });
   }
+  if ("rawDependency" in step) return env.OTHER.prepare(step.rawDependency).run();
   if ("raw" in step) {
     const statement = () => env.DB.prepare(step.raw).bind(...(step.params ?? [])).run().then(() => null);
     if (!step.rawTarget) return statement();
@@ -194,23 +204,34 @@ function tenantFilter(name: string) {
 }
 
 async function run(request: RunRequest, env: Env, ctx: ExecutionContext): Promise<Response> {
-  const counter = { inner: 0, statements: 0 };
-  const store =
+  const counter = { inner: 0, statements: 0, cacheReads: 0, inspections: 0 };
+  const underlyingStore =
     request.coordinator === "broken" ? brokenStore : createDurableObjectStore(env.COORDINATOR, {
           name: request.coordinatorName ?? "test",
           ...(request.locationHint ? { locationHint: request.locationHint } : {}),
         });
+  const store: CacheStore = {
+    ...underlyingStore,
+    read: async (input) => { counter.cacheReads++; const result = await underlyingStore.read(input); if (request.barrierOnHit && result.kind === 'hit') await waitAtBarrier(env.DB, request.barrierOnHit); return result; },
+    inspectFences: async (input) => { counter.inspections++; if (!underlyingStore.inspectFences) throw new Error('inspection unavailable'); return underlyingStore.inspectFences(input); },
+  };
   const errors: string[] = [];
-  const base = new PrismaClient({ adapter: new PrismaD1(countingDb(env.DB, counter)) });
+  const profile = { envPrefix:'TEST_CACHE', bindingNames:['DB'], bindingPrefixes:[], coordinatorNamePrefix:'test:', coordinatorClass:'CacheCoordinator', readModels:['User'], unfencedWriteTables:[] };
+  const primary = request.dependencyScope ? createD1CacheRuntime(countingDb(env.DB, counter), { store, databaseId:'primary', generation:'1', profile }) : countingDb(env.DB, counter);
+  const controlStore = createDurableObjectStore(env.COORDINATOR, { name: (request.coordinatorName ?? 'test') + ':control' });
+  const rawControlStore: CacheStore = request.rawBarrier ? { ...controlStore, beginWrite: async (input) => { await controlStore.beginWrite(input); await waitAtBarrier(env.DB, request.rawBarrier!); } } : controlStore;
+  const control = createD1CacheRuntime(env.OTHER, { store: rawControlStore, databaseId:'control', generation:'1', profile });
+  const base = new PrismaClient({ adapter: new PrismaD1(primary) });
   const tenant = request.tenantName ? base.$extends(tenantFilter(request.tenantName)) : base;
   const inside = request.innerProbe === "inside" ? tenant.$extends(innerProbe(counter)) : tenant;
-  const cached = inside.$extends(
+  const cached = request.dependencyScope ? withD1PrismaCache(inside, primary, cacheConfig, { scope:{ actor:request.dependencyScope }, dependencies:request.primaryOnly ? [primary] : [control] }, Prisma.Decimal) : inside.$extends(
     createCacheExtension({
       config: cacheConfig,
       decimal: Prisma.Decimal,
       enabled: request.enabled ?? true,
       ...(request.fillPollDelaysMs ? { fillPollDelaysMs: request.fillPollDelaysMs } : {}),
       ...(request.generation ? { generation: request.generation } : {}),
+      ...(request.coordinationGeneration ? { coordinationGeneration: request.coordinationGeneration } : {}),
       ...(request.leaseMs ? { leaseMs: request.leaseMs } : {}),
       ...(request.maxValueBytes ? { maxValueBytes: request.maxValueBytes } : {}),
       onError: (error, context) => errors.push(`${context}: ${error instanceof Error ? error.message : String(error)}`),
@@ -222,17 +243,22 @@ async function run(request: RunRequest, env: Env, ctx: ExecutionContext): Promis
     }),
   );
   const client = request.innerProbe === "outside" ? cached.$extends(innerProbe(counter)) : cached;
+  const rawStore: CacheStore = request.rawBarrier ? {
+    ...store,
+    beginWrite: async (input) => { await store.beginWrite(input); await waitAtBarrier(env.DB, request.rawBarrier!); },
+  } : store;
+  const runEnv: Env = { ...env, OTHER: control, ...(request.fencedRaw ? { DB: fenceD1Writes(env.DB, { store: rawStore, generation: request.coordinationGeneration ?? '1', policy: { unfencedWriteTables: [] } }) } : {}) };
   const results: Array<{ error: string } | { value: unknown }> = [];
   const started = Date.now();
   for (const step of request.steps) {
     try {
-      results.push({ value: describe(await runStep(client, base, env, step)) });
+      results.push({ value: describe(await runStep(client, base, runEnv, step)) });
     } catch (error) {
       results.push({ error: error instanceof Error ? `${error.name}: ${error.message}` : String(error) });
     }
   }
   const elapsedMs = Date.now() - started;
-  return Response.json({ elapsedMs, errors, inner: counter.inner, results, statements: counter.statements }, { headers: { "cache-control": "no-store" } });
+  return Response.json({ elapsedMs, errors, inner: counter.inner, results, statements: counter.statements, cacheReads: counter.cacheReads, inspections: counter.inspections }, { headers: { "cache-control": "no-store" } });
 }
 
 export async function handle(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {

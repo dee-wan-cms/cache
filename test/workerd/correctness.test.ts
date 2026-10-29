@@ -242,6 +242,76 @@ describe("concurrency", () => {
     expect((await one(findUser(1))).value).toMatchObject({ name: "After race" });
   });
 
+  it("uses one cache read and no fence inspections for a primary-only Prisma hit", async () => {
+    await seedUsers();
+    const mode = { dependencyScope: 'actor-a', primaryOnly: true };
+    await one(findUser(1), mode);
+    const warm = await one(findUser(1), mode);
+    expect(warm.statements).toBe(0);
+    expect(warm.result.cacheReads).toBe(1);
+    expect(warm.result.inspections).toBe(0);
+  });
+
+  it("scopes guarded Prisma hits by actor and a separate control database epoch", async () => {
+    await seedUsers();
+    const oneScope = { dependencyScope: 'actor-a' };
+    const first = await one(findUser(1), oneScope);
+    expect(first.statements).toBeGreaterThan(0);
+    expect((await one(findUser(1), oneScope)).statements).toBe(0);
+    expect((await one(findUser(1), { dependencyScope: 'actor-b' })).statements).toBeGreaterThan(0);
+    await one({ rawDependency: "UPDATE ControlState SET value='changed' WHERE id=1" }, oneScope);
+    const refreshed = await one(findUser(1), oneScope);
+    expect(refreshed.statements).toBeGreaterThan(0);
+    expect(refreshed.value).toEqual(first.value);
+    expect((await one(findUser(1), oneScope)).statements).toBe(0);
+    const writer = one({ rawDependency: "UPDATE ControlState SET value='pending' WHERE id=1" }, { ...oneScope, rawBarrier: 'control-lease' });
+    await until(() => rig.barrierState('control-lease'), (state) => state === 'waiting', 'control writer at barrier');
+    expect((await one(findUser(1), oneScope)).statements).toBeGreaterThan(0);
+    await rig.release('control-lease');
+    await writer;
+    expect((await one(findUser(1), oneScope)).statements).toBeGreaterThan(0);
+  });
+
+  it("rechecks a control dependency before returning a concurrent Prisma cache hit", async () => {
+    await seedUsers();
+    const mode = { dependencyScope: 'actor-a' };
+    await one(findUser(1), mode);
+    expect((await one(findUser(1), mode)).statements).toBe(0);
+    const reading = one(findUser(1), { ...mode, barrierOnHit: 'control-hit' });
+    await until(() => rig.barrierState('control-hit'), (state) => state === 'waiting', 'cached hit at barrier');
+    await one({ rawDependency: "UPDATE ControlState SET value='changed' WHERE id=1" }, mode);
+    await rig.release('control-hit');
+    const result = await reading;
+    expect(result.value).toMatchObject({ name: 'Ada' });
+    expect(result.statements).toBeGreaterThan(0);
+  });
+
+  it("shares the legacy global generation with raw D1 writes during a write lease", async () => {
+    await seedUsers();
+    const mode = { coordinationGeneration: "1" };
+    await one(findUser(1), mode);
+    expect((await one(findUser(1), mode)).statements).toBe(0);
+    const writer = one({ raw: "UPDATE User SET name = ? WHERE id = ?", params: ["Raw update", 1] }, { ...mode, fencedRaw: true, rawBarrier: "raw-lease" });
+    await until(() => rig.barrierState("raw-lease"), (state) => state === "waiting", "raw writer at barrier");
+    const during = await one(findUser(1), mode);
+    expect(during.statements).toBeGreaterThan(0);
+    expect(during.value).toMatchObject({ name: "Ada" });
+    await rig.release("raw-lease");
+    await writer;
+    expect((await one(findUser(1), mode)).value).toMatchObject({ name: "Raw update" });
+  });
+
+  it("does not publish a Prisma fill overtaken by a legacy-generation raw write", async () => {
+    await seedUsers();
+    const mode = { coordinationGeneration: "1" };
+    const reader = one(findUser(1), { ...mode, barrierAfterFill: "raw-fill" });
+    await until(() => rig.barrierState("raw-fill"), (state) => state === "waiting", "Prisma fill at barrier");
+    await one({ raw: "UPDATE User SET name = ? WHERE id = ?", params: ["After raw race", 1] }, { ...mode, fencedRaw: true });
+    await rig.release("raw-fill");
+    await reader;
+    expect((await one(findUser(1), mode)).value).toMatchObject({ name: "After raw race" });
+  });
+
   it("does not serve or cache pre-write state while a write lease is open, even if the end bump is lost", async () => {
     await seedUsers();
     await one(findUser(1));

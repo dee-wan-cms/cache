@@ -85,6 +85,9 @@ function validateOptions(options: CacheExtensionOptions): void {
     options.generation !== undefined &&
       !(options.generation.length > 0 && options.generation.length <= MAX_GENERATION_LENGTH) &&
       `generation must be 1..${MAX_GENERATION_LENGTH} characters`,
+    options.coordinationGeneration !== undefined &&
+      !(options.coordinationGeneration.length > 0 && options.coordinationGeneration.length <= MAX_GENERATION_LENGTH) &&
+      `coordinationGeneration must be 1..${MAX_GENERATION_LENGTH} characters`,
   ].filter((problem): problem is string => typeof problem === "string");
   if (problems.length > 0) throw new TypeError(`cache extension: ${problems.join("; ")}`);
   validateShapes(options.shape);
@@ -96,7 +99,7 @@ export function createCacheExtension(options: CacheExtensionOptions) {
   const enabled = options.enabled ?? true;
   const excluded = new Set(options.excludeModels ?? []);
   const scope = options.scope ?? "";
-  const generation = `${PLANNER_VERSION}/${config.cacheVersion}/${options.generation ?? ""}`;
+  const generation = options.coordinationGeneration ?? `${PLANNER_VERSION}/${config.cacheVersion}/${options.generation ?? ""}`;
   const pollDelays = options.fillPollDelaysMs ?? DEFAULT_FILL_POLL_DELAYS_MS;
   const lockMs = options.lockMs ?? DEFAULT_LOCK_MS;
   const leaseMs = options.leaseMs ?? DEFAULT_LEASE_MS;

@@ -173,3 +173,63 @@ npx wrangler delete --name <worker> && npx wrangler d1 delete <name>
 ```
 
 `test/workerd/.build/schema.sql` is written by `npm run test:workerd`.
+
+## D1 write fencing with guarded Prisma reads
+
+`@dee-wan/cache/d1` exports `cacheD1Env`, `wrapD1Handler`, `createD1CacheRuntime`,
+`d1PrismaCacheExtension`, and `fenceD1Writes`. A consumer provides a `D1CacheProfile`
+with environment prefix, D1 binding names and prefixes, coordinator object-name prefix,
+Prisma `readModels`, and explicitly proven `unfencedWriteTables`. The write adapter
+passes reads straight through and fences raw D1 writes, including batches, exec, and
+sessions. Unknown or ambiguous writes use the global fence. Exempt a table only when
+its schema proves that its writes cannot change cached data through triggers or cascades.
+
+Wrap every fetch, scheduled handler, and separate writer that can touch a coordinated
+D1 database. Apply `d1PrismaCacheExtension` to a client only after its authorization and
+scope extensions. The runtime returns no extension when caching or cached reads are
+staged off. Independent control and authentication clients should remain uncached.
+`@dee-wan/cache/d1/config` validates Worker bindings, database identity maps, and paired
+writers, and offers generic writer configuration edits. Consumers must supply real D1
+UUIDs, never binding object identities.
+
+`coordinationGeneration` lets a Prisma extension share the literal coordinator generation
+with a raw-D1 write fence during an upgrade. If omitted, the existing planner/config-derived
+coordinator generation remains unchanged. Prisma cache keys always contain planner and
+generated-config versions. Do not mix coordination generations on one coordinator; staged
+rollouts must make every writer participate before enabling cached reads. External D1 writes
+are not intercepted: disable cached reads and writers as appropriate, then use a fresh
+generation before re-enabling caching.
+
+The package's Prisma peer support remains Prisma 6.19.3 and later 6.x. The D1 write adapter
+is independent of Prisma; other Prisma versions have not been validated by this package.
+
+### Explicit authorized reads
+
+`cacheD1Read(database, { key, scope, dependencies, ttlMs, cacheable }, load)` caches an
+explicitly selected read after the caller has completed authorization. Include the full
+actor, site, current permissions and all query inputs in `scope` and `key`, and list every
+physical D1 binding read by the loader in `dependencies`. The helper inspects each unique
+binding's global fence before lookup, includes its generation and epoch in the key, and
+checks again before serving a hit or storing a fill. A pending write, unknown runtime,
+older coordinator, inspection failure, or disabled reads bypasses the cache. Default TTL
+is 30 seconds, with a maximum of five minutes. Values and keys are bounded; unsupported
+objects bypass caching. Date, bigint and byte arrays use the existing value codec.
+
+`cacheD1JsonRead(database, { key, scope, dependencies, ttlMs, request, buffered: true }, load)`
+is an explicit opt-in for responses the caller knows are buffered JSON. It keeps the
+original response on a miss and preserves response headers on a hit. Conditional, range,
+preview and capability requests, error responses, cookies, downloads, unsafe `Vary`,
+encoded bodies and oversized bodies bypass caching. Without `buffered: true`, responses
+bypass; never set it for streams. Response buffering is byte-bounded and time-bounded.
+These helpers use private Durable Object storage, not the public Cache API.
+
+For native Prisma reads that also depend on another D1 database, use
+`withD1PrismaCache(client, database, config, { scope, dependencies })` after the caller's
+guards. Scope must include the complete actor, site and permission context. Per-operation
+keys include dependency epochs and recheck dependencies on hits. The original three-argument
+form retains its existing behavior. All participating writers must fence through the same
+physical-database coordinator.
+
+D1 coordinator calls have a 2-second deadline each. Reads fall back to D1 on failure;
+writes require a successful begin. A failed end preserves the database result and keeps
+the lease conservative. Late begins and read locks are cleaned up after they settle.

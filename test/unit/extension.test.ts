@@ -160,6 +160,15 @@ describe("review fixes in the extension", () => {
     await call(createCacheExtension({ config, generation: "ops-7", store }), { where: { id: 1 } }, {});
     const generations = calls.filter(([name]) => name === "read").map(([, request]) => (request && typeof request === "object" && "generation" in request ? request.generation : null));
     expect(generations).toEqual([`${PLANNER_VERSION}/t/`, `${PLANNER_VERSION}/t/ops-7`]);
+    await call(createCacheExtension({ config, generation: "ops-7", coordinationGeneration: "1", store }), { where: { id: 1 } }, {});
+    const explicit = calls.filter(([name]) => name === "read").at(-1)?.[1];
+    expect(explicit).toMatchObject({ generation: "1" });
+    await call(createCacheExtension({ config: { ...config, cacheVersion: "next" }, coordinationGeneration: "1", store }), { where: { id: 1 } }, {});
+    const reads = calls.filter(([name]) => name === "read").map(([, request]) => request);
+    expect(reads.at(-1)).toMatchObject({ generation: "1" });
+    expect(reads.at(-1)).not.toMatchObject({ key: (explicit as { key: string }).key });
+    expect(() => createCacheExtension({ config, coordinationGeneration: "", store })).toThrow(/coordinationGeneration/);
+    expect(() => createCacheExtension({ config, coordinationGeneration: "x".repeat(257), store })).toThrow(/coordinationGeneration/);
   });
 
   it("keeps polling a fresh fill lock but stops once its holder has been slower than the whole poll budget", async () => {

@@ -2,7 +2,7 @@ import { defineConfig } from "tsup";
 
 export default defineConfig([
   {
-    entry: { index: "src/index.ts", "cloudflare/index": "src/cloudflare/index.ts" },
+    entry: { index: "src/index.ts", "cloudflare/index": "src/cloudflare/index.ts", "d1/index": "src/d1/index.ts", "d1/config": "src/d1/config.ts" },
     format: ["esm"],
     platform: "neutral",
     target: "es2022",

@@ -240,3 +240,25 @@ warming and repair (depended on the removed hot-query tracker).
 - `npm run test:consumer`: packed tarball in a fresh Worker project: generator bin, types, wrangler
   bundle, fill/hit/invalidation on workerd.
 - Deployed smoke (`test/deployed`, see README): a temporary Worker, D1 and DO on a real account.
+
+The D1 integration fences raw writes with the same global fence and explicit coordinator
+generation as the guarded Prisma extension. It does not classify or cache SQL reads. Named
+write exemptions require schema proof against triggers and cascading changes. Coordinated
+writers may stage with cached reads disabled; every writer must participate before reads
+are enabled. The default Prisma extension generation remains planner/config-derived when
+no explicit coordination generation is supplied.
+
+Explicit D1 read results use the same global fence and a key containing each unique physical
+D1 dependency's identity, generation and global epoch. A pending dependency write or failed
+inspection bypasses caching. Hits are checked against all dependency epochs again before
+returning; a fill under an old dependency epoch cannot be selected by a later read. Native
+Prisma callers may opt into the same dependency stamp and must supply complete authorization
+scope. JSON responses require an explicit buffered-response contract and retain private
+HTTP headers; unknown streams, credentials in response cookies and conditional requests
+are never cached.
+
+D1 coordinator calls have a 2-second deadline per RPC. Read failure falls through to D1.
+Begin failure refuses the write before the query. A late begin is ended after it settles;
+late read locks are released. End failure preserves the database result and leaves the
+lease active until cleanup or expiry. This applies to scoped and unscoped Prisma clients,
+raw D1 writes, and explicit invalidation. Multiple RPCs can exceed 2 seconds in total.

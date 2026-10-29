@@ -1,5 +1,7 @@
 import type {
   BeginWriteRequest,
+  InspectFencesRequest,
+  InspectFencesResponse,
   EndWriteRequest,
   ReadRequest,
   ReadResponse,
@@ -285,6 +287,13 @@ export function createCoordinatorCore(sql: SqlLike, newToken: () => string, tran
   }
 
   return {
+    inspectFences(request: InspectFencesRequest, now: number): InspectFencesResponse {
+      assertRequest(isFenceList(request.fences) && isGeneration(request.generation), 'invalid inspectFences request');
+      return transact(() => {
+        observeGeneration(request.generation, now);
+        return { epochs: epochs(request.fences), pending: pending(request.fences, now) };
+      });
+    },
     beginWrite(request: BeginWriteRequest, now: number): void {
       assertRequest(
         isFenceList(request.fences) && isDuration(request.leaseMs) && isGeneration(request.generation) && isToken(request.token),

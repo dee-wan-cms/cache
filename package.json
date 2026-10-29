@@ -19,6 +19,8 @@
       "import": "./dist/cloudflare/index.js",
       "default": "./dist/cloudflare/index.js"
     },
+    "./d1": { "types": "./dist/d1/index.d.ts", "import": "./dist/d1/index.js" },
+    "./d1/config": { "types": "./dist/d1/config.d.ts", "import": "./dist/d1/config.js" },
     "./generator": {
       "types": "./dist/generator/config.d.ts",
       "import": "./dist/generator/config.js",
@@ -48,7 +50,7 @@
   "homepage": "https://github.com/dee-wan-cms/cache#readme",
   "scripts": {
     "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsup",
-    "typecheck": "npm run test:prepare && tsc --noEmit -p tsconfig.json && tsc -p test/tsconfig.worker.json && tsc -p test/tsconfig.node.json",
+    "typecheck": "npm run test:prepare && tsc --noEmit -p tsconfig.json && tsc -p test/tsconfig.worker.json && tsc -p test/tsconfig.node.json && tsc -p test/tsconfig.d1-unit.json",
     "test": "npm run test:unit && npm run test:workerd",
     "test:unit": "vitest run --config vitest.unit.config.ts",
     "test:workerd": "vitest run --config vitest.workerd.config.ts",
