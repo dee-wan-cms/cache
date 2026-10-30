@@ -2,6 +2,7 @@ import type { D1Database } from '@cloudflare/workers-types';
 import { decode, encode, sha256Hex, stableStringify } from '../core/codec';
 import { MAX_VALUE_BYTES } from '../core/limits';
 import { d1CacheRuntime, type D1CacheRuntime } from './env';
+import { regionalKey, regionalRead, regionalWrite } from './regional';
 
 const FENCES = ['g'];
 const DEFAULT_TTL_MS = 30_000;
@@ -14,6 +15,7 @@ export interface D1ReadOptions<T> {
   scope: unknown;
   dependencies?: readonly D1Database[];
   ttlMs?: number;
+  regionalTtlMs?: number;
   cacheable?: (value: T) => boolean;
 }
 
@@ -106,6 +108,12 @@ export async function cacheD1Read<T>(database: D1Database, options: D1ReadOption
   if (!primary || !primary.readsEnabled || !Number.isFinite(ttl) || ttl <= 0 || ttl > MAX_TTL_MS || options.scope === undefined || options.scope === null || !boundedValue(options.scope, MAX_IDENTITY_BYTES, true) || !boundedValue(options.key, MAX_IDENTITY_BYTES, true)) return load();
   const runtimes = dependencyRuntimes(database, options.dependencies ?? []);
   if (!runtimes) return load();
+  const regionalIdentities = [primary, ...runtimes].map((runtime) => [runtime.databaseId, runtime.generation, runtime.coordinatorName, runtime.regionalIdentity]);
+  const regional = regionalIdentities.every((identity) => identity[3])
+    ? await regionalKey(options.regionalTtlMs, ['d1-read', options.regionalTtlMs, regionalIdentities, options.scope, options.key]) : null;
+  const hit = await regionalRead(regional, options.regionalTtlMs);
+  if (hit) return hit.value as T;
+  const started = Date.now();
   const snapshot = await inspect(runtimes);
   if (!snapshot) return load();
   let key: string;
@@ -120,7 +128,10 @@ export async function cacheD1Read<T>(database: D1Database, options: D1ReadOption
   if (result.kind === 'hit') {
     try {
       const value: unknown = decode(JSON.parse(result.value));
-      if (boundedValue(value, MAX_VALUE_SIZE, false) && sameSnapshots(snapshot, await inspect(runtimes))) return value as T;
+      if (boundedValue(value, MAX_VALUE_SIZE, false) && sameSnapshots(snapshot, await inspect(runtimes))) {
+        await regionalWrite(regional, options.regionalTtlMs, started, value);
+        return value as T;
+      }
     } catch { /* Invalid cached values are read from the source. */ }
     return load();
   }
@@ -132,7 +143,8 @@ export async function cacheD1Read<T>(database: D1Database, options: D1ReadOption
       if (value !== null && value !== undefined && boundedValue(value, MAX_VALUE_SIZE, false) && (options.cacheable?.(value) ?? true)) {
         const text = JSON.stringify(encode(value));
         if (new TextEncoder().encode(text).byteLength <= MAX_VALUE_SIZE && sameSnapshots(snapshot, await inspect(runtimes))) {
-          await primary.store.write({ key, lockToken, snapshot: result.epochs, ttlMs: ttl, softTtlMs: ttl, value: text });
+          const written = await primary.store.write({ key, lockToken, snapshot: result.epochs, ttlMs: ttl, softTtlMs: ttl, value: text });
+          if (regional && written.ok && sameSnapshots(snapshot, await inspect(runtimes))) await regionalWrite(regional, options.regionalTtlMs, started, value);
         }
       }
     } catch { /* The source result remains authoritative when caching fails. */ }

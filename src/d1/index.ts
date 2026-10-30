@@ -7,3 +7,5 @@ export { cacheD1Read, d1CacheEpoch, sameD1CacheDatabase } from './read';
 export type { D1ReadOptions } from './read';
 export { cacheD1JsonRead } from './json-read';
 export type { D1JsonReadOptions } from './json-read';
+export { cacheRegionalResponse } from './regional-response';
+export type { RegionalResponseOptions } from './regional-response';

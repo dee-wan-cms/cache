@@ -6,12 +6,12 @@ const sensitiveHeaders = new Set(['authorization', 'cookie', 'proxy-authorizatio
 const ephemeralHeaders = new Set(['cf-ray', 'x-request-id', 'traceparent', 'tracestate', 'cf-connecting-ip', 'x-forwarded-for']);
 const hopHeaders = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade']);
 
-export interface D1JsonReadOptions extends Omit<D1ReadOptions<never>, 'cacheable'> {
+export interface D1JsonReadOptions extends Omit<D1ReadOptions<never>, 'cacheable' | 'regionalTtlMs'> {
   request: Request;
   buffered?: true;
 }
 
-interface JsonResponseEntry {
+export interface JsonResponseEntry {
   status: number;
   statusText: string;
   headers: [string, string][];
@@ -28,7 +28,7 @@ function requestIdentity(request: Request): unknown | null {
   return { url: url.toString(), headers };
 }
 
-async function responseEntry(response: Response): Promise<JsonResponseEntry | null> {
+export async function responseEntry(response: Response): Promise<JsonResponseEntry | null> {
   if (response.status !== 200 || response.headers.has('set-cookie') || response.headers.has('content-disposition') || response.headers.has('transfer-encoding') || response.headers.has('content-encoding')) return null;
   if (!/^application\/(?:[a-z0-9.+-]*\+)?json(?:\s*;|$)/i.test(response.headers.get('content-type') ?? '')) return null;
   const vary = response.headers.get('vary');

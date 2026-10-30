@@ -8,18 +8,20 @@ import type { CacheStore, DecimalConstructor, GeneratedCacheConfig } from '../co
 import { stableStringify } from '../core/codec';
 import { boundedValue, dependencyRuntimes, inspect, sameSnapshots } from './read';
 import { boundedD1Store } from './bounded-store';
+import { regionalKey, regionalRead, regionalWrite } from './regional';
+import { readTargets } from '../core/targets';
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const hints = new Set(['wnam', 'enam', 'sam', 'weur', 'eeur', 'apac', 'oc', 'afr', 'me']);
 const wrapped = new WeakMap<object, WeakMap<D1Database, Map<string, D1Database>>>();
-export interface D1CacheRuntime { store: CacheStore; generation: string; databaseId: string; readsEnabled: boolean; readModels: readonly string[]; coordinatorIdentity: object; coordinatorName: string }
+export interface D1CacheRuntime { store: CacheStore; generation: string; databaseId: string; readsEnabled: boolean; readModels: readonly string[]; coordinatorIdentity: object; coordinatorName: string; regionalIdentity?: string }
 const runtimes = new WeakMap<object, D1CacheRuntime>();
 export const d1CacheRuntime = (database: object): D1CacheRuntime | undefined => runtimes.get(database);
-export function createD1CacheRuntime(database: D1Database, options: { store: CacheStore; databaseId: string; generation: string; readsEnabled?: boolean; profile: D1CacheProfile; coordinatorIdentity?: object; coordinatorName?: string }): D1Database {
+export function createD1CacheRuntime(database: D1Database, options: { store: CacheStore; databaseId: string; generation: string; readsEnabled?: boolean; profile: D1CacheProfile; coordinatorIdentity?: object; coordinatorName?: string; regionalIdentity?: string }): D1Database {
   const { generation, databaseId, profile, readsEnabled = true } = options;
   const store = boundedD1Store(options.store);
   const fenced = fenceD1Writes(database, { store, generation, policy: profile });
-  runtimes.set(fenced, { store, generation, databaseId, readsEnabled, readModels: profile.readModels, coordinatorIdentity: options.coordinatorIdentity ?? options.store, coordinatorName: options.coordinatorName ?? '' });
+  runtimes.set(fenced, { store, generation, databaseId, readsEnabled, readModels: profile.readModels, coordinatorIdentity: options.coordinatorIdentity ?? options.store, coordinatorName: options.coordinatorName ?? '', regionalIdentity: options.regionalIdentity });
   return fenced;
 }
 
@@ -62,7 +64,7 @@ export function cacheD1Env<T extends object>(env: T, profile: D1CacheProfile): T
     if (!cached) {
       const coordinatorName = `${profile.coordinatorNamePrefix}${databaseId}`;
       const store = createDurableObjectStore(namespace as DurableObjectNamespace<CacheCoordinator>, { name: coordinatorName, locationHint: locationHint as CoordinatorLocationHint });
-      cached = createD1CacheRuntime(database, { store, generation, databaseId, readsEnabled, profile, coordinatorIdentity: namespace, coordinatorName });
+      cached = createD1CacheRuntime(database, { store, generation, databaseId, readsEnabled, profile, coordinatorIdentity: namespace, coordinatorName, regionalIdentity: (namespace as DurableObjectNamespace<CacheCoordinator>).idFromName(coordinatorName).toString() });
       versions.set(cacheKey, cached);
     }
     Reflect.set(scoped, key, cached);
@@ -78,6 +80,8 @@ export interface D1PrismaCacheOptions {
   scope: unknown;
   dependencies?: readonly D1Database[];
   keyArgs?: (args: unknown) => unknown;
+  regionalTtlMs?: number;
+  regionalModels?: readonly string[];
 }
 
 export function d1PrismaCacheExtension(database: object, config: GeneratedCacheConfig, optionsOrDecimal?: D1PrismaCacheOptions | DecimalConstructor, decimalArg?: DecimalConstructor): ReturnType<typeof createCacheExtension> | undefined {
@@ -98,6 +102,26 @@ export function d1PrismaCacheExtension(database: object, config: GeneratedCacheC
       if (options.scope === null || options.scope === undefined || !boundedValue(options.scope, 32_768, true) || (options.dependencies?.length ?? 0) > 32) return params.query(params.args);
       const dependencies = dependencyRuntimes(database, options.dependencies ?? []);
       if (!dependencies) return params.query(params.args);
+      const internal = params.__internalParams;
+      const dataPath = internal && typeof internal === 'object' && Array.isArray(Reflect.get(internal, 'dataPath')) ? Reflect.get(internal, 'dataPath') : [];
+      const transaction: unknown = internal && typeof internal === 'object' ? Reflect.get(internal, 'transaction') : undefined;
+      const inBatch = !!transaction && typeof transaction === 'object' && Reflect.get(transaction, 'kind') === 'batch';
+      let regional: string | null = null;
+      let normalizedArgs: unknown;
+      let normalized = false;
+      try {
+        const identities = [runtime, ...dependencies].map((item) => [item.databaseId, item.generation, item.coordinatorName, item.regionalIdentity]);
+        const targets = options.regionalModels ? readTargets(config.relationGraph, params.model, params.args) : undefined;
+        const allowedTargets = !options.regionalModels || (!!targets && [...targets.models].every((model) => options.regionalModels?.includes(model)));
+        if (options.regionalTtlMs && options.regionalTtlMs > 0 && options.regionalTtlMs <= 5000 && !inBatch && allowedTargets && identities.every((item) => item[3])) {
+          normalizedArgs = options.keyArgs ? options.keyArgs(params.args) : params.args;
+          normalized = true;
+          regional = await regionalKey(options.regionalTtlMs, ['prisma', options.regionalTtlMs, identities, config, options.scope, params.model, params.operation, dataPath, normalizedArgs ?? null]);
+        }
+      } catch { /* Key callbacks use the strict path on failure. */ }
+      const hit = await regionalRead(regional, options.regionalTtlMs, decimal);
+      if (hit) return hit.value;
+      let started = Date.now();
       const snapshot = await inspect(dependencies);
       if (!snapshot) return params.query(params.args);
       let scope: string;
@@ -105,14 +129,29 @@ export function d1PrismaCacheExtension(database: object, config: GeneratedCacheC
         scope = stableStringify([runtime.databaseId, runtime.generation, options.scope, snapshot.map(({ runtime: dependency, epoch }) => [dependency.databaseId, dependency.generation, epoch])]);
         if (new TextEncoder().encode(scope).byteLength > 32_768) return params.query(params.args);
       } catch { return params.query(params.args); }
+      let verifiedHit = false;
+      let verifiedWrite = false;
+      let queried = false;
       const store: CacheStore = { ...runtime.store,
+        async write(request) {
+          const result = await runtime.store.write(request);
+          verifiedWrite = result.ok;
+          return result;
+        },
         async read(request) {
         const result = await runtime.store.read(request);
         if (result.kind === 'hit' && !sameSnapshots(snapshot, await inspect(dependencies))) return { kind: 'miss', epochs: result.epochs, lockHeldForMs: null, lockToken: null, pending: true };
+        if (result.kind === 'hit') verifiedHit = true;
         return result;
       } };
-      const scoped = createCacheExtension({ ...common, store, scope });
-      return scoped.query.$allModels.$allOperations(params);
+      const scoped = createCacheExtension({ ...common, store, scope, ...(normalized ? { keyArgs: () => normalizedArgs } : {}) });
+      const value = await scoped.query.$allModels.$allOperations({ ...params, query: async (args) => {
+        queried = true;
+        started = Date.now();
+        return params.query(args);
+      } });
+      if (regional && ((!queried && verifiedHit) || verifiedWrite) && sameSnapshots(snapshot, await inspect(dependencies))) await regionalWrite(regional, options.regionalTtlMs, started, value);
+      return value;
     } } },
   };
 }

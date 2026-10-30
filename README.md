@@ -242,3 +242,11 @@ writes require a successful begin. A failed end preserves the database result an
 the lease conservative. Late begins and read locks are cleaned up after they settle.
 
 `keyArgs` optionally maps read arguments to cache-key identity. Preserve every result-changing input in that identity. Execution and invalidation use the original arguments. Callback errors bypass the cache.
+
+### Regional read cache
+
+`cacheD1Read` and scoped `d1PrismaCacheExtension` / `withD1PrismaCache` accept `regionalTtlMs` from 0 to 5000. The default is 0 (strict coordination). A positive value opts in to bounded stale results in the local Cloudflare Cache API; changes by other writers may remain invisible for up to that interval. Use 0 for a strict read. Cache API failure falls back to the strict path. This option caches values, not HTTP responses.
+
+Keys include database and coordinator identities, generations, scope, and query identity. `regionalModels` optionally limits Prisma regional reads to queries whose root and all related models are listed. Callers must supply a scope that separates every authorization context affecting the result. `keyArgs` must preserve every result-changing argument. For custom `createD1CacheRuntime` stores, supply a stable, unique `regionalIdentity` per coordinator; without one the regional layer is bypassed.
+
+`cacheRegionalResponse(request, { namespace, ttlMs, waitUntil? }, load)` is an opt-in regional cache for anonymous public GET JSON responses. Use a stable deployment/version namespace and a TTL no greater than 5000 ms. Credential, preview, conditional and cache-bypass requests reach `load`. Only explicitly public responses with positive `s-maxage` qualify. Browser responses require revalidation; the internal expiry remains bounded from the start of `load`. Cache API errors fall back to `load`. Callers must apply this only to public routes and must include every response-varying request input in the request or namespace.
