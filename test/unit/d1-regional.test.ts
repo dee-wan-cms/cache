@@ -224,3 +224,38 @@ it('does not promote a primary pending read or an invalid regional envelope', as
   entries.set(key, new Response(JSON.stringify({ expires:Date.now() + 10_000, value:1 })));
   expect(await regionalRead(key)).toBeNull();
 });
+
+it('uses regional cache for large Prisma configs and separates policy changes with the same version', async () => {
+  const f = fixture();
+  const db = f.database();
+  const dependency = f.database('dependency');
+  const extraModels = Array.from({ length:800 }, (_, index) => `GeneratedModel${String(index).padStart(4, '0')}`);
+  const largeConfig: GeneratedCacheConfig = {
+    ...config,
+    modelNames:[...config.modelNames, ...extraModels],
+    cacheableByModel:{ ...config.cacheableByModel, ...Object.fromEntries(extraModels.map((model) => [model, false])) },
+    primaryKeyFieldsByModel:{ ...config.primaryKeyFieldsByModel, ...Object.fromEntries(extraModels.map((model) => [model, ['id']])) },
+    relationGraph:{ ...config.relationGraph, ...Object.fromEntries(extraModels.map((model) => [model, []])) },
+  };
+  expect(new TextEncoder().encode(JSON.stringify(largeConfig)).byteLength).toBeGreaterThan(32_768);
+  let queries = 0;
+  const makeRun = (generatedConfig: GeneratedCacheConfig) => {
+    const extension = d1PrismaCacheExtension(db, generatedConfig, { scope:'actor', dependencies:[dependency], regionalTtlMs:5000, regionalModels:['Meta'] });
+    if (!extension) throw Error('extension missing');
+    return () => extension.query.$allModels.$allOperations({ model:'Meta', operation:'findMany', args:{ where:{ id:1 } }, query:async () => ++queries });
+  };
+  const run = makeRun(largeConfig);
+  expect(await run()).toBe(1);
+  const reads = f.read.mock.calls.length;
+  const inspections = f.inspect.mock.calls.length;
+  expect(reads).toBe(1);
+  expect(inspections).toBeGreaterThan(0);
+  expect(await run()).toBe(1);
+  expect(queries).toBe(1);
+  expect(f.read).toHaveBeenCalledTimes(reads);
+  expect(f.inspect).toHaveBeenCalledTimes(inspections);
+  const changedConfig: GeneratedCacheConfig = { ...largeConfig, cacheableByModel:{ ...largeConfig.cacheableByModel, [extraModels[0]!]:true } };
+  expect(changedConfig.cacheVersion).toBe(largeConfig.cacheVersion);
+  expect(await makeRun(changedConfig)()).toBe(2);
+  expect(f.read).toHaveBeenCalledTimes(reads + 1);
+});

@@ -5,7 +5,7 @@ import { fenceD1Writes } from './adapter';
 import { isD1BindingName, type D1CacheProfile } from './profile';
 import { createCacheExtension } from '../core/extension';
 import type { CacheStore, DecimalConstructor, GeneratedCacheConfig } from '../core/types';
-import { stableStringify } from '../core/codec';
+import { sha256Hex, stableStringify } from '../core/codec';
 import { boundedValue, dependencyRuntimes, inspect, sameSnapshots } from './read';
 import { boundedD1Store } from './bounded-store';
 import { regionalKey, regionalRead, regionalWrite } from './regional';
@@ -116,7 +116,8 @@ export function d1PrismaCacheExtension(database: object, config: GeneratedCacheC
         if (options.regionalTtlMs && options.regionalTtlMs > 0 && options.regionalTtlMs <= 5000 && !inBatch && allowedTargets && identities.every((item) => item[3])) {
           normalizedArgs = options.keyArgs ? options.keyArgs(params.args) : params.args;
           normalized = true;
-          regional = await regionalKey(options.regionalTtlMs, ['prisma', options.regionalTtlMs, identities, config, options.scope, params.model, params.operation, dataPath, normalizedArgs ?? null]);
+          const configDigest = await sha256Hex(stableStringify(config));
+          regional = await regionalKey(options.regionalTtlMs, ['prisma', options.regionalTtlMs, identities, configDigest, options.scope, params.model, params.operation, dataPath, normalizedArgs ?? null]);
         }
       } catch { /* Key callbacks use the strict path on failure. */ }
       const hit = await regionalRead(regional, options.regionalTtlMs, decimal);
