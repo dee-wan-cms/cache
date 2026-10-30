@@ -4,6 +4,6 @@
     "lib": ["ES2022"],
     "types": ["@cloudflare/workers-types", "node"]
   },
-  "include": ["unit/d1-write-deadline.test.ts", "unit/d1-regional.test.ts", "unit/regional-response.test.ts"],
+  "include": ["unit/d1-write-deadline.test.ts", "unit/d1-regional.test.ts", "unit/regional-response.test.ts", "unit/d1-read-response-lease.test.ts"],
   "exclude": []
 }

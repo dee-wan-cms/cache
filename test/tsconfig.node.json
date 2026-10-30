@@ -6,5 +6,5 @@
     "types": ["node"]
   },
   "include": ["unit/**/*.ts", "workerd/*.ts", "deployed/*.ts", "consumer/*.ts", "../*.config.ts"],
-  "exclude": ["unit/d1-write-deadline.test.ts", "unit/d1-regional.test.ts", "unit/regional-response.test.ts"]
+  "exclude": ["unit/d1-write-deadline.test.ts", "unit/d1-regional.test.ts", "unit/regional-response.test.ts", "unit/d1-read-response-lease.test.ts"]
 }

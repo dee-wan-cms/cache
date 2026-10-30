@@ -9,6 +9,15 @@ export interface D1CacheProfile extends D1WritePolicy {
   bindingPrefixes: readonly string[];
   coordinatorNamePrefix: string;
   coordinatorClass: string;
+  readResponseLease?: {
+    databaseBinding: string;
+    deploymentEnv: string;
+    paths: readonly string[];
+    credentialHeaders: readonly string[];
+    varyHeaders: readonly string[];
+    bypassQueryParams?: readonly string[];
+    freshnessCookie: string;
+  };
 }
 
 export const isD1BindingName = (key: string, profile: D1CacheProfile): boolean =>

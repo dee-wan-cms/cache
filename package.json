@@ -21,6 +21,7 @@
     },
     "./d1": { "types": "./dist/d1/index.d.ts", "import": "./dist/d1/index.js" },
     "./d1/config": { "types": "./dist/d1/config.d.ts", "import": "./dist/d1/config.js" },
+    "./d1/response-lease": { "types": "./dist/d1/response-lease.d.ts", "import": "./dist/d1/response-lease.js" },
     "./generator": {
       "types": "./dist/generator/config.d.ts",
       "import": "./dist/generator/config.js",
