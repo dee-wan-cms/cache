@@ -3,7 +3,7 @@ import type { D1Database } from '@cloudflare/workers-types';
 import type { CacheStore } from '../../src/core/types';
 import type { D1CacheProfile } from '../../src/d1/profile';
 import { createD1CacheRuntime } from '../../src/d1/env';
-import { limitD1ReadLeaseUntil, wrapD1ReadResponseLease } from '../../src/d1/read-response-lease';
+import { forwardD1ReadLease, limitD1ReadLeaseUntil, wrapD1ReadLeaseOrigin, wrapD1ReadResponseLease } from '../../src/d1/read-response-lease';
 
 const entries = new Map<string, Response>();
 const cache = { match:vi.fn(async (key: string) => entries.get(key)?.clone()), put:vi.fn(async (key: string, value: Response) => { entries.set(key, value.clone()); }) };
@@ -169,4 +169,40 @@ it('ignores unconfigured tracing headers and bypasses configured query keys', as
   await f.wrapped(f.req({}, 'https://test.example/metadata?q=test'), f.env, undefined);
   await f.wrapped(f.req({}, 'https://test.example/metadata?q=test'), f.env, undefined);
   expect(f.handler).toHaveBeenCalledTimes(3);
+});
+
+
+it('transports verified origin deadlines and strips forged request and response proofs', async () => {
+  const f = fixture();
+  let authorized = true;
+  let calls = 0;
+  const origin = vi.fn(async (request: Request) => {
+    expect(request.headers.has('x-dee-wan-read-lease-deadline')).toBe(false);
+    if (authorized) limitD1ReadLeaseUntil(Date.now() + 5000);
+    return Response.json({ count:++calls }, { headers:{ 'cache-control':'private, no-store', 'x-dee-wan-read-lease-deadline':'9999999999999' } });
+  });
+  const source = wrapD1ReadLeaseOrigin(origin);
+  const service = { fetch:(request: Request) => source(request, undefined, undefined) };
+  const gateway = wrapD1ReadResponseLease((request) => forwardD1ReadLease(request, service), profile);
+  const req = f.req({ 'x-dee-wan-read-lease-deadline':'9999999999999' });
+  const first = await gateway(req, f.env, undefined);
+  expect(first.headers.has('x-dee-wan-read-lease-deadline')).toBe(false);
+  expect(await first.json()).toHaveProperty('count', 1);
+  expect(await (await gateway(req, f.env, undefined)).json()).toHaveProperty('count', 1);
+  expect(origin).toHaveBeenCalledTimes(1);
+  authorized = false;
+  const other = f.req({ cookie:'session=b', 'x-dee-wan-read-lease-deadline':'9999999999999' });
+  const denied = await gateway(other, f.env, undefined);
+  expect(denied.headers.has('x-dee-wan-read-lease-deadline')).toBe(false);
+  await gateway(other, f.env, undefined);
+  expect(origin).toHaveBeenCalledTimes(3);
+});
+
+it('does not add proof to event streams or responses setting cookies', async () => {
+  for (const response of [new Response('data: hello\n\n', { headers:{ 'content-type':'text/event-stream' } }), Response.json({}, { headers:{ 'set-cookie':'session=x' } })]) {
+    const origin = wrapD1ReadLeaseOrigin(async () => { limitD1ReadLeaseUntil(Date.now() + 5000); return response; });
+    const result = await origin(new Request('https://test.example/metadata'), undefined, undefined);
+    expect(result).toBe(response);
+    expect(result.headers.has('x-dee-wan-read-lease-deadline')).toBe(false);
+  }
 });

@@ -127,3 +127,41 @@ export function wrapD1ReadResponseLease<Env extends object, Context>(handler: (r
     return response;
   };
 }
+
+const proofHeader = 'x-dee-wan-read-lease-deadline';
+
+function withoutProof(request: Request): Request {
+  if (!request.headers.has(proofHeader)) return request;
+  const headers = new Headers(request.headers);
+  headers.delete(proofHeader);
+  return new Request(request, { headers });
+}
+
+function responseWithProof(response: Response, deadline?: number): Response {
+  if (!response.headers.has(proofHeader) && deadline === undefined) return response;
+  const headers = new Headers(response.headers);
+  headers.delete(proofHeader);
+  if (deadline !== undefined) headers.set(proofHeader, String(Math.floor(deadline)));
+  return new Response(response.body, { status:response.status, statusText:response.statusText, headers, ...(response.webSocket ? { webSocket:response.webSocket } : {}) });
+}
+
+export function wrapD1ReadLeaseOrigin<Env, Context>(handler: (request: Request, env: Env, context: Context) => Promise<Response>): (request: Request, env: Env, context: Context) => Promise<Response> {
+  return async (request, env, context) => {
+    const lease: LeaseScope = {};
+    const response = await scope.run(lease, () => handler(withoutProof(request), env, context));
+    const deadline = lease.deadline;
+    const type = response.headers.get('content-type') ?? '';
+    if (request.method !== 'GET' || response.status !== 200 || response.headers.has('set-cookie') || !/^application\/(?:[a-z0-9.+-]*\+)?json(?:\s*;|$)/i.test(type) || deadline === undefined || !Number.isFinite(deadline) || deadline <= Date.now()) return responseWithProof(response);
+    return responseWithProof(response, deadline);
+  };
+}
+
+export async function forwardD1ReadLease(request: Request, service: { fetch(request: Request): Promise<Response> }): Promise<Response> {
+  const response = await service.fetch(withoutProof(request));
+  const raw = response.headers.get(proofHeader);
+  if (raw && /^\d+$/.test(raw)) {
+    const deadline = Number(raw);
+    if (Number.isSafeInteger(deadline) && deadline > Date.now()) limitD1ReadLeaseUntil(deadline);
+  }
+  return responseWithProof(response);
+}
