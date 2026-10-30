@@ -241,3 +241,97 @@ it('unscoped Prisma fill returns the database value when write and release hang'
   await expect(result).resolves.toEqual([{ id: 1 }]);
   expect(query).toHaveBeenCalledTimes(1);
 });
+
+it('retries a failed D1 cleanup after the database operation and preserves its result', async () => {
+  const { core, inspect, store } = setup();
+  const before = inspect();
+  let operationFinished = false;
+  let attempts = 0;
+  store.endWrite = async (request) => {
+    expect(operationFinished).toBe(true);
+    if (++attempts === 1) throw Error('temporary coordinator failure');
+    core.endWrite(request, Date.now());
+  };
+  const value = { count:1, duration:0 };
+  expect(await fenced(store, async () => { operationFinished = true; return value; }).exec('UPDATE catalogue SET name = 1')).toEqual(value);
+  expect(attempts).toBe(2);
+  expect(inspect().pending).toBe(false);
+  expect(inspect().epochs.g).toBeGreaterThan(before.epochs.g ?? 0);
+});
+
+it('retries cleanup after a failed database operation and preserves its error', async () => {
+  const { core, inspect, store } = setup();
+  let attempts = 0;
+  store.endWrite = async (request) => {
+    if (++attempts === 1) throw Error('temporary coordinator failure');
+    core.endWrite(request, Date.now());
+  };
+  const failure = new Error('database failure');
+  await expect(fenced(store, async () => { throw failure; }).exec('UPDATE catalogue SET name = 1')).rejects.toBe(failure);
+  expect(attempts).toBe(2);
+  expect(inspect().pending).toBe(false);
+});
+
+it('retries late cleanup after an ambiguous begin without executing the write', async () => {
+  vi.useFakeTimers();
+  const { core, inspect, store } = setup();
+  let resume: (() => void) | undefined;
+  store.beginWrite = async (request) => {
+    await new Promise<void>((resolve) => { resume = resolve; });
+    core.beginWrite(request, Date.now());
+  };
+  let attempts = 0;
+  store.endWrite = async (request) => {
+    if (++attempts === 1) throw Error('temporary coordinator failure');
+    core.endWrite(request, Date.now());
+  };
+  const execute = vi.fn(async () => ({ count:1, duration:0 }));
+  const result = fenced(store, execute).exec('UPDATE catalogue SET name = 1');
+  const assertion = expect(result).rejects.toBeInstanceOf(CacheUnavailableError);
+  await vi.advanceTimersByTimeAsync(2000);
+  await assertion;
+  expect(execute).not.toHaveBeenCalled();
+  resume?.();
+  await vi.advanceTimersByTimeAsync(0);
+  expect(attempts).toBe(2);
+  expect(inspect().pending).toBe(false);
+});
+
+it('preserves the write result when all cleanup attempts fail', async () => {
+  const { inspect, store } = setup();
+  const end = vi.fn(async () => { throw Error('coordinator unavailable'); });
+  store.endWrite = end;
+  const value = { count:1, duration:0 };
+  expect(await fenced(store, async () => value).exec('UPDATE catalogue SET name = 1')).toEqual(value);
+  expect(end).toHaveBeenCalledTimes(2);
+  expect(inspect().pending).toBe(true);
+});
+
+it('does not launch another cleanup after the shared deadline', async () => {
+  vi.useFakeTimers();
+  const { store } = setup();
+  let rejectEnd: ((error: Error) => void) | undefined;
+  const end = vi.fn(() => new Promise<void>((_, reject) => { rejectEnd = reject; }));
+  store.endWrite = end;
+  const value = { count:1, duration:0 };
+  const result = fenced(store, async () => value).exec('UPDATE catalogue SET name = 1');
+  await vi.advanceTimersByTimeAsync(2000);
+  await expect(result).resolves.toEqual(value);
+  rejectEnd?.(Error('late failure'));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(end).toHaveBeenCalledTimes(1);
+});
+
+it('retains the lease until the database operation settles', async () => {
+  const { inspect, store } = setup();
+  let finish: (() => void) | undefined;
+  let reached: (() => void) | undefined;
+  const waiting = new Promise<void>((resolve) => { finish = resolve; });
+  const started = new Promise<void>((resolve) => { reached = resolve; });
+  const result = fenced(store, async () => { reached?.(); await waiting; return { count:1, duration:0 }; }).exec('UPDATE catalogue SET name = 1');
+  await started;
+  expect(inspect().pending).toBe(true);
+  finish?.();
+  await result;
+  expect(inspect().pending).toBe(false);
+});

@@ -1,4 +1,4 @@
-import type { CacheStore } from '../core/types';
+import type { CacheStore, EndWriteRequest } from '../core/types';
 import { withinCoordinatorDeadline } from './deadline';
 
 const boundedStores = new WeakMap<CacheStore, CacheStore>();
@@ -8,6 +8,17 @@ export function boundedD1Store(store: CacheStore): CacheStore {
   if (existing) return existing;
   const failedBegins = new Set<string>();
   const inspectFences = store.inspectFences;
+  const endWrite = async (request: EndWriteRequest): Promise<void> => {
+    let active = true;
+    try {
+      await withinCoordinatorDeadline((async () => {
+        for (let attempt = 0; ; attempt++) {
+          try { await store.endWrite(request); return; }
+          catch (error) { if (!active || attempt === 1) throw error; }
+        }
+      })());
+    } finally { active = false; }
+  };
   const bounded: CacheStore = {
     ...store,
     ...(inspectFences ? { inspectFences: (request: Parameters<typeof inspectFences>[0]) => withinCoordinatorDeadline(Promise.resolve().then(() => inspectFences.call(store, request))) } : {}),
@@ -31,15 +42,15 @@ export function boundedD1Store(store: CacheStore): CacheStore {
       catch (error) {
         failedBegins.add(request.token);
         void begin.then(
-          () => store.endWrite({ fences: request.fences, token: request.token }),
-          () => store.endWrite({ fences: request.fences, token: request.token }),
+          () => endWrite({ fences: request.fences, token: request.token }),
+          () => endWrite({ fences: request.fences, token: request.token }),
         ).catch(() => undefined);
         throw error;
       }
     },
     async endWrite(request) {
       if (failedBegins.delete(request.token)) return;
-      await withinCoordinatorDeadline(Promise.resolve().then(() => store.endWrite(request)));
+      await endWrite(request);
     },
     invalidate: (fences) => withinCoordinatorDeadline(Promise.resolve().then(() => store.invalidate(fences))),
   };
