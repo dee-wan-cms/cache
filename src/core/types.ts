@@ -115,6 +115,7 @@ export interface CacheExtensionOptions {
   fillPollDelaysMs?: number[];
   generation?: string;
   coordinationGeneration?: string;
+  keyArgs?: (args: unknown) => unknown;
   leaseMs?: number;
   lockMs?: number;
   maxValueBytes?: number;

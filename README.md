@@ -240,3 +240,5 @@ physical-database coordinator.
 D1 coordinator calls have a 2-second deadline each. Reads fall back to D1 on failure;
 writes require a successful begin. A failed end preserves the database result and keeps
 the lease conservative. Late begins and read locks are cleaned up after they settle.
+
+`keyArgs` optionally maps read arguments to cache-key identity. Preserve every result-changing input in that identity. Execution and invalidation use the original arguments. Callback errors bypass the cache.

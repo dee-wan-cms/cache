@@ -208,3 +208,28 @@ describe("Decimal schemas", () => {
     expect(() => createCacheExtension({ config: { ...config, hasDecimalFields: true }, decimal: Decimal, store })).not.toThrow();
   });
 });
+
+it('uses keyArgs only for read identity and bypasses cache on callback errors', async () => {
+  const values = new Map<string, string>();
+  const { calls, store } = recordingStore({
+    read: async ({ key }) => values.has(key)
+      ? { kind: 'hit', epochs: { g: 0 }, refreshToken: null, value: values.get(key)! }
+      : miss,
+    write: async ({ key, value }) => { values.set(key, value); return { ok: true }; },
+  });
+  const executed: unknown[] = [];
+  const extension = createCacheExtension({ config, store, keyArgs: (args) => {
+    if (typeof args !== 'object' || args === null || !('where' in args)) throw new Error('bad args');
+    const where = args.where;
+    if (typeof where !== 'object' || where === null || !('id' in where)) throw new Error('bad where');
+    return { where: { id: String(where.id).split(':')[0] } };
+  } });
+  const run = (args: unknown) => extension.query.$allModels.$allOperations({ model: 'User', operation: 'findUnique', args, query: async (original) => { executed.push(original); return { id: executed.length }; } });
+  const first = { where: { id: 'a:1' } };
+  expect(await run(first)).toEqual({ id: 1 });
+  expect(await run({ where: { id: 'a:2' } })).toEqual({ id: 1 });
+  expect(await run({ where: { id: 'b:1' } })).toEqual({ id: 2 });
+  expect(await run({ invalid: true })).toEqual({ id: 3 });
+  expect(executed).toEqual([first, { where: { id: 'b:1' } }, { invalid: true }]);
+  expect(calls.filter(([name]) => name === 'read')).toHaveLength(3);
+});

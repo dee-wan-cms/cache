@@ -77,6 +77,7 @@ export function wrapD1Handler<Event, Env extends object, Context, Result>(handle
 export interface D1PrismaCacheOptions {
   scope: unknown;
   dependencies?: readonly D1Database[];
+  keyArgs?: (args: unknown) => unknown;
 }
 
 export function d1PrismaCacheExtension(database: object, config: GeneratedCacheConfig, optionsOrDecimal?: D1PrismaCacheOptions | DecimalConstructor, decimalArg?: DecimalConstructor): ReturnType<typeof createCacheExtension> | undefined {
@@ -86,7 +87,7 @@ export function d1PrismaCacheExtension(database: object, config: GeneratedCacheC
   const decimal = typeof optionsOrDecimal === 'function' ? optionsOrDecimal : decimalArg;
   const allowed = new Set(runtime.readModels);
   const scopedConfig = { ...config, cacheableByModel: Object.fromEntries(Object.entries(config.cacheableByModel).map(([model, enabled]) => [model, enabled && allowed.has(model)])) };
-  const common = { config: scopedConfig, store: runtime.store, generation: runtime.generation, coordinationGeneration: runtime.generation, ...(decimal ? { decimal } : {}) };
+  const common = { config: scopedConfig, store: runtime.store, generation: runtime.generation, coordinationGeneration: runtime.generation, ...(decimal ? { decimal } : {}), ...(options?.keyArgs ? { keyArgs: options.keyArgs } : {}) };
   const base = createCacheExtension({ ...common, scope: runtime.databaseId });
   if (!options) return base;
   const operation = base.query.$allModels.$allOperations;

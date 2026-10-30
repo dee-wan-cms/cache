@@ -190,7 +190,7 @@ export function createCacheExtension(options: CacheExtensionOptions) {
   async function handleRead(model: string, operation: string, args: unknown, query: Query, dataPath: unknown[]): Promise<unknown> {
     let key: string;
     try {
-      const identity = [PLANNER_VERSION, config.cacheVersion, scope, model, operation, dataPath, args ?? null];
+      const identity = [PLANNER_VERSION, config.cacheVersion, scope, model, operation, dataPath, (options.keyArgs ? options.keyArgs(args) : args) ?? null];
       key = `${model}:${await sha256Hex(stableStringify(identity))}`;
     } catch (error) {
       report(error, "key");
