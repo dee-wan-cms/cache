@@ -64,6 +64,39 @@ describe("read-through cache on workerd", () => {
     expect(second.value).toEqual(first.value);
   });
 
+  it("caches aggregates and invalidates them after a value change", async () => {
+    await seedUsers();
+    const aggregate = op("post", "aggregate", { _count: { _all: true }, _max: { id: true } });
+    const first = await one(aggregate);
+    expect(first.statements).toBeGreaterThan(0);
+    expect(first.value).toEqual({ _count: { _all: 1 }, _max: { id: 10 } });
+    expect((await expectCached(aggregate)).value).toEqual(first.value);
+    await one(op("post", "create", { data: { authorId: 2, id: 11, title: "Second" } }));
+    const refreshed = await one(aggregate);
+    expect(refreshed.statements).toBeGreaterThan(0);
+    expect(refreshed.value).toEqual({ _count: { _all: 2 }, _max: { id: 11 } });
+    expect((await expectCached(aggregate)).value).toEqual(refreshed.value);
+  });
+
+  it("caches grouped counts and invalidates them after a membership change", async () => {
+    await seedUsers();
+    await one(op("post", "create", { data: { authorId: 2, id: 11, title: "Second" } }));
+    const grouped = op("post", "groupBy", { by: ["authorId"], _count: { _all: true }, orderBy: { authorId: "asc" } });
+    const first = await one(grouped);
+    expect(first.statements).toBeGreaterThan(0);
+    expect(first.value).toEqual([
+      { authorId: 1, _count: { _all: 1 } },
+      { authorId: 2, _count: { _all: 1 } },
+    ]);
+    const warm = await expectCached(grouped);
+    expect(warm.value).toEqual(first.value);
+    await one(op("post", "update", { where: { id: 10 }, data: { authorId: 2 } }));
+    const refreshed = await one(grouped);
+    expect(refreshed.statements).toBeGreaterThan(0);
+    expect(refreshed.value).toEqual([{ authorId: 2, _count: { _all: 2 } }]);
+    expect((await expectCached(grouped)).value).toEqual(refreshed.value);
+  });
+
   it("caches a negative lookup and invalidates it when the row is created", async () => {
     await one(op("user", "findUnique", { where: { id: 99 } }));
     expect((await one(op("user", "findUnique", { where: { id: 99 } }))).statements).toBe(0);
