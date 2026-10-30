@@ -54,6 +54,18 @@ export function boundedValue(value: unknown, maxBytes: number, identity: boolean
 }
 
 export interface Snapshot { runtime: D1CacheRuntime; epoch: number }
+export function sameD1CacheDatabase(left: object, right: object): boolean {
+  const a = d1CacheRuntime(left);
+  const b = d1CacheRuntime(right);
+  return !!a && !!b && a.databaseId === b.databaseId && a.generation === b.generation && a.coordinatorIdentity === b.coordinatorIdentity && a.coordinatorName === b.coordinatorName;
+}
+export async function d1CacheEpoch(database: object): Promise<string | null> {
+  const runtime = d1CacheRuntime(database);
+  if (!runtime || !runtime.readsEnabled) return null;
+  const snapshot = await inspect([runtime]);
+  if (!snapshot?.[0]) return null;
+  return stableStringify([runtime.databaseId, runtime.generation, snapshot[0].epoch]);
+}
 export async function inspect(runtimes: readonly D1CacheRuntime[]): Promise<Snapshot[] | null> {
   if (runtimes.length === 0) return [];
   try {

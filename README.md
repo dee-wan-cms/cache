@@ -205,6 +205,13 @@ is independent of Prisma; other Prisma versions have not been validated by this 
 
 ### Explicit authorized reads
 
+`d1CacheEpoch(database)` returns an opaque namespace for a wrapped database's identity,
+generation and global write epoch. Capture it before reading that database and include
+every dependency's captured namespace in an external cache key. A missing runtime,
+disabled reads, pending write or coordinator failure returns `null`; bypass external
+cache reads and fills in that case. Old in-flight fills retain their old namespace.
+This does not authorize a request or invalidate downstream browser caches.
+
 `cacheD1Read(database, { key, scope, dependencies, ttlMs, cacheable }, load)` caches an
 explicitly selected read after the caller has completed authorization. Include the full
 actor, site, current permissions and all query inputs in `scope` and `key`, and list every

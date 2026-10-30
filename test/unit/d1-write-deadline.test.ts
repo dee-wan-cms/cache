@@ -5,6 +5,7 @@ import { CacheUnavailableError } from '../../src/core/extension';
 import { createCoordinatorCore, migrate } from '../../src/cloudflare/coordinator-core';
 import { fenceD1Writes } from '../../src/d1/adapter';
 import { createD1CacheRuntime, d1PrismaCacheExtension } from '../../src/d1/env';
+import { d1CacheEpoch } from '../../src/d1/read';
 import { memorySql } from './sqlite';
 
 function setup() {
@@ -93,6 +94,24 @@ const config = {
   primaryKeyFieldsByModel: { Post: ['id'] }, primaryKeyNameByModel: {}, relationGraph: {},
 };
 const profile = { unfencedWriteTables: [], readModels: ['Post'], envPrefix: 'CACHE', bindingNames: ['DB'], bindingPrefixes: [], coordinatorNamePrefix: 'test:', coordinatorClass: 'CacheCoordinator' };
+
+it('captures a namespace only while the global fence is available and idle', async () => {
+  const { core, store } = setup();
+  store.inspectFences = async (request) => core.inspectFences(request, Date.now());
+  const unused = (): never => { throw new Error('unused'); };
+  const db: D1Database = { exec: async () => ({ count: 1, duration: 0 }), prepare: unused, batch: unused, withSession: unused, dump: unused };
+  const wrapped = createD1CacheRuntime(db, { store, generation: '1', databaseId: 'db', profile });
+  expect(await d1CacheEpoch(db)).toBeNull();
+  const before = await d1CacheEpoch(wrapped);
+  expect(before).not.toBeNull();
+  await store.beginWrite({ fences: ['g'], generation: '1', leaseMs: 60000, token: 'pending' });
+  expect(await d1CacheEpoch(wrapped)).toBeNull();
+  await store.endWrite({ fences: ['g'], token: 'pending' });
+  expect(await d1CacheEpoch(wrapped)).not.toBe(before);
+  const unavailableStore = { ...store, inspectFences: async () => { throw new Error('unavailable'); } };
+  const unavailable = createD1CacheRuntime(db, { store: unavailableStore, generation: '1', databaseId: 'db', profile });
+  expect(await d1CacheEpoch(unavailable)).toBeNull();
+});
 
 function prismaExtension(store: CacheStore, scoped: boolean) {
   const unused = (): never => { throw new Error('unused'); };
