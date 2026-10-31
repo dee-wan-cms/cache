@@ -156,7 +156,13 @@ export function wrapD1ReadLeaseOrigin<Env, Context>(handler: (request: Request, 
 }
 
 export async function forwardD1ReadLease(request: Request, service: { fetch(request: Request): Promise<Response> }): Promise<Response> {
-  const response = await service.fetch(withoutProof(request));
+  let forwarded = withoutProof(request);
+  if (request.method === 'GET') {
+    const headers = new Headers(forwarded.headers);
+    headers.set('accept-encoding', 'identity');
+    forwarded = new Request(forwarded, { headers });
+  }
+  const response = await service.fetch(forwarded);
   const raw = response.headers.get(proofHeader);
   if (raw && /^\d+$/.test(raw)) {
     const deadline = Number(raw);

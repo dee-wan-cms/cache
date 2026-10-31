@@ -213,3 +213,30 @@ it('reuses a multi-megabyte response across native Cache API requests', async ()
     expect(warm).toBe(first);
   } finally { await worker.dispose(); }
 });
+
+it('negotiates identity encoding and reuses a large origin response across the service binding', async () => {
+  const source = originSource.replace("{ calls:++calls, forged, control:request.headers.get('cache-control') }", "{ calls:++calls, forged, encoding:request.headers.get('accept-encoding'), authorization:request.headers.get('authorization'), site:request.headers.get('x-site-id'), items:Array.from({ length:3000 }, (_, id) => ({ id, value:'x'.repeat(1000) })) }");
+  const makeBundle = async (contents: string) => {
+    const bundle = await build({ stdin:{ contents, resolveDir:resolve(__dirname, '../../src/d1'), loader:'ts' }, bundle:true, format:'esm', platform:'neutral', target:'es2022', external:['cloudflare:workers', 'node:async_hooks'], write:false });
+    const output = bundle.outputFiles[0];
+    if (!output) throw Error('bundle missing');
+    return output.text;
+  };
+  const origin = await makeBundle(source);
+  const gateway = await makeBundle(gatewaySource);
+  const worker = new Miniflare({ workers:[
+    { name:'gateway', modules:true, script:gateway, compatibilityDate:'2026-01-01', compatibilityFlags:['nodejs_compat'], d1Databases:['DB'], serviceBindings:{ ORIGIN:'origin' } },
+    { name:'origin', modules:true, script:origin, compatibilityDate:'2026-01-01', compatibilityFlags:['nodejs_compat'] },
+  ] });
+  try {
+    const headers = { cookie:'session=a', authorization:'Bearer token', origin:'https://site.example', 'x-site-id':'site-a', 'accept-encoding':'br, gzip', 'x-dee-wan-read-lease-deadline':'forged' };
+    const firstResponse = await worker.dispatchFetch('https://cache.test/metadata', { headers });
+    expect(firstResponse.headers.has('x-dee-wan-read-lease-deadline')).toBe(false);
+    const first = await firstResponse.text();
+    expect(new TextEncoder().encode(first).byteLength).toBeGreaterThan(3_000_000);
+    expect(JSON.parse(first)).toMatchObject({ calls:1, forged:false, encoding:'identity', authorization:'Bearer token', site:'site-a' });
+    const warm = await worker.dispatchFetch('https://cache.test/metadata', { headers });
+    expect(warm.headers.has('x-dee-wan-read-lease-deadline')).toBe(false);
+    expect(await warm.text()).toBe(first);
+  } finally { await worker.dispose(); }
+});

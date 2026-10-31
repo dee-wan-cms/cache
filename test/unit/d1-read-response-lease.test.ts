@@ -480,3 +480,63 @@ it('reuses a multi-megabyte JSON response and rejects oversized encoded envelope
   await rejected(request, f.env, undefined); await rejected(request, f.env, undefined);
   expect(tooLarge).toHaveBeenCalledTimes(2);
 });
+
+it('requests identity encoding across the binding without changing the caller or credentials', async () => {
+  const request = new Request('https://test.example/metadata', { headers:{ 'accept-encoding':'br, gzip', authorization:'Bearer token', cookie:'session=a', 'x-site-id':'site-a', 'x-dee-wan-read-lease-deadline':'forged' } });
+  const fetch = vi.fn(async (forwarded: Request) => {
+    expect(forwarded.headers.get('accept-encoding')).toBe('identity');
+    expect(forwarded.headers.get('authorization')).toBe('Bearer token');
+    expect(forwarded.headers.get('cookie')).toBe('session=a');
+    expect(forwarded.headers.get('x-site-id')).toBe('site-a');
+    expect(forwarded.headers.has('x-dee-wan-read-lease-deadline')).toBe(false);
+    return Response.json({}, { headers:{ 'x-dee-wan-read-lease-deadline':'123' } });
+  });
+  const response = await forwardD1ReadLease(request, { fetch });
+  expect(response.headers.has('x-dee-wan-read-lease-deadline')).toBe(false);
+  expect(request.headers.get('accept-encoding')).toBe('br, gzip');
+  expect(request.headers.get('authorization')).toBe('Bearer token');
+  expect(request.headers.get('cookie')).toBe('session=a');
+  expect(request.headers.get('x-site-id')).toBe('site-a');
+  expect(request.headers.get('x-dee-wan-read-lease-deadline')).toBe('forged');
+});
+
+it('reuses a large identity-encoded origin response but still rejects encoded responses', async () => {
+  const f = fixture();
+  const body = JSON.stringify({ items:Array.from({ length:3000 }, (_, id) => ({ id, value:'x'.repeat(1000) })) });
+  let calls = 0;
+  let encoded = false;
+  const source = wrapD1ReadLeaseOrigin(async (request: Request) => {
+    expect(request.headers.get('accept-encoding')).toBe('identity');
+    expect(request.headers.get('cookie')).toBe('session=a');
+    expect(request.headers.get('x-site-id')).toBe('site-a');
+    calls++;
+    limitD1ReadLeaseUntil(Date.now() + 10_000);
+    const headers = new Headers({ 'content-type':'application/json' });
+    if (encoded) headers.set('content-encoding', 'gzip');
+    return new Response(body, { headers });
+  });
+  const service = { fetch:(request: Request) => source(request, undefined, undefined) };
+  const wrapped = wrapD1ReadResponseLease((request) => forwardD1ReadLease(request, service), profile);
+  const request = f.req({ 'accept-encoding':'br, gzip', 'x-site-id':'site-a' });
+  expect(await (await wrapped(request, f.env, undefined)).text()).toBe(body);
+  expect(await (await wrapped(request, f.env, undefined)).text()).toBe(body);
+  expect(calls).toBe(1);
+  expect(request.headers.get('accept-encoding')).toBe('br, gzip');
+  encoded = true;
+  const other = f.req({ 'accept-encoding':'br, gzip', 'x-site-id':'site-a' }, 'https://test.example/metadata?encoded=1');
+  await wrapped(other, f.env, undefined); await wrapped(other, f.env, undefined);
+  expect(calls).toBe(3);
+});
+
+it('forwards write bodies without changing their encoding negotiation', async () => {
+  const request = new Request('https://test.example/metadata', { method:'POST', body:'{"value":1}', headers:{ 'content-type':'application/json', 'accept-encoding':'br, gzip', cookie:'session=a', 'x-dee-wan-read-lease-deadline':'forged' } });
+  const fetch = vi.fn(async (forwarded: Request) => {
+    expect(forwarded.headers.get('accept-encoding')).toBe('br, gzip');
+    expect(forwarded.headers.get('cookie')).toBe('session=a');
+    expect(forwarded.headers.has('x-dee-wan-read-lease-deadline')).toBe(false);
+    expect(await forwarded.text()).toBe('{"value":1}');
+    return Response.json({ ok:true });
+  });
+  await forwardD1ReadLease(request, { fetch });
+  expect(fetch).toHaveBeenCalledTimes(1);
+});
