@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { d1CacheRuntime } from './env';
 import { isD1BindingName, type D1CacheProfile } from './profile';
-import { responseLeaseKey, responseLeaseRead, responseLeaseWrite } from './regional';
+import { MAX_RESPONSE_LEASE_BYTES, responseLeaseKey, responseLeaseRead, responseLeaseWrite } from './regional';
 import { isMutation, matchesPath, needsFreshness } from './read-freshness-policy';
 import { hasCacheBypass, hasFreshnessCookie, hasFreshnessGeneration, validFreshnessHeader } from './request-freshness';
 import { registerRegionalDeadlineReporter } from './regional-deadline';
@@ -30,7 +30,7 @@ function decodeEntry(value: unknown, permittedVary: Set<string>): Response | nul
   const entry = value as Partial<Entry>;
   if (typeof entry.statusText !== 'string' || typeof entry.body !== 'string' || !Array.isArray(entry.headers) || !entry.headers.every((item) => Array.isArray(item) && item.length === 2 && typeof item[0] === 'string' && typeof item[1] === 'string')) return null;
   try {
-    if (new TextEncoder().encode(entry.body).byteLength > 1_500_000) return null;
+    if (new TextEncoder().encode(entry.body).byteLength > MAX_RESPONSE_LEASE_BYTES) return null;
     JSON.parse(entry.body);
     const headers = new Headers(entry.headers);
     const length = headers.get('content-length');
@@ -59,7 +59,7 @@ async function responseEntry(response: Response, permittedVary: Set<string>): Pr
       const part = await Promise.race([reader.read(), timeout]);
       if (part.done) break;
       size += part.value.byteLength;
-      if (size > 1_500_000) return null;
+      if (size > MAX_RESPONSE_LEASE_BYTES) return null;
       chunks.push(part.value);
     }
     const bytes = new Uint8Array(size);

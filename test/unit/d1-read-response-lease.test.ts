@@ -78,7 +78,7 @@ it('bypasses missing credentials, conditionals and unsafe responses', async () =
   const requests = [new Request('https://test.example/metadata'), f.req({ range:'bytes=0-2' }), f.req({ 'if-none-match':'x' })];
   for (const request of requests) { await f.wrapped(request, f.env, undefined); await f.wrapped(request, f.env, undefined); }
   expect(f.handler).toHaveBeenCalledTimes(6);
-  for (const response of [new Response('{}', { status:401, headers:{ 'content-type':'application/json' } }), new Response('{}', { headers:{ 'content-type':'application/json', 'set-cookie':'secret=x' } }), new Response('text'), new Response('{}', { headers:{ 'content-type':'application/json', vary:'X-Unknown' } }), new Response(JSON.stringify({ data:'x'.repeat(1_500_001) }), { headers:{ 'content-type':'application/json' } })]) {
+  for (const response of [new Response('{}', { status:401, headers:{ 'content-type':'application/json' } }), new Response('{}', { headers:{ 'content-type':'application/json', 'set-cookie':'secret=x' } }), new Response('text'), new Response('{}', { headers:{ 'content-type':'application/json', vary:'X-Unknown' } }), new Response(JSON.stringify({ data:'x'.repeat(8_000_001) }), { headers:{ 'content-type':'application/json' } })]) {
     const load = vi.fn(async () => { limitD1ReadLeaseUntil(Date.now() + 5000); return response.clone(); });
     const wrapped = wrapD1ReadResponseLease(load, profile);
     await wrapped(f.req(), f.env, undefined); await wrapped(f.req(), f.env, undefined);
@@ -460,4 +460,23 @@ it('caps a 300-second lease at the verified session deadline', async () => {
   expect(calls).toBe(1);
   vi.setSystemTime(110_000); await wrapped(f.req(), env, undefined);
   expect(calls).toBe(2);
+});
+
+it('reuses a multi-megabyte JSON response and rejects oversized encoded envelopes', async () => {
+  const f = fixture();
+  const body = JSON.stringify({ items:Array.from({ length:3000 }, (_, id) => ({ id, value:'x'.repeat(1000) })) });
+  expect(new TextEncoder().encode(body).byteLength).toBeGreaterThan(3_000_000);
+  let calls = 0;
+  const handler = vi.fn(async () => { calls++; limitD1ReadLeaseUntil(Date.now() + 10_000); return new Response(body, { headers:{ 'content-type':'application/json', 'cache-control':'private, no-store' } }); });
+  const wrapped = wrapD1ReadResponseLease(handler, profile);
+  expect(await (await wrapped(f.req(), f.env, undefined)).text()).toBe(body);
+  expect(await (await wrapped(f.req(), f.env, undefined)).text()).toBe(body);
+  expect(calls).toBe(1);
+  const escaped = JSON.stringify({ value:'"'.repeat(3_000_000) });
+  expect(new TextEncoder().encode(escaped).byteLength).toBeLessThan(8_000_000);
+  const tooLarge = vi.fn(async () => { limitD1ReadLeaseUntil(Date.now() + 10_000); return new Response(escaped, { headers:{ 'content-type':'application/json' } }); });
+  const rejected = wrapD1ReadResponseLease(tooLarge, profile);
+  const request = f.req({}, 'https://test.example/metadata?oversize=1');
+  await rejected(request, f.env, undefined); await rejected(request, f.env, undefined);
+  expect(tooLarge).toHaveBeenCalledTimes(2);
 });

@@ -4,8 +4,9 @@ import type { DecimalConstructor } from '../core/types';
 
 const MAX_IDENTITY_BYTES = 32_768;
 const MAX_VALUE_BYTES = 1_500_000;
+export const MAX_RESPONSE_LEASE_BYTES = 8_000_000;
 
-function createRegionalCache(maxMs: number) {
+function createRegionalCache(maxMs: number, maxValueBytes = MAX_VALUE_BYTES) {
   async function regionalKey(ttl: number | undefined, identity: unknown): Promise<string | null> {
     if (!Number.isFinite(ttl) || !ttl || ttl <= 0 || ttl > maxMs || !boundedValue(identity, MAX_IDENTITY_BYTES, true)) return null;
     try {
@@ -31,7 +32,7 @@ function createRegionalCache(maxMs: number) {
           const part = await Promise.race([reader.read(), timeout]);
           if (part.done) break;
           size += part.value.byteLength;
-          if (size > MAX_VALUE_BYTES) return null;
+          if (size > maxValueBytes) return null;
           chunks.push(part.value);
         }
       } finally {
@@ -46,17 +47,17 @@ function createRegionalCache(maxMs: number) {
       const now = Date.now();
       if (!Number.isFinite(ttl) || ttl <= 0 || ttl > maxMs || !envelope || typeof envelope !== 'object' || !('started' in envelope) || typeof envelope.started !== 'number' || !Number.isSafeInteger(envelope.started) || envelope.started > now || !('expires' in envelope) || typeof envelope.expires !== 'number' || !Number.isSafeInteger(envelope.expires) || envelope.expires <= now || envelope.expires > envelope.started + ttl || envelope.expires > now + ttl || !('value' in envelope)) return null;
       const value = decode(envelope.value, decimal);
-      return value !== null && value !== undefined && boundedValue(value, MAX_VALUE_BYTES, false) && stableStringify(encode(value)) === stableStringify(envelope.value) ? { value, expires: envelope.expires } : null;
+      return value !== null && value !== undefined && boundedValue(value, maxValueBytes, false) && stableStringify(encode(value)) === stableStringify(envelope.value) ? { value, expires: envelope.expires } : null;
     } catch { return null; }
   }
 
   async function regionalWrite(key: string | null, ttl: number | undefined, started: number, value: unknown): Promise<void> {
-    if (!key || !ttl || !Number.isFinite(ttl) || ttl <= 0 || ttl > maxMs || value === null || value === undefined || !boundedValue(value, MAX_VALUE_BYTES, false)) return;
+    if (!key || !ttl || !Number.isFinite(ttl) || ttl <= 0 || ttl > maxMs || value === null || value === undefined || !boundedValue(value, maxValueBytes, false)) return;
     try {
       const expires = Math.floor(started + ttl);
       if (expires <= Date.now()) return;
       const text = JSON.stringify({ started: Math.floor(started), expires, value: encode(value) });
-      if (new TextEncoder().encode(text).byteLength > MAX_VALUE_BYTES) return;
+      if (new TextEncoder().encode(text).byteLength > maxValueBytes) return;
       await caches.default.put(key, new Response(text, { headers: { 'Cache-Control': `public, max-age=${maxMs / 1000}` } }));
     } catch { /* Cache API is optional. */ }
   }
@@ -65,4 +66,4 @@ function createRegionalCache(maxMs: number) {
 }
 
 export const { regionalKey, regionalRead, regionalWrite } = createRegionalCache(5000);
-export const { regionalKey: responseLeaseKey, regionalRead: responseLeaseRead, regionalWrite: responseLeaseWrite } = createRegionalCache(300_000);
+export const { regionalKey: responseLeaseKey, regionalRead: responseLeaseRead, regionalWrite: responseLeaseWrite } = createRegionalCache(300_000, MAX_RESPONSE_LEASE_BYTES);
