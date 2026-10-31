@@ -16,6 +16,8 @@ export interface D1CacheProfile extends D1WritePolicy {
     credentialHeaders: readonly string[];
     varyHeaders: readonly string[];
     bypassQueryParams?: readonly string[];
+    ignoreRequestCacheControl?: boolean;
+    freshnessHeader?: string;
     freshnessCookie: string;
   };
 }

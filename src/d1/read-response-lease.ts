@@ -19,7 +19,7 @@ const noCache = (request: Request): Request => {
   return new Request(request, { headers });
 };
 const hasMarker = (request: Request, name: string): boolean => (request.headers.get('cookie') ?? '').split(';').some((part) => part.trim().split('=', 1)[0] === name);
-const bypass = (request: Request): boolean => request.body !== null || ['range','if-match','if-none-match','if-modified-since','if-unmodified-since','if-range'].some((name) => request.headers.has(name)) || (request.headers.get('cache-control') ?? '').split(',').some((part) => /^\s*(?:no-cache|no-store)(?:\s*=|\s*$)/i.test(part));
+const bypass = (request: Request, ignoreCacheControl: boolean): boolean => request.body !== null || ['range','if-match','if-none-match','if-modified-since','if-unmodified-since','if-range'].some((name) => request.headers.has(name)) || (!ignoreCacheControl && (request.headers.get('cache-control') ?? '').split(',').some((part) => /^\s*(?:no-cache|no-store)(?:\s*=|\s*$)/i.test(part)));
 const matchesPath = (pathname: string, patterns: readonly string[]): boolean => {
   const actual = pathname.split('/');
   return patterns.some((pattern) => {
@@ -98,8 +98,9 @@ export function wrapD1ReadResponseLease<Env extends object, Context>(handler: (r
     }
     if (request.method !== 'GET') return handler(request, env, context);
     if (hasMarker(request, config.freshnessCookie)) return handler(noCache(request), env, context);
+    if (config.freshnessHeader !== undefined && (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(config.freshnessHeader) || request.headers.has(config.freshnessHeader))) return handler(noCache(request), env, context);
     const url = new URL(request.url);
-    if (bypass(request) || !matchesPath(url.pathname, config.paths) || config.bypassQueryParams?.some((name) => url.searchParams.has(name)) || !config.credentialHeaders.some((name) => !!request.headers.get(name)?.trim())) return handler(request, env, context);
+    if (bypass(request, config.ignoreRequestCacheControl === true) || !matchesPath(url.pathname, config.paths) || config.bypassQueryParams?.some((name) => url.searchParams.has(name)) || !config.credentialHeaders.some((name) => !!request.headers.get(name)?.trim())) return handler(request, env, context);
     const identities: unknown[] = [];
     for (const [name, value] of Object.entries(env)) {
       if (!isD1BindingName(name, profile)) continue;

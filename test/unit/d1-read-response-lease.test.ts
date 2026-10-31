@@ -206,3 +206,37 @@ it('does not add proof to event streams or responses setting cookies', async () 
     expect(result.headers.has('x-dee-wan-read-lease-deadline')).toBe(false);
   }
 });
+
+it('optionally reuses leases despite browser cache directives while explicit freshness forces the source', async () => {
+  const f = fixture();
+  const base = profile.readResponseLease;
+  if (!base) throw Error('lease policy missing');
+  const policy: D1CacheProfile = { ...profile, readResponseLease:{ ...base, ignoreRequestCacheControl:true, freshnessHeader:'x-read-fresh' } };
+  const wrapped = wrapD1ReadResponseLease(f.handler, policy);
+  const run = (headers: Record<string,string> = {}) => wrapped(f.req(headers), f.env, undefined);
+  expect(await (await run({ 'cache-control':'no-cache' })).json()).toHaveProperty('calls', 1);
+  expect(await (await run({ 'cache-control':'no-store' })).json()).toHaveProperty('calls', 1);
+  expect(f.handler).toHaveBeenCalledTimes(1);
+  expect(await (await run({ 'x-read-fresh':'1', 'cache-control':'no-store' })).json()).toHaveProperty('calls', 2);
+  expect(f.handler.mock.calls.at(-1)?.[0].headers.get('cache-control')).toBe('no-cache');
+  expect(await (await run({ cookie:'session=a; fresh=1', 'cache-control':'no-cache' })).json()).toHaveProperty('calls', 3);
+  const write = await wrapped(f.req({}, 'https://test.example/metadata', 'POST'), f.env, undefined);
+  expect(write.headers.get('set-cookie')).toContain('fresh=1');
+  expect(f.handler).toHaveBeenCalledTimes(4);
+  expect(await (await run()).json()).toHaveProperty('calls', 1);
+});
+
+it('preserves default cache directive bypass and fails safe for an invalid freshness header', async () => {
+  const f = fixture();
+  await f.wrapped(f.req({ 'cache-control':'no-cache' }), f.env, undefined);
+  await f.wrapped(f.req({ 'cache-control':'no-store' }), f.env, undefined);
+  expect(f.handler).toHaveBeenCalledTimes(2);
+  const base = profile.readResponseLease;
+  if (!base) throw Error('lease policy missing');
+  const invalid: D1CacheProfile = { ...profile, readResponseLease:{ ...base, ignoreRequestCacheControl:true, freshnessHeader:'bad header' } };
+  const wrapped = wrapD1ReadResponseLease(f.handler, invalid);
+  await wrapped(f.req(), f.env, undefined);
+  await wrapped(f.req(), f.env, undefined);
+  expect(f.handler).toHaveBeenCalledTimes(4);
+  expect(f.handler.mock.calls.at(-1)?.[0].headers.get('cache-control')).toBe('no-cache');
+});
