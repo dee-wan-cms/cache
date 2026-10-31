@@ -57,8 +57,8 @@ it('transports verified leases across a trusted service binding without exposing
     if (!output) throw Error('bundle missing');
     return output.text;
   };
-  const origin = await makeBundle(originSource);
-  const gateway = await makeBundle(gatewaySource);
+  const origin = await makeBundle(originSource.replace("  const forged = request.headers.has('x-dee-wan-read-lease-deadline');", "  if (request.method === 'GET' && url.pathname === '/metadata' && !request.headers.get('cookie')?.includes('fresh=1') && request.headers.get('x-read-fresh') !== '1') throw Error('missing internal freshness header');\n  const forged = request.headers.has('x-dee-wan-read-lease-deadline');"));
+  const gateway = await makeBundle(gatewaySource.replace("freshnessCookie:'fresh'", "freshnessCookie:'fresh', freshnessHeader:'x-read-fresh'"));
   const worker = new Miniflare({ workers:[
     { name:'gateway', modules:true, script:gateway, compatibilityDate:'2026-01-01', compatibilityFlags:['nodejs_compat'], d1Databases:['DB'], serviceBindings:{ ORIGIN:'origin' } },
     { name:'origin', modules:true, script:origin, compatibilityDate:'2026-01-01', compatibilityFlags:['nodejs_compat'] },

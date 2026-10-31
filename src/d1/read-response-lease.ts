@@ -119,7 +119,9 @@ export function wrapD1ReadResponseLease<Env extends object, Context>(handler: (r
     }
     const started = requestStarted;
     const lease: LeaseScope = {};
-    const response = await scope.run(lease, () => handler(noCache(request), env, context));
+    const source = noCache(request);
+    if (config.freshnessHeader !== undefined) source.headers.set(config.freshnessHeader, '1');
+    const response = await scope.run(lease, () => handler(source, env, context));
     if (lease.deadline === undefined || !Number.isFinite(lease.deadline)) return response;
     const fillTtl = Math.min(ttl, lease.deadline - started, (lease.dataDeadline ?? Infinity) - started);
     const fill = (async () => {

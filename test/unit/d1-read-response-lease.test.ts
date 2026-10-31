@@ -243,6 +243,29 @@ it('preserves default cache directive bypass and fails safe for an invalid fresh
   expect(f.handler.mock.calls.at(-1)?.[0].headers.get('cache-control')).toBe('no-cache');
 });
 
+it('loads lease misses with fresh metadata and preserves explicit freshness bypass', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(100_000);
+  const f = fixture();
+  const base = profile.readResponseLease;
+  if (!base) throw Error('lease policy missing');
+  const config = { ...base, maxSeconds:30, ignoreRequestCacheControl:true, freshnessHeader:'x-read-fresh' };
+  const policy: D1CacheProfile = { ...profile, readResponseLease:config };
+  const env = { ...f.env, TEST_READ_ACCESS_SECONDS:'30' };
+  let calls = 0;
+  const handler = vi.fn(async (request: Request) => {
+    limitD1ReadLeaseUntil(200_000);
+    return Response.json({ calls:++calls, fresh:request.headers.get('x-read-fresh'), control:request.headers.get('cache-control'), metadataTtl:regionalD1MetadataTtl(request, config) });
+  });
+  const wrapped = wrapD1ReadResponseLease(handler, policy);
+  expect(await (await wrapped(f.req(), env, undefined)).json()).toMatchObject({ calls:1, fresh:'1', control:'no-cache', metadataTtl:0 });
+  vi.setSystemTime(106_000);
+  expect(await (await wrapped(f.req(), env, undefined)).json()).toHaveProperty('calls', 1);
+  expect(handler).toHaveBeenCalledTimes(1);
+  expect(await (await wrapped(f.req({ 'x-read-fresh':'1' }), env, undefined)).json()).toHaveProperty('calls', 2);
+  expect(await (await wrapped(f.req(), env, undefined)).json()).toHaveProperty('calls', 1);
+  expect(handler).toHaveBeenCalledTimes(2);
+});
+
 it('omits the freshness cookie only for excluded write paths and keeps the handler response intact', async () => {
   const f = fixture();
   const base = profile.readResponseLease;
