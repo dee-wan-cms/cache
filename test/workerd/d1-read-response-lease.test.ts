@@ -162,6 +162,10 @@ it('enforces a thirty-second response lease and writer freshness in native Cache
     expect(write.headers.get('set-cookie')).toContain('fresh=1; Max-Age=30;');
     expect(await (await fetch(129999, 'GET', 'session=a; fresh=1')).json()).toHaveProperty('calls', 3);
     expect(await (await fetch(130000)).json()).toHaveProperty('calls', 4);
+    const forced = await worker.dispatchFetch('https://cache.test/metadata', { headers:{ cookie:'session=a', 'x-test-now':'130001', 'x-read-fresh':'1' } });
+    expect(await forced.json()).toHaveProperty('calls', 5);
+    expect(await (await fetch(130002)).json()).toHaveProperty('calls', 5);
+    expect(await (await fetch(160001)).json()).toHaveProperty('calls', 6);
   } finally { await worker.dispose(); }
 });
 

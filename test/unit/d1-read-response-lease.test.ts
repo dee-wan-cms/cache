@@ -353,7 +353,7 @@ it('optionally reuses leases despite browser cache directives while explicit fre
   const write = await wrapped(f.req({}, 'https://test.example/metadata', 'POST'), f.env, undefined);
   expect(write.headers.get('set-cookie')).toContain('fresh=1');
   expect(f.handler).toHaveBeenCalledTimes(4);
-  expect(await (await run()).json()).toHaveProperty('calls', 1);
+  expect(await (await run()).json()).toHaveProperty('calls', 2);
 });
 
 it('preserves default cache directive bypass and fails safe for an invalid freshness header', async () => {
@@ -371,7 +371,7 @@ it('preserves default cache directive bypass and fails safe for an invalid fresh
   expect(f.handler.mock.calls.at(-1)?.[0].headers.get('cache-control')).toBe('no-cache');
 });
 
-it('loads lease misses with fresh metadata and preserves explicit freshness bypass', async () => {
+it('loads fresh metadata and replaces the lease after explicit freshness', async () => {
   vi.useFakeTimers(); vi.setSystemTime(100_000);
   const f = fixture();
   const base = profile.readResponseLease;
@@ -390,8 +390,28 @@ it('loads lease misses with fresh metadata and preserves explicit freshness bypa
   expect(await (await wrapped(f.req(), env, undefined)).json()).toHaveProperty('calls', 1);
   expect(handler).toHaveBeenCalledTimes(1);
   expect(await (await wrapped(f.req({ 'x-read-fresh':'1' }), env, undefined)).json()).toHaveProperty('calls', 2);
-  expect(await (await wrapped(f.req(), env, undefined)).json()).toHaveProperty('calls', 1);
+  expect(await (await wrapped(f.req(), env, undefined)).json()).toHaveProperty('calls', 2);
   expect(handler).toHaveBeenCalledTimes(2);
+  vi.setSystemTime(135_999);
+  expect(await (await wrapped(f.req(), env, undefined)).json()).toHaveProperty('calls', 2);
+  vi.setSystemTime(136_000);
+  expect(await (await wrapped(f.req(), env, undefined)).json()).toHaveProperty('calls', 3);
+});
+
+it('does not replace a warm lease with an unsafe fresh source response', async () => {
+  const f = fixture();
+  const base = profile.readResponseLease;
+  if (!base) throw Error('lease policy missing');
+  let calls = 0;
+  const source = vi.fn(async () => {
+    limitD1ReadLeaseUntil(Date.now() + 10_000);
+    return ++calls === 1 ? Response.json({ calls }) : new Response('{}', { status:401, headers:{ 'content-type':'application/json' } });
+  });
+  const wrapped = wrapD1ReadResponseLease(source, { ...profile, readResponseLease:{ ...base, freshnessHeader:'x-read-fresh' } });
+  expect(await (await wrapped(f.req(), f.env, undefined)).json()).toHaveProperty('calls', 1);
+  expect((await wrapped(f.req({ 'x-read-fresh':'1' }), f.env, undefined)).status).toBe(401);
+  expect(await (await wrapped(f.req(), f.env, undefined)).json()).toHaveProperty('calls', 1);
+  expect(source).toHaveBeenCalledTimes(2);
 });
 
 it('omits the freshness cookie only for excluded write paths and keeps the handler response intact', async () => {
@@ -487,6 +507,8 @@ it('opts into thirty-second leases without sliding and makes writer-marker reads
   expect(await (await wrapped(f.req({ cookie:'session=a; fresh=1' }), env, undefined)).json()).toHaveProperty('calls', 3);
   expect(await (await wrapped(f.req({ 'x-read-fresh':'1' }), env, undefined)).json()).toHaveProperty('calls', 4);
   vi.setSystemTime(130_000);
+  expect(await (await wrapped(f.req(), env, undefined)).json()).toHaveProperty('calls', 4);
+  vi.setSystemTime(159_999);
   expect(await (await wrapped(f.req(), env, undefined)).json()).toHaveProperty('calls', 5);
 });
 

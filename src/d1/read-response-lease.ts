@@ -110,7 +110,8 @@ export function wrapD1ReadResponseLease<Env extends object, Context>(handler: (r
     }
     if (request.method !== 'GET') return handler(request, env, context);
     if (hasFreshnessCookie(request, config.freshnessCookie) && (!generationMode || !hasFreshnessGeneration(request, config.freshnessCookie))) return handler(noCache(request), env, context);
-    if (config.freshnessHeader !== undefined && (!validFreshnessHeader(config.freshnessHeader) || request.headers.has(config.freshnessHeader))) return handler(noCache(request), env, context);
+    if (config.freshnessHeader !== undefined && !validFreshnessHeader(config.freshnessHeader)) return handler(noCache(request), env, context);
+    const forceSource = config.freshnessHeader !== undefined && request.headers.has(config.freshnessHeader);
     const url = new URL(request.url);
     const headerValue = (name: string): string | null => name.toLowerCase() === 'cookie' && config.cookieNames !== undefined ? selectedCookies(request.headers.get('cookie'), config.cookieNames) : request.headers.get(name);
     const hasCredential = (name: string): boolean => {
@@ -118,7 +119,7 @@ export function wrapD1ReadResponseLease<Env extends object, Context>(handler: (r
       if (name.toLowerCase() !== 'cookie' || config.cookieNames === undefined) return !!value?.trim();
       return (value ?? '').split(';').some((pair) => { const separator = pair.indexOf('='); return separator > 0 && pair.slice(0, separator).trim() !== config.freshnessCookie && !!pair.slice(separator + 1).trim(); });
     };
-    if (bypass(request, config.ignoreRequestCacheControl === true) || !matchesPath(url.pathname, config.paths) || config.bypassQueryParams?.some((name) => url.searchParams.has(name)) || !config.credentialHeaders.some(hasCredential)) return handler(request, env, context);
+    if (bypass(request, config.ignoreRequestCacheControl === true) || !matchesPath(url.pathname, config.paths) || config.bypassQueryParams?.some((name) => url.searchParams.has(name)) || !config.credentialHeaders.some(hasCredential)) return handler(forceSource ? noCache(request) : request, env, context);
     const identities: unknown[] = [];
     for (const [name, value] of Object.entries(env)) {
       if (!isD1BindingName(name, profile)) continue;
@@ -132,7 +133,7 @@ export function wrapD1ReadResponseLease<Env extends object, Context>(handler: (r
     const ttl = seconds * 1000;
     const key = await responseLeaseKey(ttl, ['d1-response-lease-v2', request.method, request.url, profile, release, identities, names.map((name) => [name, headerValue(name)])]);
     if (!key) return handler(noCache(request), env, context);
-    const cached = await readLease(key, ttl, permittedVary);
+    const cached = forceSource ? null : await readLease(key, ttl, permittedVary);
     if (cached) return cached;
     const started = requestStarted;
     const lease: LeaseScope = {};
