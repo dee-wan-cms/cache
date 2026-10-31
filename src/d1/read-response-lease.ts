@@ -1,11 +1,14 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { d1CacheRuntime } from './env';
 import { isD1BindingName, type D1CacheProfile } from './profile';
-import { regionalKey, regionalRead, regionalWrite } from './regional';
+import { responseLeaseKey, responseLeaseRead, responseLeaseWrite } from './regional';
 import { isMutation, matchesPath, needsFreshness } from './read-freshness-policy';
+import { hasCacheBypass, hasFreshnessCookie, hasFreshnessGeneration, validFreshnessHeader } from './request-freshness';
+import { registerRegionalDeadlineReporter } from './regional-deadline';
 
-interface LeaseScope { deadline?: number }
+interface LeaseScope { deadline?: number; dataDeadline?: number }
 const scope = new AsyncLocalStorage<LeaseScope>();
+registerRegionalDeadlineReporter((deadline) => { const current = scope.getStore(); if (current) current.dataDeadline = Math.min(current.dataDeadline ?? Infinity, deadline); });
 
 export function limitD1ReadLeaseUntil(deadline: number | undefined): void {
   const current = scope.getStore();
@@ -19,8 +22,7 @@ const noCache = (request: Request): Request => {
   headers.set('cache-control', 'no-cache');
   return new Request(request, { headers });
 };
-const hasMarker = (request: Request, name: string): boolean => (request.headers.get('cookie') ?? '').split(';').some((part) => part.trim().split('=', 1)[0] === name);
-const bypass = (request: Request, ignoreCacheControl: boolean): boolean => request.body !== null || ['range','if-match','if-none-match','if-modified-since','if-unmodified-since','if-range'].some((name) => request.headers.has(name)) || (!ignoreCacheControl && (request.headers.get('cache-control') ?? '').split(',').some((part) => /^\s*(?:no-cache|no-store)(?:\s*=|\s*$)/i.test(part)));
+const bypass = (request: Request, ignoreCacheControl: boolean): boolean => request.body !== null || ['range','if-match','if-none-match','if-modified-since','if-unmodified-since','if-range'].some((name) => request.headers.has(name)) || (!ignoreCacheControl && hasCacheBypass(request));
 
 interface Entry { statusText: string; headers: [string, string][]; body: string }
 function decodeEntry(value: unknown, permittedVary: Set<string>): Response | null {
@@ -77,22 +79,24 @@ export function wrapD1ReadResponseLease<Env extends object, Context>(handler: (r
     const requestStarted = Date.now();
     const config = profile.readResponseLease;
     const rawSeconds: unknown = Reflect.get(env, `${profile.envPrefix}_READ_ACCESS_SECONDS`);
-    const seconds = typeof rawSeconds === 'string' && /^[0-5]$/.test(rawSeconds) ? Number(rawSeconds) : 0;
-    if (!config || !seconds || !/^[A-Za-z0-9_-]+$/.test(config.freshnessCookie)) return handler(request, env, context);
+    const maxSeconds = config?.maxSeconds ?? 5;
+    const seconds = typeof rawSeconds === 'string' && /^(?:0|[1-9]|[12]\d|30)$/.test(rawSeconds) ? Number(rawSeconds) : 0;
+    if (!config || !Number.isInteger(maxSeconds) || maxSeconds < 1 || maxSeconds > 30 || !seconds || seconds > maxSeconds || !/^[A-Za-z0-9_-]+$/.test(config.freshnessCookie)) return handler(request, env, context);
     const release: unknown = Reflect.get(env, config.deploymentEnv);
     const database: unknown = Reflect.get(env, config.databaseBinding);
     const runtime = database && typeof database === 'object' ? d1CacheRuntime(database) : undefined;
     if (!isD1BindingName(config.databaseBinding, profile) || typeof release !== 'string' || !release.trim() || !runtime?.readsEnabled || !runtime.regionalIdentity) return handler(request, env, context);
+    const generationMode = config.freshnessCookieMode === 'generation' && config.credentialHeaders.some((name) => name.toLowerCase() === 'cookie');
     if (isMutation(request.method)) {
       const response = await handler(request, env, context);
       if (response.status < 200 || response.status >= 300 || !needsFreshness(request.method, new URL(request.url).pathname, config.freshnessCookieExcludedPaths)) return response;
       const headers = new Headers(response.headers);
-      headers.append('set-cookie', `${config.freshnessCookie}=1; Max-Age=5; Path=/; HttpOnly; SameSite=Lax${new URL(request.url).protocol === 'https:' ? '; Secure' : ''}`);
+      headers.append('set-cookie', `${config.freshnessCookie}=${generationMode ? crypto.randomUUID() : '1'}; Max-Age=${maxSeconds}; Path=/; HttpOnly; SameSite=Lax${new URL(request.url).protocol === 'https:' ? '; Secure' : ''}`);
       return new Response(response.body, { status:response.status, statusText:response.statusText, headers });
     }
     if (request.method !== 'GET') return handler(request, env, context);
-    if (hasMarker(request, config.freshnessCookie)) return handler(noCache(request), env, context);
-    if (config.freshnessHeader !== undefined && (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(config.freshnessHeader) || request.headers.has(config.freshnessHeader))) return handler(noCache(request), env, context);
+    if (hasFreshnessCookie(request, config.freshnessCookie) && (!generationMode || !hasFreshnessGeneration(request, config.freshnessCookie))) return handler(noCache(request), env, context);
+    if (config.freshnessHeader !== undefined && (!validFreshnessHeader(config.freshnessHeader) || request.headers.has(config.freshnessHeader))) return handler(noCache(request), env, context);
     const url = new URL(request.url);
     if (bypass(request, config.ignoreRequestCacheControl === true) || !matchesPath(url.pathname, config.paths) || config.bypassQueryParams?.some((name) => url.searchParams.has(name)) || !config.credentialHeaders.some((name) => !!request.headers.get(name)?.trim())) return handler(request, env, context);
     const identities: unknown[] = [];
@@ -106,9 +110,9 @@ export function wrapD1ReadResponseLease<Env extends object, Context>(handler: (r
     const names = [...new Set([...config.credentialHeaders, ...config.varyHeaders].map((name) => name.toLowerCase()))].sort();
     const permittedVary = new Set(names);
     const ttl = seconds * 1000;
-    const key = await regionalKey(ttl, ['d1-response-lease-v1', request.method, request.url, profile, release, identities, names.map((name) => [name, request.headers.get(name)])]);
+    const key = await responseLeaseKey(ttl, ['d1-response-lease-v1', request.method, request.url, profile, release, identities, names.map((name) => [name, request.headers.get(name)])]);
     if (!key) return handler(noCache(request), env, context);
-    const cached = await regionalRead(key, ttl);
+    const cached = await responseLeaseRead(key, ttl);
     if (cached) {
       const response = decodeEntry(cached.value, permittedVary);
       if (response) return response;
@@ -118,7 +122,7 @@ export function wrapD1ReadResponseLease<Env extends object, Context>(handler: (r
     const response = await scope.run(lease, () => handler(noCache(request), env, context));
     if (lease.deadline === undefined || !Number.isFinite(lease.deadline)) return response;
     const entry = await responseEntry(response, permittedVary);
-    if (entry) await regionalWrite(key, Math.min(ttl, lease.deadline - started), started, entry);
+    if (entry) await responseLeaseWrite(key, Math.min(ttl, lease.deadline - started, (lease.dataDeadline ?? Infinity) - started), started, entry);
     return response;
   };
 }
@@ -147,7 +151,7 @@ export function wrapD1ReadLeaseOrigin<Env, Context>(handler: (request: Request, 
     const deadline = lease.deadline;
     const type = response.headers.get('content-type') ?? '';
     if (request.method !== 'GET' || response.status !== 200 || response.headers.has('set-cookie') || !/^application\/(?:[a-z0-9.+-]*\+)?json(?:\s*;|$)/i.test(type) || deadline === undefined || !Number.isFinite(deadline) || deadline <= Date.now()) return responseWithProof(response);
-    return responseWithProof(response, deadline);
+    return responseWithProof(response, Math.min(deadline, lease.dataDeadline ?? Infinity));
   };
 }
 

@@ -3,6 +3,7 @@ import { decode, encode, sha256Hex, stableStringify } from '../core/codec';
 import { MAX_VALUE_BYTES } from '../core/limits';
 import { d1CacheRuntime, type D1CacheRuntime } from './env';
 import { regionalKey, regionalRead, regionalWrite } from './regional';
+import { limitRegionalDataUntil } from './regional-deadline';
 
 const FENCES = ['g'];
 const DEFAULT_TTL_MS = 30_000;
@@ -112,7 +113,7 @@ export async function cacheD1Read<T>(database: D1Database, options: D1ReadOption
   const regional = regionalIdentities.every((identity) => identity[3])
     ? await regionalKey(options.regionalTtlMs, ['d1-read', options.regionalTtlMs, regionalIdentities, options.scope, options.key]) : null;
   const hit = await regionalRead(regional, options.regionalTtlMs);
-  if (hit) return hit.value as T;
+  if (hit) { limitRegionalDataUntil(hit.expires); return hit.value as T; }
   const started = Date.now();
   const snapshot = await inspect(runtimes);
   if (!snapshot) return load();

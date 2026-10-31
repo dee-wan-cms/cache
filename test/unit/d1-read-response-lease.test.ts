@@ -3,6 +3,8 @@ import type { D1Database } from '@cloudflare/workers-types';
 import type { CacheStore } from '../../src/core/types';
 import type { D1CacheProfile } from '../../src/d1/profile';
 import { createD1CacheRuntime } from '../../src/d1/env';
+import { cacheD1Read } from '../../src/d1/read';
+import { regionalD1MetadataTtl } from '../../src/d1/request-freshness';
 import { forwardD1ReadLease, limitD1ReadLeaseUntil, wrapD1ReadLeaseOrigin, wrapD1ReadResponseLease } from '../../src/d1/read-response-lease';
 
 const entries = new Map<string, Response>();
@@ -263,4 +265,138 @@ it('omits the freshness cookie only for excluded write paths and keeps the handl
   const unchanged = await withCookie(f.req({}, 'https://test.example/items/1/presence', 'POST'), f.env, undefined);
   expect(unchanged).toBe(existing);
   expect(unchanged.headers.get('set-cookie')).toContain('other=value');
+});
+
+it('caps an outer response lease at the inner regional data expiry across the origin binding', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(100_000);
+  const f = fixture();
+  const coordinator: CacheStore = {
+    beginWrite:async () => {}, endWrite:async () => {}, invalidate:async () => {}, release:async () => {},
+    read:async () => ({ kind:'miss', epochs:{ g:0 }, lockHeldForMs:null, lockToken:'lock', pending:false }),
+    write:async () => ({ ok:true }),
+  };
+  const db = createD1CacheRuntime(binding, { store:coordinator, databaseId:'data', generation:'1', coordinatorName:'data', regionalIdentity:'data-coord', profile });
+  let loads = 0;
+  const data = () => cacheD1Read(db, { key:'metadata', scope:'actor', regionalTtlMs:5000 }, async () => ++loads);
+  expect(await data()).toBe(1);
+  vi.setSystemTime(104_000);
+  let originCalls = 0;
+  const source = wrapD1ReadLeaseOrigin(async () => { originCalls++; limitD1ReadLeaseUntil(120_000); return Response.json({ value:await data() }); });
+  const gateway = wrapD1ReadResponseLease((request) => forwardD1ReadLease(request, { fetch:(incoming) => source(incoming, undefined, undefined) }), profile);
+  expect(await (await gateway(f.req(), f.env, undefined)).json()).toHaveProperty('value', 1);
+  vi.setSystemTime(104_999);
+  expect(await (await gateway(f.req(), f.env, undefined)).json()).toHaveProperty('value', 1);
+  expect(originCalls).toBe(1);
+  vi.setSystemTime(105_000);
+  expect(await (await gateway(f.req(), f.env, undefined)).json()).toHaveProperty('value', 2);
+  expect(originCalls).toBe(2);
+  expect(loads).toBe(2);
+  vi.setSystemTime(105_001);
+  expect(await (await gateway(f.req(), f.env, undefined)).json()).toHaveProperty('value', 2);
+  expect(originCalls).toBe(2);
+});
+
+it('does not mistake a regional data deadline for an authentication proof', async () => {
+  const f = fixture();
+  const coordinator: CacheStore = {
+    beginWrite:async () => {}, endWrite:async () => {}, invalidate:async () => {}, release:async () => {},
+    read:async () => ({ kind:'miss', epochs:{ g:0 }, lockHeldForMs:null, lockToken:'lock', pending:false }),
+    write:async () => ({ ok:true }),
+  };
+  const db = createD1CacheRuntime(binding, { store:coordinator, databaseId:'data', generation:'1', coordinatorName:'data', regionalIdentity:'data-coord', profile });
+  const data = () => cacheD1Read(db, { key:'auth-proof', scope:'actor', regionalTtlMs:5000 }, async () => 1);
+  await data();
+  let calls = 0;
+  const source = wrapD1ReadLeaseOrigin(async () => { calls++; return Response.json({ value:await data() }); });
+  const gateway = wrapD1ReadResponseLease((request) => forwardD1ReadLease(request, { fetch:(incoming) => source(incoming, undefined, undefined) }), profile);
+  await gateway(f.req(), f.env, undefined);
+  await gateway(f.req(), f.env, undefined);
+  expect(calls).toBe(2);
+});
+
+it('opts into thirty-second leases without sliding and makes writer-marker reads fresh', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(100_000);
+  const f = fixture();
+  const base = profile.readResponseLease;
+  if (!base) throw Error('lease policy missing');
+  const policy: D1CacheProfile = { ...profile, readResponseLease:{ ...base, maxSeconds:30, freshnessHeader:'x-read-fresh' } };
+  const env = { ...f.env, TEST_READ_ACCESS_SECONDS:'30' };
+  let calls = 0;
+  const handler = vi.fn(async () => { limitD1ReadLeaseUntil(200_000); return Response.json({ calls:++calls }); });
+  const wrapped = wrapD1ReadResponseLease(handler, policy);
+  expect(await (await wrapped(f.req(), env, undefined)).json()).toHaveProperty('calls', 1);
+  vi.setSystemTime(129_999);
+  expect(await (await wrapped(f.req(), env, undefined)).json()).toHaveProperty('calls', 1);
+  const write = await wrapped(f.req({}, 'https://test.example/metadata', 'POST'), env, undefined);
+  expect(write.headers.get('set-cookie')).toContain('fresh=1; Max-Age=30;');
+  expect(await (await wrapped(f.req({ cookie:'session=a; fresh=1' }), env, undefined)).json()).toHaveProperty('calls', 3);
+  expect(await (await wrapped(f.req({ 'x-read-fresh':'1' }), env, undefined)).json()).toHaveProperty('calls', 4);
+  vi.setSystemTime(130_000);
+  expect(await (await wrapped(f.req(), env, undefined)).json()).toHaveProperty('calls', 5);
+});
+
+it('rejects excess or invalid response lease configuration and caps long leases at session expiry', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(100_000);
+  const f = fixture();
+  const base = profile.readResponseLease;
+  if (!base) throw Error('lease policy missing');
+  const env = { ...f.env, TEST_READ_ACCESS_SECONDS:'30' };
+  const defaultPolicy = wrapD1ReadResponseLease(f.handler, profile);
+  await defaultPolicy(f.req(), env, undefined); await defaultPolicy(f.req(), env, undefined);
+  expect(f.handler).toHaveBeenCalledTimes(2);
+  for (const maxSeconds of [0, 31, 1.5]) {
+    const invalid = wrapD1ReadResponseLease(f.handler, { ...profile, readResponseLease:{ ...base, maxSeconds } });
+    await invalid(f.req(), env, undefined); await invalid(f.req(), env, undefined);
+  }
+  expect(f.handler).toHaveBeenCalledTimes(8);
+  let calls = 0;
+  const source = vi.fn(async () => { limitD1ReadLeaseUntil(110_000); return Response.json({ calls:++calls }); });
+  const valid = wrapD1ReadResponseLease(source, { ...profile, readResponseLease:{ ...base, maxSeconds:30 } });
+  await valid(f.req(), env, undefined);
+  vi.setSystemTime(109_999); await valid(f.req(), env, undefined);
+  expect(source).toHaveBeenCalledTimes(1);
+  vi.setSystemTime(110_000); await valid(f.req(), env, undefined);
+  expect(source).toHaveBeenCalledTimes(2);
+});
+
+it('uses a fresh cookie generation as a lease key after each write while legacy markers bypass', async () => {
+  const f = fixture();
+  const base = profile.readResponseLease;
+  if (!base) throw Error('lease policy missing');
+  const policy: D1CacheProfile = { ...profile, readResponseLease:{ ...base, maxSeconds:30, freshnessCookieMode:'generation', freshnessHeader:'x-read-fresh' } };
+  const env = { ...f.env, TEST_READ_ACCESS_SECONDS:'30' };
+  let calls = 0;
+  const handler = vi.fn(async (request: Request) => {
+    limitD1ReadLeaseUntil(Date.now() + 60_000);
+    return Response.json({ calls:++calls, ttl:regionalD1MetadataTtl(request, policy.readResponseLease ?? base) });
+  });
+  const wrapped = wrapD1ReadResponseLease(handler, policy);
+  const run = (cookie: string) => wrapped(f.req({ cookie }), env, undefined);
+  expect(await (await run('session=a')).json()).toHaveProperty('calls', 1);
+  const firstWrite = await wrapped(f.req({}, 'https://test.example/metadata', 'POST'), env, undefined);
+  const first = firstWrite.headers.get('set-cookie')?.match(/fresh=([^;]+)/)?.[1];
+  expect(first).toMatch(/^[0-9a-f-]{36}$/);
+  expect(firstWrite.headers.get('set-cookie')).toContain('Max-Age=30');
+  const cookie1 = `session=a; fresh=${first}`;
+  expect(await (await run(cookie1)).json()).toEqual({ calls:3, ttl:0 });
+  expect(await (await run(cookie1)).json()).toEqual({ calls:3, ttl:0 });
+  const nextWrite = await wrapped(f.req({}, 'https://test.example/metadata', 'POST'), env, undefined);
+  const second = nextWrite.headers.get('set-cookie')?.match(/fresh=([^;]+)/)?.[1];
+  expect(second).toMatch(/^[0-9a-f-]{36}$/);
+  expect(second).not.toBe(first);
+  expect(await (await run(`session=a; fresh=${second}`)).json()).toEqual({ calls:5, ttl:0 });
+  expect(await (await run(`session=a; fresh=${second}`)).json()).toEqual({ calls:5, ttl:0 });
+  expect(await (await run('session=a; fresh=1')).json()).toHaveProperty('calls', 6);
+  expect(await (await run('session=a; fresh=1')).json()).toHaveProperty('calls', 7);
+  expect(await (await wrapped(f.req({ cookie:cookie1, 'x-read-fresh':'1' }), env, undefined)).json()).toHaveProperty('calls', 8);
+});
+
+it('keeps bypass markers when generation mode has no cookie credential in its key', async () => {
+  const f = fixture();
+  const base = profile.readResponseLease;
+  if (!base) throw Error('lease policy missing');
+  const policy: D1CacheProfile = { ...profile, readResponseLease:{ ...base, freshnessCookieMode:'generation', credentialHeaders:['authorization'] } };
+  const wrapped = wrapD1ReadResponseLease(f.handler, policy);
+  const response = await wrapped(f.req({ authorization:'Bearer x' }, 'https://test.example/metadata', 'POST'), f.env, undefined);
+  expect(response.headers.get('set-cookie')).toContain('fresh=1;');
 });

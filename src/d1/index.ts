@@ -9,3 +9,4 @@ export { cacheD1JsonRead } from './json-read';
 export type { D1JsonReadOptions } from './json-read';
 export { cacheRegionalResponse } from './regional-response';
 export type { RegionalResponseOptions } from './regional-response';
+export { regionalD1MetadataTtl } from './request-freshness';

@@ -18,7 +18,9 @@ export interface D1CacheProfile extends D1WritePolicy {
     bypassQueryParams?: readonly string[];
     ignoreRequestCacheControl?: boolean;
     freshnessHeader?: string;
+    maxSeconds?: number;
     freshnessCookie: string;
+    freshnessCookieMode?: 'generation' | 'bypass';
     freshnessCookieExcludedPaths?: readonly string[];
   };
 }

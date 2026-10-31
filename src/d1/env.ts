@@ -9,6 +9,7 @@ import { sha256Hex, stableStringify } from '../core/codec';
 import { boundedValue, dependencyRuntimes, inspect, sameSnapshots } from './read';
 import { boundedD1Store } from './bounded-store';
 import { regionalKey, regionalRead, regionalWrite } from './regional';
+import { limitRegionalDataUntil } from './regional-deadline';
 import { readTargets } from '../core/targets';
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -121,7 +122,7 @@ export function d1PrismaCacheExtension(database: object, config: GeneratedCacheC
         }
       } catch { /* Key callbacks use the strict path on failure. */ }
       const hit = await regionalRead(regional, options.regionalTtlMs, decimal);
-      if (hit) return hit.value;
+      if (hit) { limitRegionalDataUntil(hit.expires); return hit.value; }
       let started = Date.now();
       const snapshot = await inspect(dependencies);
       if (!snapshot) return params.query(params.args);

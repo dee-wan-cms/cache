@@ -85,3 +85,100 @@ it('transports verified leases across a trusted service binding without exposing
     expect(socket.headers.has('x-dee-wan-read-lease-deadline')).toBe(false);
   } finally { await worker.dispose(); }
 });
+
+const deadlineOriginSource = `
+import { createD1CacheRuntime } from './env';
+import { cacheD1Read } from './read';
+import { wrapD1ReadLeaseOrigin, limitD1ReadLeaseUntil } from './read-response-lease';
+let now = 100000;
+Date.now = () => now;
+let loads = 0, calls = 0;
+const profile = { envPrefix:'TEST', bindingNames:['DB'], bindingPrefixes:[], coordinatorNamePrefix:'test:', coordinatorClass:'CacheCoordinator', readModels:[], unfencedWriteTables:[] };
+const store = { read:async () => ({ kind:'miss', epochs:{ g:0 }, lockHeldForMs:null, lockToken:'lock', pending:false }), write:async () => ({ ok:true }), release:async () => {}, beginWrite:async () => {}, endWrite:async () => {}, invalidate:async () => {} };
+const handler = wrapD1ReadLeaseOrigin(async (request, env) => {
+  if (new URL(request.url).pathname !== '/seed') { calls++; limitD1ReadLeaseUntil(120000); }
+  const db = createD1CacheRuntime(env.DB, { store, databaseId:'data', generation:'1', coordinatorName:'data', regionalIdentity:'data-coord', profile });
+  const value = await cacheD1Read(db, { key:'metadata', scope:'actor', regionalTtlMs:5000 }, async () => ++loads);
+  return Response.json({ value, calls });
+});
+export default { fetch(request, env, context) { now = Number(request.headers.get('x-test-now')); return handler(request, env, context); } };`;
+const deadlineGatewaySource = `
+import { createD1CacheRuntime } from './env';
+import { wrapD1ReadResponseLease, forwardD1ReadLease } from './read-response-lease';
+let now = 100000;
+Date.now = () => now;
+const profile = { envPrefix:'TEST', bindingNames:['DB'], bindingPrefixes:[], coordinatorNamePrefix:'test:', coordinatorClass:'CacheCoordinator', readModels:[], unfencedWriteTables:[], readResponseLease:{ databaseBinding:'DB', deploymentEnv:'RELEASE', paths:['/metadata'], credentialHeaders:['cookie'], varyHeaders:[], freshnessCookie:'fresh' } };
+const store = { read:async () => { throw Error('unexpected'); }, write:async () => { throw Error('unexpected'); }, release:async () => {}, beginWrite:async () => {}, endWrite:async () => {}, invalidate:async () => {} };
+const handler = wrapD1ReadResponseLease((request, env) => forwardD1ReadLease(request, env.ORIGIN), profile);
+export default { fetch(request, env, context) { now = Number(request.headers.get('x-test-now')); const DB = createD1CacheRuntime(env.DB, { store, databaseId:'db', generation:'1', coordinatorName:'db', regionalIdentity:'coord', profile }); return handler(request, { DB, ORIGIN:env.ORIGIN, RELEASE:'release', TEST_READ_ACCESS_SECONDS:'5' }, context); } };`;
+
+it('carries the inner data deadline through a native service binding without extending its age', async () => {
+  const makeBundle = async (contents: string) => {
+    const bundle = await build({ stdin:{ contents, resolveDir:resolve(__dirname, '../../src/d1'), loader:'ts' }, bundle:true, format:'esm', platform:'neutral', target:'es2022', external:['cloudflare:workers', 'node:async_hooks'], write:false });
+    const output = bundle.outputFiles[0];
+    if (!output) throw Error('bundle missing');
+    return output.text;
+  };
+  const origin = await makeBundle(deadlineOriginSource);
+  const gateway = await makeBundle(deadlineGatewaySource);
+  const worker = new Miniflare({ workers:[
+    { name:'gateway', modules:true, script:gateway, compatibilityDate:'2026-01-01', compatibilityFlags:['nodejs_compat'], d1Databases:['DB'], serviceBindings:{ ORIGIN:'origin' } },
+    { name:'origin', modules:true, script:origin, compatibilityDate:'2026-01-01', compatibilityFlags:['nodejs_compat'], d1Databases:['DB'] },
+  ] });
+  try {
+    const fetch = (path: string, now: number) => worker.dispatchFetch(`https://cache.test${path}`, { headers:{ cookie:'session=a', 'x-test-now':String(now) } });
+    expect(await (await fetch('/seed', 100000)).json()).toEqual({ value:1, calls:0 });
+    const first = await fetch('/metadata', 104000);
+    expect(first.headers.has('x-dee-wan-read-lease-deadline')).toBe(false);
+    expect(await first.json()).toEqual({ value:1, calls:1 });
+    expect(await (await fetch('/metadata', 104999)).json()).toEqual({ value:1, calls:1 });
+    expect(await (await fetch('/metadata', 105000)).json()).toEqual({ value:2, calls:2 });
+    expect(await (await fetch('/metadata', 105001)).json()).toEqual({ value:2, calls:2 });
+  } finally { await worker.dispose(); }
+});
+
+const longLeaseSource = `
+import { createD1CacheRuntime } from './env';
+import { wrapD1ReadResponseLease, limitD1ReadLeaseUntil } from './read-response-lease';
+let now = 100000, calls = 0;
+Date.now = () => now;
+const profile = { envPrefix:'TEST', bindingNames:['DB'], bindingPrefixes:[], coordinatorNamePrefix:'test:', coordinatorClass:'CacheCoordinator', readModels:[], unfencedWriteTables:[], readResponseLease:{ databaseBinding:'DB', deploymentEnv:'RELEASE', paths:['/metadata'], credentialHeaders:['cookie'], varyHeaders:[], freshnessCookie:'fresh', freshnessHeader:'x-read-fresh', maxSeconds:30 } };
+const store = { read:async () => { throw Error('unexpected'); }, write:async () => { throw Error('unexpected'); }, release:async () => {}, beginWrite:async () => {}, endWrite:async () => {}, invalidate:async () => {} };
+const handler = wrapD1ReadResponseLease(async () => { limitD1ReadLeaseUntil(200000); return Response.json({ calls:++calls }); }, profile);
+export default { fetch(request, env, context) { now = Number(request.headers.get('x-test-now')); const DB = createD1CacheRuntime(env.DB, { store, databaseId:'db', generation:'1', coordinatorName:'db', regionalIdentity:'coordinator', profile }); return handler(request, { DB, RELEASE:'release-1', TEST_READ_ACCESS_SECONDS:'30' }, context); } };`;
+
+it('enforces a thirty-second response lease and writer freshness in native Cache API', async () => {
+  const bundle = await build({ stdin:{ contents:longLeaseSource, resolveDir:resolve(__dirname, '../../src/d1'), loader:'ts' }, bundle:true, format:'esm', platform:'neutral', target:'es2022', external:['cloudflare:workers', 'node:async_hooks'], write:false });
+  const output = bundle.outputFiles[0];
+  if (!output) throw Error('bundle missing');
+  const worker = new Miniflare({ modules:true, script:output.text, compatibilityDate:'2026-01-01', compatibilityFlags:['nodejs_compat'], d1Databases:['DB'] });
+  try {
+    const fetch = (now: number, method = 'GET', cookie = 'session=a') => worker.dispatchFetch('https://cache.test/metadata', { method, headers:{ cookie, 'x-test-now':String(now) } });
+    expect(await (await fetch(100000)).json()).toHaveProperty('calls', 1);
+    expect(await (await fetch(129999)).json()).toHaveProperty('calls', 1);
+    const write = await fetch(129999, 'POST');
+    expect(write.headers.get('set-cookie')).toContain('fresh=1; Max-Age=30;');
+    expect(await (await fetch(129999, 'GET', 'session=a; fresh=1')).json()).toHaveProperty('calls', 3);
+    expect(await (await fetch(130000)).json()).toHaveProperty('calls', 4);
+  } finally { await worker.dispose(); }
+});
+
+it('reuses each writer generation and isolates the next in native Cache API', async () => {
+  const source = longLeaseSource.replace('maxSeconds:30 }', "maxSeconds:30, freshnessCookieMode:'generation' }");
+  const bundle = await build({ stdin:{ contents:source, resolveDir:resolve(__dirname, '../../src/d1'), loader:'ts' }, bundle:true, format:'esm', platform:'neutral', target:'es2022', external:['cloudflare:workers', 'node:async_hooks'], write:false });
+  const output = bundle.outputFiles[0];
+  if (!output) throw Error('bundle missing');
+  const worker = new Miniflare({ modules:true, script:output.text, compatibilityDate:'2026-01-01', compatibilityFlags:['nodejs_compat'], d1Databases:['DB'] });
+  try {
+    const fetch = (method = 'GET', cookie = 'session=a') => worker.dispatchFetch('https://cache.test/metadata', { method, headers:{ cookie, 'x-test-now':'100000' } });
+    expect(await (await fetch()).json()).toHaveProperty('calls', 1);
+    const first = (await fetch('POST')).headers.get('set-cookie')?.match(/fresh=([^;]+)/)?.[1];
+    expect(first).toMatch(/^[0-9a-f-]{36}$/);
+    expect(await (await fetch('GET', `session=a; fresh=${first}`)).json()).toHaveProperty('calls', 3);
+    expect(await (await fetch('GET', `session=a; fresh=${first}`)).json()).toHaveProperty('calls', 3);
+    const second = (await fetch('POST')).headers.get('set-cookie')?.match(/fresh=([^;]+)/)?.[1];
+    expect(second).not.toBe(first);
+    expect(await (await fetch('GET', `session=a; fresh=${second}`)).json()).toHaveProperty('calls', 5);
+    expect(await (await fetch('GET', `session=a; fresh=${second}`)).json()).toHaveProperty('calls', 5);
+  } finally { await worker.dispose(); }
+});
