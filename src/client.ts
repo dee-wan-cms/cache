@@ -33,3 +33,85 @@ export function createReadFreshness(policy: ReadLeasePolicy, now: () => number =
     },
   };
 }
+
+export interface MutationInvalidationEvent {
+  scope: string;
+  method: string;
+  pathname: string;
+}
+
+export interface MutationInvalidationChannel {
+  readonly name: string;
+  postMessage(value: MutationInvalidationEvent): void;
+  addEventListener(type: 'message', listener: (event: { data: unknown }) => void): void;
+  removeEventListener(type: 'message', listener: (event: { data: unknown }) => void): void;
+  close(): void;
+}
+
+const mutationChannelName = 'dee-wan-cache-invalidation-v1';
+const validScope = (scope: string): boolean => /^[A-Za-z0-9:_-]{1,256}$/.test(scope);
+const validMethod = (method: string): boolean => /^[!#$%&'*+.^_`|~0-9A-Z-]{1,32}$/.test(method);
+const validPathname = (pathname: string): boolean => pathname.startsWith('/') && pathname.length <= 2048 && !/[?#\u0000-\u001f\u007f]/.test(pathname);
+
+function invalidationChannel(value: unknown): value is MutationInvalidationChannel {
+  return !!value && typeof value === 'object' && Reflect.get(value, 'name') === mutationChannelName && ['postMessage', 'addEventListener', 'removeEventListener', 'close'].every((name) => typeof Reflect.get(value, name) === 'function');
+}
+
+function browserInvalidationChannel(): MutationInvalidationChannel | undefined {
+  const document: unknown = Reflect.get(globalThis, 'document');
+  if (!document || typeof document !== 'object') return undefined;
+  const constructor: unknown = Reflect.get(globalThis, 'BroadcastChannel');
+  if (typeof constructor !== 'function') return undefined;
+  try { const channel: unknown = Reflect.construct(constructor, [mutationChannelName]); return invalidationChannel(channel) ? channel : undefined; } catch { return undefined; }
+}
+
+export function createMutationInvalidation(policy: Pick<NonNullable<D1CacheProfile['readResponseLease']>, 'freshnessCookieExcludedPaths'>, options: { channel?: MutationInvalidationChannel | null } = {}) {
+  const supplied = options.channel === undefined ? browserInvalidationChannel() : options.channel;
+  const channel = invalidationChannel(supplied) ? supplied : undefined;
+  const listeners = new Map<string, Set<(event: MutationInvalidationEvent) => void>>();
+  let disposed = false;
+  const notify = (event: MutationInvalidationEvent) => {
+    for (const listener of listeners.get(event.scope) ?? []) {
+      try { listener({ ...event }); } catch { /* Subscribers are independent. */ }
+    }
+  };
+  const receive = ({ data }: { data: unknown }) => {
+    try {
+      if (disposed || !data || typeof data !== 'object' || Object.keys(data).sort().join(',') !== 'method,pathname,scope') return;
+      const scope: unknown = Reflect.get(data, 'scope');
+      const method: unknown = Reflect.get(data, 'method');
+      const pathname: unknown = Reflect.get(data, 'pathname');
+      if (typeof scope !== 'string' || !validScope(scope) || typeof method !== 'string' || !validMethod(method) || typeof pathname !== 'string' || !validPathname(pathname) || !needsFreshness(method, pathname, policy.freshnessCookieExcludedPaths)) return;
+      notify({ scope, method, pathname });
+    } catch { /* Ignore malformed messages. */ }
+  };
+  channel?.addEventListener('message', receive);
+  return {
+    publish(scope: string, method: string, url: string): void {
+      if (disposed || !validScope(scope)) return;
+      const normalized = method.toUpperCase();
+      if (!validMethod(normalized)) return;
+      let pathname: string;
+      try { pathname = new URL(url, 'https://cache.invalid').pathname; } catch { return; }
+      if (!validPathname(pathname) || !needsFreshness(normalized, pathname, policy.freshnessCookieExcludedPaths)) return;
+      const event = { scope, method:normalized, pathname };
+      notify(event);
+      try { channel?.postMessage({ scope, method:normalized, pathname }); } catch { /* Local notification remains available. */ }
+    },
+    subscribe(scope: string, listener: (event: MutationInvalidationEvent) => void): () => void {
+      if (disposed || !validScope(scope)) return () => {};
+      let group = listeners.get(scope);
+      if (!group) { group = new Set(); listeners.set(scope, group); }
+      group.add(listener);
+      const subscribed = group;
+      return () => { subscribed.delete(listener); if (subscribed.size === 0 && listeners.get(scope) === subscribed) listeners.delete(scope); };
+    },
+    dispose(): void {
+      if (disposed) return;
+      disposed = true;
+      listeners.clear();
+      channel?.removeEventListener('message', receive);
+      channel?.close();
+    },
+  };
+}
