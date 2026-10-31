@@ -259,3 +259,28 @@ it('uses regional cache for large Prisma configs and separates policy changes wi
   expect(await makeRun(changedConfig)()).toBe(2);
   expect(f.read).toHaveBeenCalledTimes(reads + 1);
 });
+
+it('accepts canonical encoded values and rejects noncanonical or lossy tags', async () => {
+  const key = await regionalKey(5000, 'canonical-encoding');
+  if (!key) throw Error('key missing');
+  const fixtures: [unknown, boolean][] = [
+    [{ z:2, a:[{ x:'ไทย' }, true, null] }, true],
+    [{ $t:'n', v:'12345678901234567890' }, true],
+    [{ $t:'d', v:'2026-01-01T00:00:00.000Z' }, true],
+    [{ $t:'b', v:'AA==' }, true],
+    [{ $t:'f', v:'NaN' }, true],
+    [{ $t:'o', v:{ $t:'u' } }, true],
+    [{ $t:'n', v:'001' }, false],
+    [{ $t:'d', v:'2026-01-01' }, false],
+    [{ $t:'b', v:'AA' }, false],
+    [{ $t:'future', v:'unknown' }, false],
+    [{ nested:{ $t:'u' } }, false],
+    [{ $t:'u' }, false],
+    [{ $t:'m', v:'1.25' }, false],
+  ];
+  for (const [value, accepted] of fixtures) {
+    const started = Date.now();
+    entries.set(key, new Response(JSON.stringify({ started, expires:started + 5000, value })));
+    expect(await regionalRead(key), JSON.stringify(value)).toEqual(accepted ? expect.objectContaining({ value:expect.anything() }) : null);
+  }
+});

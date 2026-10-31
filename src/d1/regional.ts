@@ -6,6 +6,19 @@ const MAX_IDENTITY_BYTES = 32_768;
 const MAX_VALUE_BYTES = 1_500_000;
 export const MAX_RESPONSE_LEASE_BYTES = 8_000_000;
 
+function sameEncodedValue(left: unknown, right: unknown): boolean {
+  let remaining = 100_000;
+  const same = (a: unknown, b: unknown, depth: number): boolean => {
+    if (--remaining < 0 || depth > 64) return false;
+    if (a === b) return true;
+    if (!a || !b || typeof a !== 'object' || typeof b !== 'object') return false;
+    if (Array.isArray(a) || Array.isArray(b)) return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((value, index) => same(value, b[index], depth + 1));
+    const keys = Object.keys(a);
+    return keys.length === Object.keys(b).length && keys.every((key) => Object.hasOwn(b, key) && same(Reflect.get(a, key), Reflect.get(b, key), depth + 1));
+  };
+  return same(left, right, 0);
+}
+
 function createRegionalCache(maxMs: number, maxValueBytes = MAX_VALUE_BYTES) {
   async function regionalKey(ttl: number | undefined, identity: unknown): Promise<string | null> {
     if (!Number.isFinite(ttl) || !ttl || ttl <= 0 || ttl > maxMs || !boundedValue(identity, MAX_IDENTITY_BYTES, true)) return null;
@@ -47,7 +60,7 @@ function createRegionalCache(maxMs: number, maxValueBytes = MAX_VALUE_BYTES) {
       const now = Date.now();
       if (!Number.isFinite(ttl) || ttl <= 0 || ttl > maxMs || !envelope || typeof envelope !== 'object' || !('started' in envelope) || typeof envelope.started !== 'number' || !Number.isSafeInteger(envelope.started) || envelope.started > now || !('expires' in envelope) || typeof envelope.expires !== 'number' || !Number.isSafeInteger(envelope.expires) || envelope.expires <= now || envelope.expires > envelope.started + ttl || envelope.expires > now + ttl || !('value' in envelope)) return null;
       const value = decode(envelope.value, decimal);
-      return value !== null && value !== undefined && boundedValue(value, maxValueBytes, false) && stableStringify(encode(value)) === stableStringify(envelope.value) ? { value, expires: envelope.expires } : null;
+      return value !== null && value !== undefined && boundedValue(value, maxValueBytes, false) && sameEncodedValue(encode(value), envelope.value) ? { value, expires: envelope.expires } : null;
     } catch { return null; }
   }
 

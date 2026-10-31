@@ -602,3 +602,14 @@ it('does not cache a background fill that outlives the authentication deadline',
   await tasks[0];
   expect(cache.put).not.toHaveBeenCalled();
 });
+
+it('reuses large nested UTF-8 JSON responses without changing their contents', async () => {
+  const f = fixture();
+  const body = JSON.stringify({ sections:[{ title:'ภาษาไทย', details:{ text:'ไทย🌿'.repeat(240_000) } }] });
+  expect(new TextEncoder().encode(body).byteLength).toBeGreaterThan(3_000_000);
+  const source = vi.fn(async () => { limitD1ReadLeaseUntil(Date.now() + 10_000); return new Response(body, { headers:{ 'content-type':'application/json', 'cache-control':'private, no-store' } }); });
+  const wrapped = wrapD1ReadResponseLease(source, profile);
+  expect(await (await wrapped(f.req(), f.env, undefined)).text()).toBe(body);
+  expect(await (await wrapped(f.req(), f.env, undefined)).text()).toBe(body);
+  expect(source).toHaveBeenCalledTimes(1);
+});
