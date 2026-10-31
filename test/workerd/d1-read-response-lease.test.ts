@@ -6,10 +6,10 @@ import { resolve } from 'node:path';
 const source = `
 import { createD1CacheRuntime } from './env';
 import { wrapD1ReadResponseLease, limitD1ReadLeaseUntil } from './read-response-lease';
-const profile = { envPrefix:'TEST', bindingNames:['DB'], bindingPrefixes:[], coordinatorNamePrefix:'test:', coordinatorClass:'CacheCoordinator', readModels:[], unfencedWriteTables:[], readResponseLease:{ databaseBinding:'DB', deploymentEnv:'RELEASE', paths:['/metadata', '/items/*'], credentialHeaders:['cookie'], varyHeaders:['origin', 'x-site-id'], freshnessCookie:'fresh' } };
+const profile = { envPrefix:'TEST', bindingNames:['DB'], bindingPrefixes:[], coordinatorNamePrefix:'test:', coordinatorClass:'CacheCoordinator', readModels:[], unfencedWriteTables:[], readResponseLease:{ databaseBinding:'DB', deploymentEnv:'RELEASE', paths:['/metadata', '/items/*'], credentialHeaders:['cookie'], varyHeaders:['origin', 'x-site-id'], freshnessCookie:'fresh', ignoreRequestCacheControl:true } };
 const store = { read:async () => { throw Error('unexpected'); }, write:async () => { throw Error('unexpected'); }, release:async () => {}, beginWrite:async () => {}, endWrite:async () => {}, invalidate:async () => {} };
 let calls = 0;
-const handler = wrapD1ReadResponseLease(async (request) => { limitD1ReadLeaseUntil(Date.now() + 10000); return Response.json({ calls:++calls, control:request.headers.get('cache-control') }, { headers:{ 'cache-control':'private, no-store', vary:'Origin' } }); }, profile);
+const handler = wrapD1ReadResponseLease(async (request) => { limitD1ReadLeaseUntil(Date.now() + 10000); return Response.json({ calls:++calls, control:request.headers.get('cache-control') }, { headers:{ 'cache-control':'private, no-store', vary:'Origin', etag:'"native,tag"', 'last-modified':'Wed, 21 Oct 2015 07:28:00 GMT' } }); }, profile);
 export default { async fetch(request, env, context) { const DB = createD1CacheRuntime(env.DB, { store, databaseId:'db', generation:'1', coordinatorName:'db', regionalIdentity:'coordinator', profile }); return handler(request, { DB, RELEASE:'release-1', TEST_READ_ACCESS_SECONDS:'5' }, context); } };`;
 
 it('reuses an authenticated response across requests and refreshes after a write marker', async () => {
@@ -25,6 +25,13 @@ it('reuses an authenticated response across requests and refreshes after a write
     expect(await warm.json()).toEqual({ calls:1, control:'no-cache' });
     expect(warm.headers.get('cache-control')).toBe('private, no-store');
     expect(warm.headers.has('x-dee-wan-lease-meta')).toBe(false);
+    const conditional = await worker.dispatchFetch('https://cache.test/metadata', { headers:{ ...headers, 'if-none-match':'W/"native,tag"' } });
+    expect(conditional.status).toBe(304);
+    expect(await conditional.text()).toBe('');
+    expect(conditional.headers.get('etag')).toBe('"native,tag"');
+    expect(conditional.headers.get('cache-control')).toBe('private, no-store');
+    expect(conditional.headers.has('content-length')).toBe(false);
+    expect(await (await worker.dispatchFetch('https://cache.test/metadata', { headers:{ ...headers, 'if-none-match':'"other"' } })).json()).toHaveProperty('calls', 1);
     expect(await (await worker.dispatchFetch('https://cache.test/metadata', { headers:{ ...headers, cookie:'session=b' } })).json()).toEqual({ calls:2, control:'no-cache' });
     const write = await worker.dispatchFetch('https://cache.test/metadata', { method:'POST', headers });
     expect(write.headers.get('set-cookie')).toContain('fresh=1');

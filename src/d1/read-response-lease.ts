@@ -22,7 +22,69 @@ const noCache = (request: Request): Request => {
   headers.set('cache-control', 'no-cache');
   return new Request(request, { headers });
 };
-const bypass = (request: Request, ignoreCacheControl: boolean): boolean => request.body !== null || ['range','if-match','if-none-match','if-modified-since','if-unmodified-since','if-range'].some((name) => request.headers.has(name)) || (!ignoreCacheControl && hasCacheBypass(request));
+const bypass = (request: Request, ignoreCacheControl: boolean): boolean => request.body !== null || ['range','if-match','if-unmodified-since','if-range'].some((name) => request.headers.has(name)) || (!ignoreCacheControl && hasCacheBypass(request));
+
+function entityTags(value: string): string[] | null {
+  const tags: string[] = [];
+  let index = 0;
+  const whitespace = () => { while (value[index] === ' ' || value[index] === '\t') index++; };
+  whitespace();
+  while (index < value.length) {
+    if (value.slice(index, index + 2) === 'W/') index += 2;
+    if (value[index++] !== '"') return null;
+    const start = index;
+    while (index < value.length && value[index] !== '"') {
+      const code = value.charCodeAt(index++);
+      if (code < 33 || code === 127 || code > 255) return null;
+    }
+    if (value[index] !== '"') return null;
+    tags.push(value.slice(start, index++));
+    whitespace();
+    if (index === value.length) break;
+    if (value[index++] !== ',') return null;
+    whitespace();
+    if (index === value.length) return null;
+  }
+  return tags.length ? tags : null;
+}
+
+function httpDate(value: string | null): number {
+  if (!value || !/^(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT|(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), \d{2}-(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{2} \d{2}:\d{2}:\d{2} GMT|(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [ \d]\d \d{2}:\d{2}:\d{2} \d{4})$/.test(value)) return NaN;
+  const time = Date.parse(value.endsWith(' GMT') ? value : `${value} GMT`);
+  if (!Number.isFinite(time)) return NaN;
+  const date = new Date(time);
+  const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const day = days[date.getUTCDay()];
+  const month = months[date.getUTCMonth()];
+  const number = String(date.getUTCDate()).padStart(2, '0');
+  const clock = date.toUTCString().slice(17, 25);
+  const rfc850 = `${day}, ${number}-${month}-${String(date.getUTCFullYear() % 100).padStart(2, '0')} ${clock} GMT`;
+  const asctime = `${day?.slice(0, 3)} ${month} ${String(date.getUTCDate()).padStart(2, ' ')} ${clock} ${date.getUTCFullYear()}`;
+  return value === date.toUTCString() || value === rfc850 || value === asctime ? time : NaN;
+}
+
+function conditionalHit(request: Request, response: Response): Response {
+  const condition = request.headers.get('if-none-match');
+  let matches = false;
+  if (condition !== null) {
+    if (condition.trim() === '*') matches = true;
+    else {
+      const requested = entityTags(condition);
+      const current = entityTags(response.headers.get('etag') ?? '');
+      matches = !!requested && !!current && current.length === 1 && requested.includes(current[0] ?? '');
+    }
+  } else {
+    const modified = httpDate(response.headers.get('last-modified'));
+    const since = httpDate(request.headers.get('if-modified-since'));
+    matches = Number.isFinite(modified) && Number.isFinite(since) && modified <= since;
+  }
+  if (!matches) return response;
+  const headers = new Headers(response.headers);
+  headers.delete('content-length');
+  void response.body?.cancel().catch(() => undefined);
+  return new Response(null, { status:304, headers });
+}
 
 function selectedCookies(header: string | null, names: readonly string[]): string | null {
   const selected = (header ?? '').split(';').map((part) => part.trimStart()).filter((part) => {
@@ -134,7 +196,7 @@ export function wrapD1ReadResponseLease<Env extends object, Context>(handler: (r
     const key = await responseLeaseKey(ttl, ['d1-response-lease-v2', request.method, request.url, profile, release, identities, names.map((name) => [name, headerValue(name)])]);
     if (!key) return handler(noCache(request), env, context);
     const cached = forceSource ? null : await readLease(key, ttl, permittedVary);
-    if (cached) return cached;
+    if (cached) return conditionalHit(request, cached);
     const started = requestStarted;
     const lease: LeaseScope = {};
     const source = noCache(request);

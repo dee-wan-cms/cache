@@ -139,7 +139,7 @@ it('requires an explicit future authentication deadline and never slides expirat
 
 it('bypasses missing credentials, conditionals and unsafe responses', async () => {
   const f = fixture();
-  const requests = [new Request('https://test.example/metadata'), f.req({ range:'bytes=0-2' }), f.req({ 'if-none-match':'x' })];
+  const requests = [new Request('https://test.example/metadata'), f.req({ range:'bytes=0-2' }), f.req({ 'if-match':'x' })];
   for (const request of requests) { await f.wrapped(request, f.env, undefined); await f.wrapped(request, f.env, undefined); }
   expect(f.handler).toHaveBeenCalledTimes(6);
   for (const response of [new Response('{}', { status:401, headers:{ 'content-type':'application/json' } }), new Response('{}', { headers:{ 'content-type':'application/json', 'set-cookie':'secret=x' } }), new Response('text'), new Response('{}', { headers:{ 'content-type':'application/json', vary:'X-Unknown' } }), new Response(JSON.stringify({ data:'x'.repeat(8_000_001) }), { headers:{ 'content-type':'application/json' } })]) {
@@ -148,6 +148,57 @@ it('bypasses missing credentials, conditionals and unsafe responses', async () =
     await wrapped(f.req(), f.env, undefined); await wrapped(f.req(), f.env, undefined);
     expect(load).toHaveBeenCalledTimes(2);
   }
+});
+
+it('evaluates GET validators against a warm lease without invoking the source', async () => {
+  const f = fixture();
+  const source = vi.fn(async () => {
+    limitD1ReadLeaseUntil(Date.now() + 10_000);
+    return Response.json({ value:'cached' }, { headers:{ etag:'"a,b"', 'last-modified':'Wed, 21 Oct 2015 07:28:00 GMT', 'cache-control':'private, no-store', 'access-control-allow-origin':'https://site.example', vary:'Origin' } });
+  });
+  const wrapped = wrapD1ReadResponseLease(source, profile);
+  await wrapped(f.req(), f.env, undefined);
+  const matches: Array<Record<string,string>> = [
+    { 'if-none-match':'"a,b"' }, { 'if-none-match':'W/"a,b"' },
+    { 'if-none-match':'"other", W/"a,b"' }, { 'if-none-match':'*' },
+    { 'if-modified-since':'Wed, 21 Oct 2015 07:28:00 GMT' },
+    { 'if-modified-since':'Wed, 21 Oct 2015 07:29:00 GMT' },
+    { 'if-modified-since':'Wednesday, 21-Oct-15 07:28:00 GMT' },
+    { 'if-modified-since':'Wed Oct 21 07:28:00 2015' },
+  ];
+  for (const headers of matches) {
+    const response = await wrapped(f.req(headers), f.env, undefined);
+    expect(response.status, JSON.stringify(headers)).toBe(304);
+    expect(await response.text()).toBe('');
+    expect(response.headers.get('etag')).toBe('"a,b"');
+    expect(response.headers.get('last-modified')).toBe('Wed, 21 Oct 2015 07:28:00 GMT');
+    expect(response.headers.get('cache-control')).toBe('private, no-store');
+    expect(response.headers.get('access-control-allow-origin')).toBe('https://site.example');
+    expect(response.headers.has('content-length')).toBe(false);
+  }
+  const nonmatches: Array<Record<string,string>> = [
+    { 'if-none-match':'"other"' }, { 'if-none-match':'"a", "b"' },
+    { 'if-none-match':'"a,b", invalid' }, { 'if-modified-since':'invalid' },
+    { 'if-modified-since':'Fri, 31 Feb 2023 07:28:00 GMT' },
+    { 'if-modified-since':'Wed, 21 Oct 2015 07:27:59 GMT' },
+    { 'if-none-match':'"other"', 'if-modified-since':'Wed, 21 Oct 2015 07:29:00 GMT' },
+  ];
+  for (const headers of nonmatches) {
+    const response = await wrapped(f.req(headers), f.env, undefined);
+    expect(response.status, JSON.stringify(headers)).toBe(200);
+    expect(await response.json()).toEqual({ value:'cached' });
+  }
+  expect(source).toHaveBeenCalledTimes(1);
+  for (const header of ['range', 'if-match', 'if-unmodified-since', 'if-range']) await wrapped(f.req({ [header]:'x' }), f.env, undefined);
+  expect(source).toHaveBeenCalledTimes(5);
+});
+
+it('honors wildcard validators on warm responses without an entity tag', async () => {
+  const f = fixture();
+  await f.wrapped(f.req(), f.env, undefined);
+  const response = await f.wrapped(f.req({ 'if-none-match':'*' }), f.env, undefined);
+  expect(response.status).toBe(304);
+  expect(f.handler).toHaveBeenCalledTimes(1);
 });
 
 it('falls back on cache failures and rejects an expired slow fill', async () => {
