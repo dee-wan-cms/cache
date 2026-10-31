@@ -1,6 +1,21 @@
 import type { D1CacheProfile } from './d1/profile';
 import { needsFreshness } from './d1/read-freshness-policy';
 
+export function createSingleFlight<Key, Value>() {
+  const pending = new Map<Key, Promise<Value>>();
+  return {
+    run(key: Key, load: () => Promise<Value>): Promise<Value> {
+      const existing = pending.get(key);
+      if (existing) return existing;
+      const promise = Promise.resolve().then(load);
+      pending.set(key, promise);
+      void promise.then(() => { if (pending.get(key) === promise) pending.delete(key); }, () => { if (pending.get(key) === promise) pending.delete(key); });
+      return promise;
+    },
+    forget(key: Key): void { pending.delete(key); },
+  };
+}
+
 type ReadLeasePolicy = Pick<NonNullable<D1CacheProfile['readResponseLease']>, 'freshnessHeader' | 'freshnessCookieExcludedPaths' | 'maxSeconds' | 'freshnessCookieMode'> & Partial<Pick<NonNullable<D1CacheProfile['readResponseLease']>, 'credentialHeaders'>>;
 
 export interface FreshnessTransport { origin?: string; baseUrl?: string; withCredentials?: boolean }

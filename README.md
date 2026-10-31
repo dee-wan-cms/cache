@@ -262,3 +262,5 @@ Browser clients can import `createReadFreshness(policy)` from `@dee-wan/cache/cl
 `createMutationInvalidation(policy)` from `@dee-wan/cache/client` signals successful writes between listeners and browser tabs. Call `publish(scope, method, url)` after success and `subscribe(scope, listener)` to receive `{ scope, method, pathname }`; call the returned function to unsubscribe and `dispose()` when finished. The URL's query and credentials are not sent. Use a credential-free scope. Read methods and `freshnessCookieExcludedPaths` are ignored. The channel is opened only when the factory runs in a browser.
 
 `createRevalidationWindow(intervalMs, now?)` coalesces automatic checks per scope. `remaining(scope)` establishes a deadline without moving it on later calls; `take(scope)` permits an uninitialized scope immediately and an initialized scope at or after its deadline. Mutation notifications remain immediate and do not use this window.
+
+`createSingleFlight<Key, Value>()` shares concurrent `run(key, load)` calls. Completed and failed calls are removed; `forget(key)` allows a new call while an older one is still running.
