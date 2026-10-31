@@ -14,6 +14,7 @@ export interface D1CacheProfile extends D1WritePolicy {
     deploymentEnv: string;
     paths: readonly string[];
     credentialHeaders: readonly string[];
+    cookieNames?: readonly string[];
     varyHeaders: readonly string[];
     bypassQueryParams?: readonly string[];
     ignoreRequestCacheControl?: boolean;

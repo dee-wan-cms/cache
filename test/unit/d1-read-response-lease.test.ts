@@ -41,6 +41,70 @@ it('scopes warm reads by credentials, site, origin and release without calling t
   expect(await (await f.wrapped(f.req(), f.env, undefined)).json()).toHaveProperty('control', 'no-cache');
 });
 
+it('selects cookie credentials without collapsing duplicates or other credential headers', async () => {
+  const f = fixture();
+  const base = profile.readResponseLease;
+  if (!base) throw Error('lease policy missing');
+  const policy: D1CacheProfile = { ...profile, readResponseLease:{ ...base, credentialHeaders:['cookie', 'authorization'], cookieNames:['session', 'secure-session', 'access', 'fresh'] } };
+  const wrapped = wrapD1ReadResponseLease(f.handler, policy);
+  const read = (cookie: string, authorization = 'Bearer a') => wrapped(f.req({ cookie, authorization }), f.env, undefined);
+  await read('session=a; nuisance=one');
+  await read('session=a; nuisance=two');
+  expect(f.handler).toHaveBeenCalledTimes(1);
+  for (const [cookie, authorization] of [
+    ['session=b', 'Bearer a'], ['secure-session=a', 'Bearer a'], ['access=a', 'Bearer a'], ['session=a; secure-session=b', 'Bearer a'],
+    ['session=a; session=b', 'Bearer a'], ['session=b; session=a', 'Bearer a'], ['session=a', 'Bearer b'],
+  ] as const) await read(cookie, authorization);
+  expect(f.handler).toHaveBeenCalledTimes(8);
+  await read('nuisance=one', ''); await read('nuisance=two', '');
+  expect(f.handler).toHaveBeenCalledTimes(10);
+  await f.wrapped(f.req({ cookie:'session=a; nuisance=one' }), f.env, undefined);
+  await f.wrapped(f.req({ cookie:'session=a; nuisance=two' }), f.env, undefined);
+  expect(f.handler).toHaveBeenCalledTimes(12);
+});
+
+it('bypasses caching for invalid cookie selectors', async () => {
+  const f = fixture();
+  const base = profile.readResponseLease;
+  if (!base) throw Error('lease policy missing');
+  for (const config of [
+    { ...base, cookieNames:[] }, { ...base, cookieNames:['bad name'] },
+    { ...base, cookieNames:['session', 'session'] },
+    { ...base, credentialHeaders:['authorization'], cookieNames:['session'] },
+    { ...base, freshnessCookieMode:'generation', cookieNames:['session'] },
+  ]) {
+    const wrapped = wrapD1ReadResponseLease(f.handler, { ...profile, readResponseLease:config });
+    await wrapped(f.req(), f.env, undefined); await wrapped(f.req(), f.env, undefined);
+  }
+  expect(f.handler).toHaveBeenCalledTimes(10);
+});
+
+it('isolates spaced and tabbed credential cookie names while ignoring nuisance cookies', async () => {
+  const f = fixture();
+  const base = profile.readResponseLease;
+  if (!base) throw Error('lease policy missing');
+  const wrapped = wrapD1ReadResponseLease(f.handler, { ...profile, readResponseLease:{ ...base, cookieNames:['session', 'access', 'fresh'] } });
+  const read = (cookie: string) => wrapped(f.req({ cookie }), f.env, undefined);
+  await read('session=invalid; access =a; nuisance=one');
+  await read('session=invalid; access =a; nuisance=two');
+  await read('session=invalid; access =b; nuisance=two');
+  await read('session=invalid; access\t=a; nuisance=one');
+  await read('session=invalid; access\t=b; nuisance=one');
+  expect(f.handler).toHaveBeenCalledTimes(4);
+});
+
+it('bypasses duplicate and legacy freshness markers with spaced names', async () => {
+  const f = fixture();
+  const base = profile.readResponseLease;
+  if (!base) throw Error('lease policy missing');
+  const wrapped = wrapD1ReadResponseLease(f.handler, { ...profile, readResponseLease:{ ...base, freshnessCookieMode:'generation', cookieNames:['session', 'fresh'] } });
+  for (const cookie of ['session=a; fresh =1', 'session=a; fresh\t=00000000-0000-4000-8000-000000000000; fresh=00000000-0000-4000-8000-000000000000']) {
+    await wrapped(f.req({ cookie }), f.env, undefined);
+    await wrapped(f.req({ cookie }), f.env, undefined);
+  }
+  expect(f.handler).toHaveBeenCalledTimes(4);
+});
+
 it('writes never hit and a successful write marker forces a fresh read across requests', async () => {
   const f = fixture();
   await f.wrapped(f.req(), f.env, undefined);

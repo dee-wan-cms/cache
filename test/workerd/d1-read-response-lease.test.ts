@@ -166,7 +166,7 @@ it('enforces a thirty-second response lease and writer freshness in native Cache
 });
 
 it('reuses each writer generation and isolates the next in native Cache API', async () => {
-  const source = longLeaseSource.replace('maxSeconds:30 }', "maxSeconds:30, freshnessCookieMode:'generation' }");
+  const source = longLeaseSource.replace('maxSeconds:30 }', "maxSeconds:30, freshnessCookieMode:'generation', cookieNames:['session', 'secure-session', 'access', 'fresh'] }");
   const bundle = await build({ stdin:{ contents:source, resolveDir:resolve(__dirname, '../../src/d1'), loader:'ts' }, bundle:true, format:'esm', platform:'neutral', target:'es2022', external:['cloudflare:workers', 'node:async_hooks'], write:false });
   const output = bundle.outputFiles[0];
   if (!output) throw Error('bundle missing');
@@ -174,14 +174,21 @@ it('reuses each writer generation and isolates the next in native Cache API', as
   try {
     const fetch = (method = 'GET', cookie = 'session=a') => worker.dispatchFetch('https://cache.test/metadata', { method, headers:{ cookie, 'x-test-now':'100000' } });
     expect(await (await fetch()).json()).toHaveProperty('calls', 1);
+    expect(await (await fetch('GET', 'session=a; nuisance=one')).json()).toHaveProperty('calls', 1);
     const first = (await fetch('POST')).headers.get('set-cookie')?.match(/fresh=([^;]+)/)?.[1];
     expect(first).toMatch(/^[0-9a-f-]{36}$/);
     expect(await (await fetch('GET', `session=a; fresh=${first}`)).json()).toHaveProperty('calls', 3);
-    expect(await (await fetch('GET', `session=a; fresh=${first}`)).json()).toHaveProperty('calls', 3);
+    expect(await (await fetch('GET', `session=a; nuisance=two; fresh=${first}`)).json()).toHaveProperty('calls', 3);
     const second = (await fetch('POST')).headers.get('set-cookie')?.match(/fresh=([^;]+)/)?.[1];
     expect(second).not.toBe(first);
     expect(await (await fetch('GET', `session=a; fresh=${second}`)).json()).toHaveProperty('calls', 5);
     expect(await (await fetch('GET', `session=a; fresh=${second}`)).json()).toHaveProperty('calls', 5);
+    expect(await (await fetch('GET', 'secure-session=a')).json()).toHaveProperty('calls', 6);
+    expect(await (await fetch('GET', 'access=a')).json()).toHaveProperty('calls', 7);
+    expect(await (await fetch('GET', 'session=a; session=b')).json()).toHaveProperty('calls', 8);
+    expect(await (await fetch('GET', 'session=b; session=a')).json()).toHaveProperty('calls', 9);
+    expect(await (await fetch('GET', 'nuisance=one')).json()).toHaveProperty('calls', 10);
+    expect(await (await fetch('GET', 'nuisance=two')).json()).toHaveProperty('calls', 11);
   } finally { await worker.dispose(); }
 });
 
