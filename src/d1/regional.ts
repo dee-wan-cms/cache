@@ -79,4 +79,4 @@ function createRegionalCache(maxMs: number, maxValueBytes = MAX_VALUE_BYTES) {
 }
 
 export const { regionalKey, regionalRead, regionalWrite } = createRegionalCache(5000);
-export const { regionalKey: responseLeaseKey, regionalRead: responseLeaseRead, regionalWrite: responseLeaseWrite } = createRegionalCache(300_000, MAX_RESPONSE_LEASE_BYTES);
+export const { regionalKey: responseLeaseKey } = createRegionalCache(300_000);

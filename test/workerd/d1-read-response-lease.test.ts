@@ -21,8 +21,10 @@ it('reuses an authenticated response across requests and refreshes after a write
     const headers = { cookie:'session=a', origin:'https://site.example' };
     expect(await (await worker.dispatchFetch('https://cache.test/metadata', { headers })).json()).toEqual({ calls:1, control:'no-cache' });
     const warm = await worker.dispatchFetch('https://cache.test/metadata', { headers });
+    expect(warm.bodyUsed).toBe(false);
     expect(await warm.json()).toEqual({ calls:1, control:'no-cache' });
     expect(warm.headers.get('cache-control')).toBe('private, no-store');
+    expect(warm.headers.has('x-dee-wan-lease-meta')).toBe(false);
     expect(await (await worker.dispatchFetch('https://cache.test/metadata', { headers:{ ...headers, cookie:'session=b' } })).json()).toEqual({ calls:2, control:'no-cache' });
     const write = await worker.dispatchFetch('https://cache.test/metadata', { method:'POST', headers });
     expect(write.headers.get('set-cookie')).toContain('fresh=1');

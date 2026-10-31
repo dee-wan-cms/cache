@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { d1CacheRuntime } from './env';
 import { isD1BindingName, type D1CacheProfile } from './profile';
-import { MAX_RESPONSE_LEASE_BYTES, responseLeaseKey, responseLeaseRead, responseLeaseWrite } from './regional';
+import { MAX_RESPONSE_LEASE_BYTES, responseLeaseKey } from './regional';
 import { isMutation, matchesPath, needsFreshness } from './read-freshness-policy';
 import { hasCacheBypass, hasFreshnessCookie, hasFreshnessGeneration, validFreshnessHeader } from './request-freshness';
 import { registerRegionalDeadlineReporter } from './regional-deadline';
@@ -24,19 +24,24 @@ const noCache = (request: Request): Request => {
 };
 const bypass = (request: Request, ignoreCacheControl: boolean): boolean => request.body !== null || ['range','if-match','if-none-match','if-modified-since','if-unmodified-since','if-range'].some((name) => request.headers.has(name)) || (!ignoreCacheControl && hasCacheBypass(request));
 
-interface Entry { statusText: string; headers: [string, string][]; body: string }
-function decodeEntry(value: unknown, permittedVary: Set<string>): Response | null {
-  if (!value || typeof value !== 'object') return null;
-  const entry = value as Partial<Entry>;
-  if (typeof entry.statusText !== 'string' || typeof entry.body !== 'string' || !Array.isArray(entry.headers) || !entry.headers.every((item) => Array.isArray(item) && item.length === 2 && typeof item[0] === 'string' && typeof item[1] === 'string')) return null;
+const metadataHeader = 'x-dee-wan-lease-meta';
+
+async function readLease(key: string, ttl: number, permittedVary: Set<string>): Promise<Response | null> {
   try {
-    if (new TextEncoder().encode(entry.body).byteLength > MAX_RESPONSE_LEASE_BYTES) return null;
-    JSON.parse(entry.body);
-    const headers = new Headers(entry.headers);
-    const length = headers.get('content-length');
-    if (length !== null && (!/^(?:0|[1-9]\d*)$/.test(length) || Number(length) !== new TextEncoder().encode(entry.body).byteLength)) return null;
-    if (!eligibleHeaders(headers, permittedVary)) return null;
-    return new Response(entry.body, { status:200, statusText:entry.statusText, headers });
+    const cached = await caches.default.match(key);
+    if (!cached || cached.status !== 200 || !eligibleHeaders(cached.headers, permittedVary)) return null;
+    const metadata = cached.headers.get(metadataHeader);
+    if (!metadata) return null;
+    const parsed: unknown = JSON.parse(metadata);
+    if (!Array.isArray(parsed) || parsed.length !== 3) return null;
+    const [started, expires, control] = parsed;
+    const now = Date.now();
+    if (!Number.isSafeInteger(started) || !Number.isSafeInteger(expires) || started > now || expires <= now || expires > started + ttl || (control !== null && typeof control !== 'string')) return null;
+    const headers = new Headers(cached.headers);
+    headers.delete(metadataHeader);
+    if (control === null) headers.delete('cache-control');
+    else headers.set('cache-control', control);
+    return new Response(cached.body, { status:cached.status, statusText:cached.statusText, headers });
   } catch { return null; }
 }
 
@@ -46,8 +51,8 @@ function eligibleHeaders(headers: Headers, permittedVary: Set<string>): boolean 
   return !vary || vary.split(',').every((name) => permittedVary.has(name.trim().toLowerCase()));
 }
 
-async function responseEntry(response: Response, permittedVary: Set<string>): Promise<Entry | null> {
-  if (response.status !== 200 || !eligibleHeaders(response.headers, permittedVary)) return null;
+async function responseEntry(response: Response, permittedVary: Set<string>): Promise<Uint8Array | null> {
+  if (response.status !== 200 || response.headers.has(metadataHeader) || !eligibleHeaders(response.headers, permittedVary)) return null;
   const reader = response.clone().body?.getReader();
   if (!reader) return null;
   const chunks: Uint8Array[] = [];
@@ -69,7 +74,7 @@ async function responseEntry(response: Response, permittedVary: Set<string>): Pr
     JSON.parse(body);
     const length = response.headers.get('content-length');
     if (length !== null && (!/^(?:0|[1-9]\d*)$/.test(length) || Number(length) !== size)) return null;
-    return { body, statusText:response.statusText, headers:[...response.headers.entries()] };
+    return bytes;
   } catch { return null; }
   finally { if (timer !== undefined) clearTimeout(timer); void reader.cancel().catch(() => undefined); }
 }
@@ -110,13 +115,10 @@ export function wrapD1ReadResponseLease<Env extends object, Context>(handler: (r
     const names = [...new Set([...config.credentialHeaders, ...config.varyHeaders].map((name) => name.toLowerCase()))].sort();
     const permittedVary = new Set(names);
     const ttl = seconds * 1000;
-    const key = await responseLeaseKey(ttl, ['d1-response-lease-v1', request.method, request.url, profile, release, identities, names.map((name) => [name, request.headers.get(name)])]);
+    const key = await responseLeaseKey(ttl, ['d1-response-lease-v2', request.method, request.url, profile, release, identities, names.map((name) => [name, request.headers.get(name)])]);
     if (!key) return handler(noCache(request), env, context);
-    const cached = await responseLeaseRead(key, ttl);
-    if (cached) {
-      const response = decodeEntry(cached.value, permittedVary);
-      if (response) return response;
-    }
+    const cached = await readLease(key, ttl, permittedVary);
+    if (cached) return cached;
     const started = requestStarted;
     const lease: LeaseScope = {};
     const source = noCache(request);
@@ -127,7 +129,13 @@ export function wrapD1ReadResponseLease<Env extends object, Context>(handler: (r
     const fill = (async () => {
       try {
         const entry = await responseEntry(response, permittedVary);
-        if (entry) await responseLeaseWrite(key, fillTtl, started, entry);
+        const expires = Math.floor(started + fillTtl);
+        if (entry && Number.isSafeInteger(expires) && expires > Date.now()) {
+          const headers = new Headers(response.headers);
+          headers.set(metadataHeader, JSON.stringify([Math.floor(started), expires, headers.get('cache-control')]));
+          headers.set('cache-control', 'public, max-age=300');
+          await caches.default.put(key, new Response(entry, { status:response.status, statusText:response.statusText, headers }));
+        }
       } catch { /* Cache filling must not affect the source response. */ }
     })();
     try {

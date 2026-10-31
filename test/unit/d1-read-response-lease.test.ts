@@ -138,6 +138,70 @@ it('falls back for malformed cached entries and leaves disabled requests untouch
   expect(f.handler.mock.calls.at(-1)?.[0]).toBe(request);
 });
 
+it('streams validated hits with original headers and rejects invalid lease metadata', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(100_000);
+  const f = fixture();
+  await f.wrapped(f.req(), f.env, undefined);
+  const warm = await f.wrapped(f.req(), f.env, undefined);
+  expect(warm.bodyUsed).toBe(false);
+  expect(warm.headers.get('cache-control')).toBe('private, no-store');
+  expect(warm.headers.has('x-dee-wan-lease-meta')).toBe(false);
+  expect(await warm.json()).toHaveProperty('calls', 1);
+  for (const value of ['invalid', '[100000,106000,null]', '[100001,105000,null]', '[100000,100000,null]']) {
+    for (const [key, cached] of entries) {
+      const headers = new Headers(cached.headers);
+      headers.set('x-dee-wan-lease-meta', value);
+      entries.set(key, new Response('{}', { headers }));
+    }
+    await f.wrapped(f.req(), f.env, undefined);
+  }
+  expect(f.handler).toHaveBeenCalledTimes(5);
+});
+
+it('returns a cache hit before its body stream becomes available', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(100_000);
+  const f = fixture();
+  const original = await (await f.wrapped(f.req(), f.env, undefined)).text();
+  let release: (() => void) | undefined;
+  for (const [key, cached] of entries) {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        release = () => { controller.enqueue(new TextEncoder().encode(original)); controller.close(); };
+      },
+    });
+    entries.set(key, new Response(body, { status:cached.status, statusText:cached.statusText, headers:cached.headers }));
+  }
+  let signalArrival: (() => void) | undefined;
+  const arrival = new Promise<void>((resolve) => { signalArrival = resolve; });
+  cache.match.mockImplementationOnce(async (key: string) => {
+    const cached = entries.get(key)?.clone();
+    signalArrival?.();
+    return cached;
+  });
+  let resolved = false;
+  const pending = f.wrapped(f.req(), f.env, undefined).then((response) => { resolved = true; return response; });
+  try {
+    await arrival;
+    await vi.advanceTimersByTimeAsync(1001);
+    expect(resolved).toBe(true);
+    expect(f.handler).toHaveBeenCalledTimes(1);
+  } finally { release?.(); }
+  const hit = await pending;
+  expect(await hit.text()).toBe(original);
+});
+
+it('does not cache a source response containing reserved lease metadata', async () => {
+  const f = fixture();
+  const source = vi.fn(async () => {
+    limitD1ReadLeaseUntil(Date.now() + 5000);
+    return Response.json({ ok:true }, { headers:{ 'x-dee-wan-lease-meta':'source' } });
+  });
+  const wrapped = wrapD1ReadResponseLease(source, profile);
+  await wrapped(f.req(), f.env, undefined);
+  await wrapped(f.req(), f.env, undefined);
+  expect(source).toHaveBeenCalledTimes(2);
+});
+
 it('keeps authentication deadlines request-local across concurrent fills', async () => {
   vi.useFakeTimers(); vi.setSystemTime(100_000);
   const f = fixture();
@@ -485,7 +549,7 @@ it('caps a 300-second lease at the verified session deadline', async () => {
   expect(calls).toBe(2);
 });
 
-it('reuses a multi-megabyte JSON response and rejects oversized encoded envelopes', async () => {
+it('reuses multi-megabyte JSON responses and rejects oversized source bodies', async () => {
   const f = fixture();
   const body = JSON.stringify({ items:Array.from({ length:3000 }, (_, id) => ({ id, value:'x'.repeat(1000) })) });
   expect(new TextEncoder().encode(body).byteLength).toBeGreaterThan(3_000_000);
@@ -497,7 +561,15 @@ it('reuses a multi-megabyte JSON response and rejects oversized encoded envelope
   expect(calls).toBe(1);
   const escaped = JSON.stringify({ value:'"'.repeat(3_000_000) });
   expect(new TextEncoder().encode(escaped).byteLength).toBeLessThan(8_000_000);
-  const tooLarge = vi.fn(async () => { limitD1ReadLeaseUntil(Date.now() + 10_000); return new Response(escaped, { headers:{ 'content-type':'application/json' } }); });
+  const escapedSource = vi.fn(async () => { limitD1ReadLeaseUntil(Date.now() + 10_000); return new Response(escaped, { headers:{ 'content-type':'application/json' } }); });
+  const cached = wrapD1ReadResponseLease(escapedSource, profile);
+  const escapedRequest = f.req({}, 'https://test.example/metadata?escaped=1');
+  expect(await (await cached(escapedRequest, f.env, undefined)).text()).toBe(escaped);
+  expect(await (await cached(escapedRequest, f.env, undefined)).text()).toBe(escaped);
+  expect(escapedSource).toHaveBeenCalledTimes(1);
+  const oversized = JSON.stringify({ value:'x'.repeat(8_000_001) });
+  expect(new TextEncoder().encode(oversized).byteLength).toBeGreaterThan(8_000_000);
+  const tooLarge = vi.fn(async () => { limitD1ReadLeaseUntil(Date.now() + 10_000); return new Response(oversized, { headers:{ 'content-type':'application/json' } }); });
   const rejected = wrapD1ReadResponseLease(tooLarge, profile);
   const request = f.req({}, 'https://test.example/metadata?oversize=1');
   await rejected(request, f.env, undefined); await rejected(request, f.env, undefined);
