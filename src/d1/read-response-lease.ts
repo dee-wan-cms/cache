@@ -54,7 +54,7 @@ async function responseEntry(response: Response, permittedVary: Set<string>): Pr
   let size = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(Error('body timeout')), 1000); });
+    const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(Error('body timeout')), 5000); });
     for (;;) {
       const part = await Promise.race([reader.read(), timeout]);
       if (part.done) break;
@@ -121,8 +121,18 @@ export function wrapD1ReadResponseLease<Env extends object, Context>(handler: (r
     const lease: LeaseScope = {};
     const response = await scope.run(lease, () => handler(noCache(request), env, context));
     if (lease.deadline === undefined || !Number.isFinite(lease.deadline)) return response;
-    const entry = await responseEntry(response, permittedVary);
-    if (entry) await responseLeaseWrite(key, Math.min(ttl, lease.deadline - started, (lease.dataDeadline ?? Infinity) - started), started, entry);
+    const fillTtl = Math.min(ttl, lease.deadline - started, (lease.dataDeadline ?? Infinity) - started);
+    const fill = (async () => {
+      try {
+        const entry = await responseEntry(response, permittedVary);
+        if (entry) await responseLeaseWrite(key, fillTtl, started, entry);
+      } catch { /* Cache filling must not affect the source response. */ }
+    })();
+    try {
+      const waitUntil: unknown = context && typeof context === 'object' ? Reflect.get(context, 'waitUntil') : undefined;
+      if (typeof waitUntil === 'function') { Reflect.apply(waitUntil, context, [fill]); return response; }
+    } catch { /* Await the fill if the request context is unavailable. */ }
+    await fill;
     return response;
   };
 }

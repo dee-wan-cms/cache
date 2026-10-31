@@ -240,3 +240,55 @@ it('negotiates identity encoding and reuses a large origin response across the s
     expect(await warm.text()).toBe(first);
   } finally { await worker.dispose(); }
 });
+
+const streamingOriginSource = `
+import { wrapD1ReadLeaseOrigin, limitD1ReadLeaseUntil } from './read-response-lease';
+let calls = 0;
+const handler = wrapD1ReadLeaseOrigin(async () => {
+  calls++;
+  limitD1ReadLeaseUntil(Date.now() + 30000);
+  const stream = new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('{"calls":' + calls)); setTimeout(() => { controller.enqueue(new TextEncoder().encode('}')); controller.close(); }, 1200); } });
+  return new Response(stream, { headers:{ 'content-type':'application/json', 'cache-control':'private, no-store' } });
+});
+export default { fetch:handler };`;
+const streamingGatewaySource = `
+import { createD1CacheRuntime } from './env';
+import { wrapD1ReadResponseLease, forwardD1ReadLease } from './read-response-lease';
+const profile = { envPrefix:'TEST', bindingNames:['DB'], bindingPrefixes:[], coordinatorNamePrefix:'test:', coordinatorClass:'CacheCoordinator', readModels:[], unfencedWriteTables:[], readResponseLease:{ databaseBinding:'DB', deploymentEnv:'RELEASE', paths:['/metadata'], credentialHeaders:['cookie'], varyHeaders:[], freshnessCookie:'fresh' } };
+const store = { read:async () => { throw Error('unexpected'); }, write:async () => { throw Error('unexpected'); }, release:async () => {}, beginWrite:async () => {}, endWrite:async () => {}, invalidate:async () => {} };
+const handler = wrapD1ReadResponseLease((request, env) => forwardD1ReadLease(request, env.ORIGIN), profile);
+let completed = 0;
+export default { async fetch(request, env, context) {
+  const path = new URL(request.url).pathname;
+  if (path === '/fill-state') return Response.json({ completed });
+  const DB = createD1CacheRuntime(env.DB, { store, databaseId:'db', generation:'1', coordinatorName:'db', regionalIdentity:'coordinator', profile });
+  return handler(request, { DB, ORIGIN:env.ORIGIN, RELEASE:'release-1', TEST_READ_ACCESS_SECONDS:'5' }, { waitUntil(task) { context.waitUntil(task.then(() => { completed++; })); } });
+} };`;
+
+it('streams a service-binding response before its background Cache API fill completes', async () => {
+  const makeBundle = async (contents: string) => {
+    const bundle = await build({ stdin:{ contents, resolveDir:resolve(__dirname, '../../src/d1'), loader:'ts' }, bundle:true, format:'esm', platform:'neutral', target:'es2022', external:['cloudflare:workers', 'node:async_hooks'], write:false });
+    const output = bundle.outputFiles[0];
+    if (!output) throw Error('bundle missing');
+    return output.text;
+  };
+  const gateway = await makeBundle(streamingGatewaySource);
+  const origin = await makeBundle(streamingOriginSource);
+  const worker = new Miniflare({ workers:[
+    { name:'gateway', modules:true, script:gateway, compatibilityDate:'2026-01-01', compatibilityFlags:['nodejs_compat'], d1Databases:['DB'], serviceBindings:{ ORIGIN:'origin' } },
+    { name:'origin', modules:true, script:origin, compatibilityDate:'2026-01-01', compatibilityFlags:['nodejs_compat'] },
+  ] });
+  try {
+    const headers = { cookie:'session=a' };
+    const first = await worker.dispatchFetch('https://cache.test/metadata', { headers });
+    expect(first.status).toBe(200);
+    expect(await first.json()).toEqual({ calls:1 });
+    let filled = false;
+    for (let attempt = 0; attempt < 50 && !filled; attempt++) {
+      const state: unknown = await (await worker.dispatchFetch('https://cache.test/fill-state')).json();
+      filled = !!state && typeof state === 'object' && Reflect.get(state, 'completed') === 1;
+    }
+    expect(filled).toBe(true);
+    expect(await (await worker.dispatchFetch('https://cache.test/metadata', { headers })).json()).toEqual({ calls:1 });
+  } finally { await worker.dispose(); }
+});

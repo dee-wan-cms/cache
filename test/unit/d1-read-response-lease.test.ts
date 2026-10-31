@@ -540,3 +540,65 @@ it('forwards write bodies without changing their encoding negotiation', async ()
   await forwardD1ReadLease(request, { fetch });
   expect(fetch).toHaveBeenCalledTimes(1);
 });
+
+it('returns a streaming source before background fill and caches bodies completing after one second', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(100_000);
+  const f = fixture();
+  let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+  const stream = new ReadableStream<Uint8Array>({ start(value) { controller = value; } });
+  const load = vi.fn(async () => { limitD1ReadLeaseUntil(110_000); return new Response(stream, { headers:{ 'content-type':'application/json' } }); });
+  const wrapped = wrapD1ReadResponseLease(load, profile);
+  const tasks: Promise<void>[] = [];
+  const context = { waitUntil(task: Promise<void>) { tasks.push(task); } };
+  const first = await wrapped(f.req(), f.env, context);
+  expect(tasks).toHaveLength(1);
+  expect(cache.put).not.toHaveBeenCalled();
+  await vi.advanceTimersByTimeAsync(1500);
+  controller?.enqueue(new TextEncoder().encode('{"value":42}'));
+  controller?.close();
+  await tasks[0];
+  expect(await first.json()).toEqual({ value:42 });
+  expect(await (await wrapped(f.req(), f.env, context)).json()).toEqual({ value:42 });
+  expect(load).toHaveBeenCalledTimes(1);
+});
+
+it('does not fill failed, non-JSON, or oversized background streams', async () => {
+  const f = fixture();
+  const cases = [
+    () => new Response('invalid', { headers:{ 'content-type':'application/json' } }),
+    () => new Response('not json', { headers:{ 'content-type':'text/plain' } }),
+    () => new Response(JSON.stringify({ value:'x'.repeat(8_000_001) }), { headers:{ 'content-type':'application/json' } }),
+    () => new Response(new ReadableStream<Uint8Array>({ start(controller) { controller.error(Error('stream failed')); } }), { headers:{ 'content-type':'application/json' } }),
+  ];
+  for (let index = 0; index < cases.length; index++) {
+    const make = cases[index];
+    if (!make) throw Error('case missing');
+    const load = vi.fn(async () => { limitD1ReadLeaseUntil(Date.now() + 10_000); return make(); });
+    const wrapped = wrapD1ReadResponseLease(load, profile);
+    const tasks: Promise<void>[] = [];
+    const context = { waitUntil(task: Promise<void>) { tasks.push(task); } };
+    const request = f.req({}, `https://test.example/metadata?case=${index}`);
+    await wrapped(request, f.env, context);
+    await tasks[0];
+    await wrapped(request, f.env, context);
+    await tasks[1];
+    expect(load).toHaveBeenCalledTimes(2);
+  }
+  expect(cache.put).not.toHaveBeenCalled();
+});
+
+it('does not cache a background fill that outlives the authentication deadline', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(100_000);
+  const f = fixture();
+  let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+  const stream = new ReadableStream<Uint8Array>({ start(value) { controller = value; } });
+  const wrapped = wrapD1ReadResponseLease(async () => { limitD1ReadLeaseUntil(102_000); return new Response(stream, { headers:{ 'content-type':'application/json' } }); }, profile);
+  const tasks: Promise<void>[] = [];
+  const context = { waitUntil(task: Promise<void>) { tasks.push(task); } };
+  await wrapped(f.req(), f.env, context);
+  await vi.advanceTimersByTimeAsync(2001);
+  controller?.enqueue(new TextEncoder().encode('{}'));
+  controller?.close();
+  await tasks[0];
+  expect(cache.put).not.toHaveBeenCalled();
+});
