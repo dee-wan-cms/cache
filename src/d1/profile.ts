@@ -19,6 +19,7 @@ export interface D1CacheProfile extends D1WritePolicy {
     ignoreRequestCacheControl?: boolean;
     freshnessHeader?: string;
     freshnessCookie: string;
+    freshnessCookieExcludedPaths?: readonly string[];
   };
 }
 

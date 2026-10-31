@@ -91,7 +91,7 @@ export function wrapD1ReadResponseLease<Env extends object, Context>(handler: (r
     if (!isD1BindingName(config.databaseBinding, profile) || typeof release !== 'string' || !release.trim() || !runtime?.readsEnabled || !runtime.regionalIdentity) return handler(request, env, context);
     if (!['GET','HEAD','OPTIONS'].includes(request.method)) {
       const response = await handler(request, env, context);
-      if (response.status < 200 || response.status >= 300) return response;
+      if (response.status < 200 || response.status >= 300 || (config.freshnessCookieExcludedPaths && matchesPath(new URL(request.url).pathname, config.freshnessCookieExcludedPaths))) return response;
       const headers = new Headers(response.headers);
       headers.append('set-cookie', `${config.freshnessCookie}=1; Max-Age=5; Path=/; HttpOnly; SameSite=Lax${new URL(request.url).protocol === 'https:' ? '; Secure' : ''}`);
       return new Response(response.body, { status:response.status, statusText:response.statusText, headers });

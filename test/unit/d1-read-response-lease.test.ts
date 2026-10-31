@@ -240,3 +240,27 @@ it('preserves default cache directive bypass and fails safe for an invalid fresh
   expect(f.handler).toHaveBeenCalledTimes(4);
   expect(f.handler.mock.calls.at(-1)?.[0].headers.get('cache-control')).toBe('no-cache');
 });
+
+it('omits the freshness cookie only for excluded write paths and keeps the handler response intact', async () => {
+  const f = fixture();
+  const base = profile.readResponseLease;
+  if (!base) throw Error('lease policy missing');
+  const policy: D1CacheProfile = { ...profile, readResponseLease:{ ...base, freshnessCookieExcludedPaths:['/items/*/presence'] } };
+  const wrapped = wrapD1ReadResponseLease(f.handler, policy);
+  await wrapped(f.req(), f.env, undefined);
+  const excluded = await wrapped(f.req({}, 'https://test.example/items/1/presence', 'POST'), f.env, undefined);
+  expect(excluded.headers.has('set-cookie')).toBe(false);
+  expect(f.handler).toHaveBeenCalledTimes(2);
+  expect(await (await wrapped(f.req(), f.env, undefined)).json()).toHaveProperty('calls', 1);
+  expect(f.handler).toHaveBeenCalledTimes(2);
+  const ordinary = await wrapped(f.req({}, 'https://test.example/items/1/presence/extra', 'POST'), f.env, undefined);
+  expect(ordinary.headers.get('set-cookie')).toContain('fresh=1');
+  const fresh = await wrapped(f.req({ cookie:'session=a; fresh=1' }), f.env, undefined);
+  expect(await fresh.json()).toHaveProperty('control', 'no-cache');
+  expect(f.handler).toHaveBeenCalledTimes(4);
+  const existing = new Response('{}', { headers:{ 'set-cookie':'other=value; HttpOnly' } });
+  const withCookie = wrapD1ReadResponseLease(async () => existing, policy);
+  const unchanged = await withCookie(f.req({}, 'https://test.example/items/1/presence', 'POST'), f.env, undefined);
+  expect(unchanged).toBe(existing);
+  expect(unchanged.headers.get('set-cookie')).toContain('other=value');
+});
