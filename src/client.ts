@@ -29,7 +29,7 @@ export function createReadFreshness(policy: ReadLeasePolicy, now: () => number =
       prune(time);
       let pathname: string;
       try { pathname = new URL(url, 'https://cache.invalid').pathname; } catch { pathname = ''; }
-      if (needsFreshness(method, pathname, policy.freshnessCookieExcludedPaths) && !usesGenerationCookie(policy, url, transport)) until.set(scope, time + (Number.isInteger(policy.maxSeconds) && policy.maxSeconds !== undefined && policy.maxSeconds >= 1 && policy.maxSeconds <= 30 ? policy.maxSeconds : 5) * 1000);
+      if (needsFreshness(method, pathname, policy.freshnessCookieExcludedPaths) && !usesGenerationCookie(policy, url, transport)) until.set(scope, time + (Number.isInteger(policy.maxSeconds) && policy.maxSeconds !== undefined && policy.maxSeconds >= 1 && policy.maxSeconds <= 300 ? policy.maxSeconds : 5) * 1000);
     },
   };
 }

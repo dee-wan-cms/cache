@@ -270,6 +270,10 @@ it('omits the freshness cookie only for excluded write paths and keeps the handl
 it('caps an outer response lease at the inner regional data expiry across the origin binding', async () => {
   vi.useFakeTimers(); vi.setSystemTime(100_000);
   const f = fixture();
+  const base = profile.readResponseLease;
+  if (!base) throw Error('lease policy missing');
+  const longPolicy: D1CacheProfile = { ...profile, readResponseLease:{ ...base, maxSeconds:300 } };
+  const env = { ...f.env, TEST_READ_ACCESS_SECONDS:'300' };
   const coordinator: CacheStore = {
     beginWrite:async () => {}, endWrite:async () => {}, invalidate:async () => {}, release:async () => {},
     read:async () => ({ kind:'miss', epochs:{ g:0 }, lockHeldForMs:null, lockToken:'lock', pending:false }),
@@ -282,17 +286,17 @@ it('caps an outer response lease at the inner regional data expiry across the or
   vi.setSystemTime(104_000);
   let originCalls = 0;
   const source = wrapD1ReadLeaseOrigin(async () => { originCalls++; limitD1ReadLeaseUntil(120_000); return Response.json({ value:await data() }); });
-  const gateway = wrapD1ReadResponseLease((request) => forwardD1ReadLease(request, { fetch:(incoming) => source(incoming, undefined, undefined) }), profile);
-  expect(await (await gateway(f.req(), f.env, undefined)).json()).toHaveProperty('value', 1);
+  const gateway = wrapD1ReadResponseLease((request) => forwardD1ReadLease(request, { fetch:(incoming) => source(incoming, undefined, undefined) }), longPolicy);
+  expect(await (await gateway(f.req(), env, undefined)).json()).toHaveProperty('value', 1);
   vi.setSystemTime(104_999);
-  expect(await (await gateway(f.req(), f.env, undefined)).json()).toHaveProperty('value', 1);
+  expect(await (await gateway(f.req(), env, undefined)).json()).toHaveProperty('value', 1);
   expect(originCalls).toBe(1);
   vi.setSystemTime(105_000);
-  expect(await (await gateway(f.req(), f.env, undefined)).json()).toHaveProperty('value', 2);
+  expect(await (await gateway(f.req(), env, undefined)).json()).toHaveProperty('value', 2);
   expect(originCalls).toBe(2);
   expect(loads).toBe(2);
   vi.setSystemTime(105_001);
-  expect(await (await gateway(f.req(), f.env, undefined)).json()).toHaveProperty('value', 2);
+  expect(await (await gateway(f.req(), env, undefined)).json()).toHaveProperty('value', 2);
   expect(originCalls).toBe(2);
 });
 
@@ -344,7 +348,7 @@ it('rejects excess or invalid response lease configuration and caps long leases 
   const defaultPolicy = wrapD1ReadResponseLease(f.handler, profile);
   await defaultPolicy(f.req(), env, undefined); await defaultPolicy(f.req(), env, undefined);
   expect(f.handler).toHaveBeenCalledTimes(2);
-  for (const maxSeconds of [0, 31, 1.5]) {
+  for (const maxSeconds of [0, 301, 1.5]) {
     const invalid = wrapD1ReadResponseLease(f.handler, { ...profile, readResponseLease:{ ...base, maxSeconds } });
     await invalid(f.req(), env, undefined); await invalid(f.req(), env, undefined);
   }
@@ -399,4 +403,61 @@ it('keeps bypass markers when generation mode has no cookie credential in its ke
   const wrapped = wrapD1ReadResponseLease(f.handler, policy);
   const response = await wrapped(f.req({ authorization:'Bearer x' }, 'https://test.example/metadata', 'POST'), f.env, undefined);
   expect(response.headers.get('set-cookie')).toContain('fresh=1;');
+});
+
+it('supports a non-sliding 300-second generation lease with fresh writer reads', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(100_000);
+  const f = fixture();
+  const base = profile.readResponseLease;
+  if (!base) throw Error('lease policy missing');
+  const policy: D1CacheProfile = { ...profile, readResponseLease:{ ...base, maxSeconds:300, freshnessCookieMode:'generation', freshnessHeader:'x-read-fresh' } };
+  const env = { ...f.env, TEST_READ_ACCESS_SECONDS:'300' };
+  let calls = 0;
+  const handler = vi.fn(async () => { limitD1ReadLeaseUntil(500_000); return Response.json({ calls:++calls }); });
+  const wrapped = wrapD1ReadResponseLease(handler, policy);
+  expect(await (await wrapped(f.req(), env, undefined)).json()).toHaveProperty('calls', 1);
+  vi.setSystemTime(399_999);
+  expect(await (await wrapped(f.req(), env, undefined)).json()).toHaveProperty('calls', 1);
+  const write = await wrapped(f.req({}, 'https://test.example/metadata', 'POST'), env, undefined);
+  expect(write.headers.get('set-cookie')).toContain('Max-Age=300;');
+  const nonce = write.headers.get('set-cookie')?.match(/fresh=([^;]+)/)?.[1];
+  expect(nonce).toMatch(/^[0-9a-f-]{36}$/);
+  const fresh = f.req({ cookie:`session=a; fresh=${nonce}` });
+  expect(await (await wrapped(fresh, env, undefined)).json()).toHaveProperty('calls', 3);
+  expect(await (await wrapped(fresh, env, undefined)).json()).toHaveProperty('calls', 3);
+  vi.setSystemTime(400_000);
+  expect(await (await wrapped(f.req(), env, undefined)).json()).toHaveProperty('calls', 4);
+});
+
+it('rejects a 301-second maximum and malformed access values', async () => {
+  const f = fixture();
+  const base = profile.readResponseLease;
+  if (!base) throw Error('lease policy missing');
+  const rejectedMax: D1CacheProfile = { ...profile, readResponseLease:{ ...base, maxSeconds:301 } };
+  const rejected = wrapD1ReadResponseLease(f.handler, rejectedMax);
+  await rejected(f.req(), { ...f.env, TEST_READ_ACCESS_SECONDS:'300' }, undefined);
+  await rejected(f.req(), { ...f.env, TEST_READ_ACCESS_SECONDS:'300' }, undefined);
+  const policy: D1CacheProfile = { ...profile, readResponseLease:{ ...base, maxSeconds:300 } };
+  const wrapped = wrapD1ReadResponseLease(f.handler, policy);
+  for (const value of ['301', '0300', '300.0', '1e2', '-1', ' 300', '300 ']) {
+    await wrapped(f.req(), { ...f.env, TEST_READ_ACCESS_SECONDS:value }, undefined);
+    await wrapped(f.req(), { ...f.env, TEST_READ_ACCESS_SECONDS:value }, undefined);
+  }
+  expect(f.handler).toHaveBeenCalledTimes(16);
+});
+
+it('caps a 300-second lease at the verified session deadline', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(100_000);
+  const f = fixture();
+  const base = profile.readResponseLease;
+  if (!base) throw Error('lease policy missing');
+  const policy: D1CacheProfile = { ...profile, readResponseLease:{ ...base, maxSeconds:300 } };
+  const env = { ...f.env, TEST_READ_ACCESS_SECONDS:'300' };
+  let calls = 0;
+  const wrapped = wrapD1ReadResponseLease(async () => { limitD1ReadLeaseUntil(110_000); return Response.json({ calls:++calls }); }, policy);
+  await wrapped(f.req(), env, undefined);
+  vi.setSystemTime(109_999); await wrapped(f.req(), env, undefined);
+  expect(calls).toBe(1);
+  vi.setSystemTime(110_000); await wrapped(f.req(), env, undefined);
+  expect(calls).toBe(2);
 });

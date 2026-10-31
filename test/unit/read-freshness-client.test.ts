@@ -98,3 +98,13 @@ it('accepts a JSON-shaped policy with a widened string mode', () => {
   const typed: NonNullable<D1CacheProfile['readResponseLease']> = jsonPolicy;
   expect(createReadFreshness(typed).headers('a', 'GET')).toEqual({});
 });
+
+it('retains the writer fallback for the configured 300-second bound', () => {
+  let time = 100_000;
+  const tracker = createReadFreshness({ freshnessHeader:'x-read-fresh', maxSeconds:300 }, () => time);
+  tracker.observe('a', 'POST', '/items/1');
+  time = 399_999;
+  expect(tracker.headers('a', 'GET')).toHaveProperty('x-read-fresh', '1');
+  time = 400_000;
+  expect(tracker.headers('a', 'GET')).toEqual({});
+});

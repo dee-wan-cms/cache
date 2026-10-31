@@ -182,3 +182,18 @@ it('reuses each writer generation and isolates the next in native Cache API', as
     expect(await (await fetch('GET', `session=a; fresh=${second}`)).json()).toHaveProperty('calls', 5);
   } finally { await worker.dispose(); }
 });
+
+it('enforces a 300-second lease in native Cache API without extending it on hits', async () => {
+  const source = longLeaseSource.replace('maxSeconds:30 }', 'maxSeconds:300 }').replace("TEST_READ_ACCESS_SECONDS:'30'", "TEST_READ_ACCESS_SECONDS:'300'").replace('limitD1ReadLeaseUntil(200000)', 'limitD1ReadLeaseUntil(500000)');
+  const bundle = await build({ stdin:{ contents:source, resolveDir:resolve(__dirname, '../../src/d1'), loader:'ts' }, bundle:true, format:'esm', platform:'neutral', target:'es2022', external:['cloudflare:workers', 'node:async_hooks'], write:false });
+  const output = bundle.outputFiles[0];
+  if (!output) throw Error('bundle missing');
+  const worker = new Miniflare({ modules:true, script:output.text, compatibilityDate:'2026-01-01', compatibilityFlags:['nodejs_compat'], d1Databases:['DB'] });
+  try {
+    const fetch = (now: number, method = 'GET') => worker.dispatchFetch('https://cache.test/metadata', { method, headers:{ cookie:'session=a', 'x-test-now':String(now) } });
+    expect(await (await fetch(100000)).json()).toHaveProperty('calls', 1);
+    expect(await (await fetch(399999)).json()).toHaveProperty('calls', 1);
+    expect((await fetch(399999, 'POST')).headers.get('set-cookie')).toContain('fresh=1; Max-Age=300;');
+    expect(await (await fetch(400000)).json()).toHaveProperty('calls', 3);
+  } finally { await worker.dispose(); }
+});

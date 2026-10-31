@@ -80,8 +80,8 @@ export function wrapD1ReadResponseLease<Env extends object, Context>(handler: (r
     const config = profile.readResponseLease;
     const rawSeconds: unknown = Reflect.get(env, `${profile.envPrefix}_READ_ACCESS_SECONDS`);
     const maxSeconds = config?.maxSeconds ?? 5;
-    const seconds = typeof rawSeconds === 'string' && /^(?:0|[1-9]|[12]\d|30)$/.test(rawSeconds) ? Number(rawSeconds) : 0;
-    if (!config || !Number.isInteger(maxSeconds) || maxSeconds < 1 || maxSeconds > 30 || !seconds || seconds > maxSeconds || !/^[A-Za-z0-9_-]+$/.test(config.freshnessCookie)) return handler(request, env, context);
+    const seconds = typeof rawSeconds === 'string' && /^(?:0|[1-9]\d{0,2})$/.test(rawSeconds) ? Number(rawSeconds) : 0;
+    if (!config || !Number.isInteger(maxSeconds) || maxSeconds < 1 || maxSeconds > 300 || !seconds || seconds > maxSeconds || !/^[A-Za-z0-9_-]+$/.test(config.freshnessCookie)) return handler(request, env, context);
     const release: unknown = Reflect.get(env, config.deploymentEnv);
     const database: unknown = Reflect.get(env, config.databaseBinding);
     const runtime = database && typeof database === 'object' ? d1CacheRuntime(database) : undefined;
