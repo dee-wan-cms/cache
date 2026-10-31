@@ -57,6 +57,19 @@ it('ignores reads, excluded paths, malformed scopes and untrusted messages', () 
   invalidation.dispose();
 });
 
+it('validates pathname control characters and preserves spaces and Unicode', () => {
+  const make = channels(); const channel = make();
+  const invalidation = createMutationInvalidation({}, { channel });
+  const listener = vi.fn(); invalidation.subscribe('site_a', listener);
+  for (const character of ['\0', '\x1f', '\x7f', '?', '#']) channel.inject({ scope:'site_a', method:'POST', pathname:`/items/${character}` });
+  expect(listener).not.toHaveBeenCalled();
+  for (const pathname of ['/items/a b', '/items/ภาษาไทย']) channel.inject({ scope:'site_a', method:'POST', pathname });
+  expect(listener).toHaveBeenCalledTimes(2);
+  expect(listener).toHaveBeenNthCalledWith(1, { scope:'site_a', method:'POST', pathname:'/items/a b' });
+  expect(listener).toHaveBeenNthCalledWith(2, { scope:'site_a', method:'POST', pathname:'/items/ภาษาไทย' });
+  invalidation.dispose();
+});
+
 it('unsubscribes and disposes listeners and channels without later delivery', () => {
   const make = channels(); const channel = make();
   const invalidation = createMutationInvalidation({}, { channel });

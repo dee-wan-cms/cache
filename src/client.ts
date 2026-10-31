@@ -48,19 +48,19 @@ function monotonicNow(): number {
 
 export function createRevalidationWindow(windowMs: number, now: () => number = monotonicNow) {
   const duration = Number.isFinite(windowMs) && windowMs > 0 ? windowMs : 300_000;
-  const scopes = new Map<string, { deadline: number; first: boolean }>();
+  const scopes = new Map<string, number>();
   return {
     remaining(scope: string): number {
       const time = now();
-      let state = scopes.get(scope);
-      if (!state) { state = { deadline: time + duration, first: true }; scopes.set(scope, state); }
-      return Math.max(0, state.deadline - time);
+      let deadline = scopes.get(scope);
+      if (deadline === undefined) { deadline = time + duration; scopes.set(scope, deadline); }
+      return Math.max(0, deadline - time);
     },
     take(scope: string): boolean {
       const time = now();
-      const state = scopes.get(scope);
-      if (state && !state.first && time < state.deadline) return false;
-      scopes.set(scope, { deadline: time + duration, first: false });
+      const deadline = scopes.get(scope);
+      if (deadline !== undefined && time < deadline) return false;
+      scopes.set(scope, time + duration);
       return true;
     },
   };
@@ -83,7 +83,7 @@ export interface MutationInvalidationChannel {
 const mutationChannelName = 'dee-wan-cache-invalidation-v1';
 const validScope = (scope: string): boolean => /^[A-Za-z0-9:_-]{1,256}$/.test(scope);
 const validMethod = (method: string): boolean => /^[!#$%&'*+.^_`|~0-9A-Z-]{1,32}$/.test(method);
-const validPathname = (pathname: string): boolean => pathname.startsWith('/') && pathname.length <= 2048 && !/[?#\u0000-\u001f\u007f]/.test(pathname);
+const validPathname = (pathname: string): boolean => pathname.startsWith('/') && pathname.length <= 2048 && ![...pathname].some((character) => character === '?' || character === '#' || character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127);
 
 function invalidationChannel(value: unknown): value is MutationInvalidationChannel {
   return !!value && typeof value === 'object' && Reflect.get(value, 'name') === mutationChannelName && ['postMessage', 'addEventListener', 'removeEventListener', 'close'].every((name) => typeof Reflect.get(value, name) === 'function');
