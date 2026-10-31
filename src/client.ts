@@ -34,6 +34,38 @@ export function createReadFreshness(policy: ReadLeasePolicy, now: () => number =
   };
 }
 
+function monotonicNow(): number {
+  const clock: unknown = Reflect.get(globalThis, 'performance');
+  if (clock && typeof clock === 'object') {
+    const read: unknown = Reflect.get(clock, 'now');
+    if (typeof read === 'function') {
+      const value: unknown = Reflect.apply(read, clock, []);
+      if (typeof value === 'number' && Number.isFinite(value)) return value;
+    }
+  }
+  return Date.now();
+}
+
+export function createRevalidationWindow(windowMs: number, now: () => number = monotonicNow) {
+  const duration = Number.isFinite(windowMs) && windowMs > 0 ? windowMs : 300_000;
+  const scopes = new Map<string, { deadline: number; first: boolean }>();
+  return {
+    remaining(scope: string): number {
+      const time = now();
+      let state = scopes.get(scope);
+      if (!state) { state = { deadline: time + duration, first: true }; scopes.set(scope, state); }
+      return Math.max(0, state.deadline - time);
+    },
+    take(scope: string): boolean {
+      const time = now();
+      const state = scopes.get(scope);
+      if (state && !state.first && time < state.deadline) return false;
+      scopes.set(scope, { deadline: time + duration, first: false });
+      return true;
+    },
+  };
+}
+
 export interface MutationInvalidationEvent {
   scope: string;
   method: string;
