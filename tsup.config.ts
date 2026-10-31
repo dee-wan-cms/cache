@@ -2,7 +2,7 @@ import { defineConfig } from "tsup";
 
 export default defineConfig([
   {
-    entry: { index: "src/index.ts", "cloudflare/index": "src/cloudflare/index.ts", "d1/index": "src/d1/index.ts", "d1/config": "src/d1/config.ts", "d1/response-lease": "src/d1/read-response-lease.ts" },
+    entry: { index: "src/index.ts", client: "src/client.ts", "cloudflare/index": "src/cloudflare/index.ts", "d1/index": "src/d1/index.ts", "d1/config": "src/d1/config.ts", "d1/response-lease": "src/d1/read-response-lease.ts" },
     format: ["esm"],
     platform: "neutral",
     removeNodeProtocol: false,

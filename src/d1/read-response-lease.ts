@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { d1CacheRuntime } from './env';
 import { isD1BindingName, type D1CacheProfile } from './profile';
 import { regionalKey, regionalRead, regionalWrite } from './regional';
+import { isMutation, matchesPath, needsFreshness } from './read-freshness-policy';
 
 interface LeaseScope { deadline?: number }
 const scope = new AsyncLocalStorage<LeaseScope>();
@@ -20,13 +21,6 @@ const noCache = (request: Request): Request => {
 };
 const hasMarker = (request: Request, name: string): boolean => (request.headers.get('cookie') ?? '').split(';').some((part) => part.trim().split('=', 1)[0] === name);
 const bypass = (request: Request, ignoreCacheControl: boolean): boolean => request.body !== null || ['range','if-match','if-none-match','if-modified-since','if-unmodified-since','if-range'].some((name) => request.headers.has(name)) || (!ignoreCacheControl && (request.headers.get('cache-control') ?? '').split(',').some((part) => /^\s*(?:no-cache|no-store)(?:\s*=|\s*$)/i.test(part)));
-const matchesPath = (pathname: string, patterns: readonly string[]): boolean => {
-  const actual = pathname.split('/');
-  return patterns.some((pattern) => {
-    const parts = pattern.split('/');
-    return parts.length === actual.length && parts.every((part, index) => part === '*' ? !!actual[index] : !part.includes('*') && part === actual[index]);
-  });
-};
 
 interface Entry { statusText: string; headers: [string, string][]; body: string }
 function decodeEntry(value: unknown, permittedVary: Set<string>): Response | null {
@@ -89,9 +83,9 @@ export function wrapD1ReadResponseLease<Env extends object, Context>(handler: (r
     const database: unknown = Reflect.get(env, config.databaseBinding);
     const runtime = database && typeof database === 'object' ? d1CacheRuntime(database) : undefined;
     if (!isD1BindingName(config.databaseBinding, profile) || typeof release !== 'string' || !release.trim() || !runtime?.readsEnabled || !runtime.regionalIdentity) return handler(request, env, context);
-    if (!['GET','HEAD','OPTIONS'].includes(request.method)) {
+    if (isMutation(request.method)) {
       const response = await handler(request, env, context);
-      if (response.status < 200 || response.status >= 300 || (config.freshnessCookieExcludedPaths && matchesPath(new URL(request.url).pathname, config.freshnessCookieExcludedPaths))) return response;
+      if (response.status < 200 || response.status >= 300 || !needsFreshness(request.method, new URL(request.url).pathname, config.freshnessCookieExcludedPaths)) return response;
       const headers = new Headers(response.headers);
       headers.append('set-cookie', `${config.freshnessCookie}=1; Max-Age=5; Path=/; HttpOnly; SameSite=Lax${new URL(request.url).protocol === 'https:' ? '; Secure' : ''}`);
       return new Response(response.body, { status:response.status, statusText:response.statusText, headers });
