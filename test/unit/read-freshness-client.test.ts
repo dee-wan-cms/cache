@@ -90,3 +90,11 @@ it('checks the actual mutation URL before relying on a same-origin generation co
   tracker.observe('empty-base-cross', 'POST', '//other.example/items', { ...transport, baseUrl:'' });
   expect(tracker.headers('empty-base-cross', 'GET')).toHaveProperty('x-read-fresh', '1');
 });
+
+
+it('accepts a JSON-shaped policy with a widened string mode', () => {
+  const mode: string = 'generation';
+  const jsonPolicy = { ...policy, freshnessCookieMode:mode };
+  const typed: NonNullable<D1CacheProfile['readResponseLease']> = jsonPolicy;
+  expect(createReadFreshness(typed).headers('a', 'GET')).toEqual({});
+});

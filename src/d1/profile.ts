@@ -20,7 +20,7 @@ export interface D1CacheProfile extends D1WritePolicy {
     freshnessHeader?: string;
     maxSeconds?: number;
     freshnessCookie: string;
-    freshnessCookieMode?: 'generation' | 'bypass';
+    freshnessCookieMode?: string;
     freshnessCookieExcludedPaths?: readonly string[];
   };
 }
