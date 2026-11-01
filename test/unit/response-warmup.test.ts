@@ -124,6 +124,62 @@ it('runs one batch per credential and scope until cooldown expires', async () =>
   expect(discover).toHaveBeenCalledTimes(2);
 });
 
+it('retries an unfinished batch immediately, but cools a drained batch and does not duplicate an active one', async () => {
+  vi.useFakeTimers();
+  let release = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const calls: string[] = [];
+  let block = true;
+  const warm = createResponseWarmup(async (request: Request) => {
+    const path = new URL(request.url).pathname;
+    calls.push(path);
+    if (path === '/api/first' && block) await held;
+    return Response.json({});
+  });
+  const config = { scopeHeader:'x-site-id', seeds:['/api/first', '/api/second'], concurrency:1, maxMilliseconds:100, cooldownMs:30_000 };
+  const start = () => warm.start(config, req('/api/root'), Response.json({}), ['identity'], 'retry-group', () => true, {}, undefined);
+  const first = start();
+  await driveUntil(() => calls.length === 1);
+  await start();
+  expect(calls).toEqual(['/api/first']);
+  await vi.advanceTimersByTimeAsync(101);
+  await first;
+  block = false;
+  release();
+  await Promise.resolve();
+  const retry = start();
+  await driveUntil(() => calls.includes('/api/second'));
+  await retry;
+  expect(calls).toEqual(['/api/first', '/api/first', '/api/second']);
+  await start();
+  expect(calls).toHaveLength(3);
+});
+
+it('does not let an abandoned older batch clear a newer batch cooldown', async () => {
+  vi.useFakeTimers();
+  let release = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const calls: string[] = [];
+  const warm = createResponseWarmup(async (request: Request) => {
+    const path = new URL(request.url).pathname;
+    calls.push(path);
+    if (path === '/api/old') await held;
+    return Response.json({});
+  });
+  const begin = (seeds: string[]) => warm.start({ scopeHeader:'x-site-id', seeds, concurrency:2, maxMilliseconds:100, cooldownMs:30_000 }, req('/api/root'), Response.json({}), ['identity'], 'ownership-group', () => true, {}, undefined);
+  const old = begin(['/api/old', '/api/old-queued']);
+  await driveUntil(() => calls.includes('/api/old'));
+  warm.invalidate();
+  const current = begin(['/api/new']);
+  await driveUntil(() => calls.includes('/api/new'));
+  await current;
+  await vi.advanceTimersByTimeAsync(101);
+  await old;
+  release();
+  await begin(['/api/new-again']);
+  expect(calls).not.toContain('/api/new-again');
+});
+
 it('strips freshness and conditional headers while preserving credentials and negotiation', async () => {
   let warmHeaders: Headers | undefined;
   const wrapped = wrapReadResponseLease(async (request) => {
@@ -499,6 +555,35 @@ it('warms a learned scope target ahead of a full seed list after scope bootstrap
     ['/api/hot', 'session=c', 'one'],
     ['/api/layout', 'session=c', 'one'],
   ]);
+});
+
+it('runs explicit unscoped seeds before learned and discovered targets within the same limits', async () => {
+  const calls: Array<[string, string | null, string | null]> = [];
+  let active = 0, peak = 0;
+  const warm = createResponseWarmup(async (request: Request) => {
+    active++; peak = Math.max(peak, active);
+    calls.push([new URL(request.url).pathname, request.headers.get('x-site-id'), request.headers.get('cookie')]);
+    await Promise.resolve();
+    active--;
+    return Response.json({});
+  });
+  const identity = ['global-seed-order'];
+  const eligible = (url: URL) => url.pathname !== '/api/blocked';
+  const base = { scopeHeader:'x-site-id', catalogScope:'credential' as const, portable:(url: URL) => url.pathname === '/api/learned' };
+  await warm.start({ ...base, seeds:[] }, req('/api/learned'), Response.json({}), identity, 'learn-global-seed-order', eligible, {}, undefined, undefined, 'credential');
+  await warm.start({
+    ...base,
+    seeds:[{ url:'/api/global-one', scope:null }, { url:'/api/blocked', scope:null }, { url:'/api/global-two', scope:null }, { url:'/api/scoped-seed', scope:'one' }],
+    maxTargets:4, concurrency:1, discoveryPriority:'next',
+    discover:(url) => url.pathname === '/api/root' ? { targets:[{ url:'/api/discovered', scope:'one' }] } : { targets:[] },
+  }, req('/api/root'), Response.json({}), identity, 'run-global-seed-order', eligible, {}, undefined, undefined, 'credential');
+  expect(calls).toEqual([
+    ['/api/global-one', null, 'session=a'],
+    ['/api/global-two', null, 'session=a'],
+    ['/api/learned', 'one', 'session=a'],
+    ['/api/discovered', 'one', 'session=a'],
+  ]);
+  expect(peak).toBe(1);
 });
 
 it('warms identical URLs independently for explicit scopes without changing other headers', async () => {

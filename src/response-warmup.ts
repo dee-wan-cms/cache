@@ -29,7 +29,7 @@ const validScope = (value: string | null | undefined): value is string => !!valu
 export function createResponseWarmup<Env, Context>(run: (request: Request, env: Env, context: Context) => Promise<Response>, canRun: () => boolean = () => true) {
   let generation = 0;
   const internal = new WeakMap<Request, { generation: number; isCurrent?: () => boolean }>();
-  const active = new Map<string, number>();
+  const active = new Map<string, { until: number }>();
   const verified = new WeakSet<Request>();
   let running = 0, waiting = 0;
   const currentValue = (check?: () => boolean) => { try { return check === undefined || check() === true; } catch { return false; } };
@@ -63,9 +63,10 @@ export function createResponseWarmup<Env, Context>(run: (request: Request, env: 
     const current = generation, end = Date.now() + duration;
     const stillCurrent = () => current === generation && currentValue(isCurrent);
     const prior = active.get(group);
-    const cooling = prior !== undefined && prior > Date.now();
-    if (!cooling) active.set(group, end + cooldown);
-    if (active.size > 1024) for (const [key, until] of active) { if (until <= Date.now()) active.delete(key); }
+    const cooling = prior !== undefined && prior.until > Date.now();
+    const marker = { until: end + cooldown };
+    if (!cooling) active.set(group, marker);
+    if (active.size > 1024) for (const [key, value] of active) { if (value.until <= Date.now()) active.delete(key); }
     if (active.size > 1024) active.delete(active.keys().next().value ?? '');
     const base = new URL(request.url);
     let scope = request.headers.get(scopeHeader);
@@ -73,6 +74,7 @@ export function createResponseWarmup<Env, Context>(run: (request: Request, env: 
     const rootScope = scope;
     const jobKey = (url: string, value: string | null) => JSON.stringify([url, value]);
     const queue: WarmJob[] = [], seen = new Set<string>([jobKey(base.href, scope)]);
+    let abandoned = false;
     let completedBootstrap: string | undefined;
     const urlFor = (target: string): URL | null => {
       try {
@@ -179,16 +181,16 @@ export function createResponseWarmup<Env, Context>(run: (request: Request, env: 
     };
     const runOne = async (target: WarmJob) => {
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
-      if (!stillCurrent() || Date.now() >= end) return;
+      if (!stillCurrent() || Date.now() >= end) { abandoned = true; return; }
       let release: (() => void) | null = null;
       while (stillCurrent() && Date.now() < end) {
         release = await acquire(concurrency, current, end, isCurrent);
-        if (!release) return;
+        if (!release) { abandoned = true; return; }
         if (canRun()) break;
         release(); release = null;
       }
-      if (!release) return;
-      if (!stillCurrent() || Date.now() >= end) { release(); return; }
+      if (!release) { abandoned = true; return; }
+      if (!stillCurrent() || Date.now() >= end) { abandoned = true; release(); return; }
       const releaseSlot = release;
       let controller: AbortController | undefined;
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -215,12 +217,17 @@ export function createResponseWarmup<Env, Context>(run: (request: Request, env: 
         void result.body?.cancel().catch(() => undefined);
       } catch { /* Background warming is best effort. */ }
       finally {
+        if (controller?.signal.aborted) abandoned = true;
         if (timer !== undefined) clearTimeout(timer);
         if (!started) releaseSlot();
       }
     };
     try {
       if (cooling) { void response.body?.cancel().catch(() => undefined); await record(base); return; }
+      const unscopedSeeds = () => {
+        for (const seed of seeds) if (typeof seed !== 'string' && seed.scope === null) enqueue(seed, -1);
+      };
+      if (!bootstrap || scope) unscopedSeeds();
       const discovered: ReadResponseWarmupTarget[] = [];
       await inspect(base, response, discovered, catalogScope === 'credential' && !bootstrap);
       if (bootstrap && !scope) {
@@ -230,9 +237,10 @@ export function createResponseWarmup<Env, Context>(run: (request: Request, env: 
         if (job && stillCurrent() && Date.now() < end) await runOne(job);
         if (!scope || !stillCurrent() || Date.now() >= end) return;
       }
+      unscopedSeeds();
       await load();
       if (discoveryPriority === 'next') for (const target of discovered) enqueue(target, 1);
-      for (const seed of seeds) enqueue(seed);
+      for (const seed of seeds) if (typeof seed === 'string' || seed.scope !== null) enqueue(seed);
       if (discoveryPriority !== 'next') for (const target of discovered) enqueue(target);
       await record(base);
       const worker = async () => {
@@ -243,6 +251,9 @@ export function createResponseWarmup<Env, Context>(run: (request: Request, env: 
       };
       await Promise.all(Array.from({ length:concurrency }, worker));
     } catch { /* Background warming is best effort. */ }
+    finally {
+      if (!cooling && (abandoned || queue.length > 0) && active.get(group) === marker) active.delete(group);
+    }
     } finally { void response.body?.cancel().catch(() => undefined); }
   }
   return { start, invalidate, allowed, isInternal, verify, snapshot:() => generation, current:(value: number) => value === generation };
