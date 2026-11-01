@@ -16,6 +16,41 @@ export function createSingleFlight<Key, Value>() {
   };
 }
 
+export function createIntentWarmup(cooldownMs = 60_000, now: () => number = monotonicNow) {
+  const duration = Number.isFinite(cooldownMs) && cooldownMs > 0 ? cooldownMs : 60_000;
+  const warmed = new Map<string, number>();
+  let scope = '';
+  let generation = 0;
+  let running = false;
+  let queued: { key: string; load: (isCurrent: () => boolean) => Promise<boolean>; generation: number } | undefined;
+  const drain = () => {
+    if (running || !queued) return;
+    const task = queued;
+    queued = undefined;
+    if ((warmed.get(task.key) ?? 0) > now()) return;
+    running = true;
+    const isCurrent = () => task.generation === generation && scope !== '';
+    void Promise.resolve().then(() => isCurrent() ? task.load(isCurrent) : false).then((ok) => {
+      if (ok && task.generation === generation) warmed.set(task.key, now() + duration);
+    }, () => {}).finally(() => { running = false; drain(); });
+  };
+  return {
+    setScope(next: string): void {
+      if (scope === next) return;
+      scope = next;
+      generation++;
+      queued = undefined;
+      warmed.clear();
+    },
+    invalidate(): void { generation++; queued = undefined; warmed.clear(); },
+    warm(key: string, load: (isCurrent: () => boolean) => Promise<boolean>): void {
+      if (!scope || !key || (warmed.get(key) ?? 0) > now()) return;
+      queued = { key, load, generation };
+      drain();
+    },
+  };
+}
+
 type ReadLeasePolicy = Pick<NonNullable<D1CacheProfile['readResponseLease']>, 'freshnessHeader' | 'freshnessCookieExcludedPaths' | 'maxSeconds' | 'freshnessCookieMode'> & Partial<Pick<NonNullable<D1CacheProfile['readResponseLease']>, 'credentialHeaders'>>;
 
 export interface FreshnessTransport { origin?: string; baseUrl?: string; withCredentials?: boolean }
