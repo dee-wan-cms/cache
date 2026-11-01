@@ -1,4 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { createResponseWarmup, type ReadResponseWarmupOptions } from './response-warmup';
+export type { ReadResponseWarmupOptions, ReadResponseWarmupTarget, ReadResponseWarmupContext } from './response-warmup';
 import { registerRegionalDeadlineReporter } from './d1/regional-deadline';
 import type { D1CacheProfile } from './d1/profile';
 import { MAX_RESPONSE_LEASE_BYTES, responseLeaseKey } from './d1/regional';
@@ -94,11 +96,22 @@ function selectedCookies(header: string | null, names: readonly string[]): strin
   return selected.length ? selected.join(';') : null;
 }
 
+function withoutCookie(header: string | null, name: string): string | null {
+  if (!header) return null;
+  const value = header.split(';').filter((part) => {
+    const separator = part.indexOf('=');
+    return separator < 0 || part.slice(0, separator).trim() !== name;
+  }).join(';').trim();
+  return value || null;
+}
+
 const metadataHeader = 'x-dee-wan-lease-meta';
 
 async function readLease(key: string, ttl: number, permittedVary: Set<string>): Promise<{ response: Response; expires: number } | null> {
+  let cached: Response | undefined;
+  let transferred = false;
   try {
-    const cached = await caches.default.match(key);
+    cached = await caches.default.match(key);
     if (!cached || cached.status !== 200 || !eligibleHeaders(cached.headers, permittedVary)) return null;
     const metadata = cached.headers.get(metadataHeader);
     if (!metadata) return null;
@@ -111,8 +124,11 @@ async function readLease(key: string, ttl: number, permittedVary: Set<string>): 
     headers.delete(metadataHeader);
     if (control === null) headers.delete('cache-control');
     else headers.set('cache-control', control);
-    return { response:new Response(cached.body, { status:cached.status, statusText:cached.statusText, headers }), expires };
+    const response = new Response(cached.body, { status:cached.status, statusText:cached.statusText, headers });
+    transferred = true;
+    return { response, expires };
   } catch { return null; }
+  finally { if (cached && !transferred) void cached.body?.cancel().catch(() => undefined); }
 }
 
 function eligibleHeaders(headers: Headers, permittedVary: Set<string>): boolean {
@@ -155,31 +171,42 @@ export interface ReadResponseLeaseOptions extends ReadResponseLeasePolicy {
   deployment: string;
   database: string;
   seconds: number;
+  warmup?: ReadResponseWarmupOptions;
 }
-type LeaseConfig = NonNullable<D1CacheProfile['readResponseLease']> | ReadResponseLeaseOptions;
+type LeaseConfig = (NonNullable<D1CacheProfile['readResponseLease']> | ReadResponseLeaseOptions) & { warmup?: ReadResponseWarmupOptions };
 interface ResolvedLease { config: LeaseConfig; seconds: number; identity: () => unknown[] | null }
 export function createReadResponseLease<Env, Context>(handler: (request: Request, env: Env, context: Context) => Promise<Response>, resolve: (env: Env) => ResolvedLease | null): (request: Request, env: Env, context: Context) => Promise<Response> {
   const pending = new Map<string, { valid: boolean; task: Promise<void> }>();
-  return async (request, env, context) => {
+  let foreground = 0;
+  const warming = createResponseWarmup<Env, Context>((request, env, context) => wrapped(request, env, context), () => foreground === 0);
+  const wrapped = async (request: Request, env: Env, context: Context): Promise<Response> => {
     const requestStarted = Date.now();
+    const requestGeneration = warming.snapshot();
+    const serve = async (input: Request): Promise<Response> => {
+      if (input.method !== 'GET' || warming.isInternal(request)) return handler(input, env, context);
+      foreground++;
+      try { return await handler(input, env, context); }
+      finally { foreground--; }
+    };
     const resolved = resolve(env);
-    if (!resolved) return handler(request, env, context);
+    if (!resolved) return serve(request);
     const { config, seconds } = resolved;
     const maxSeconds = config.maxSeconds ?? 5;
     const refreshAhead = config.refreshAheadSeconds ?? 0;
-    if (!Number.isInteger(refreshAhead) || refreshAhead < 0 || refreshAhead > maxSeconds || !Number.isInteger(maxSeconds) || maxSeconds < 1 || maxSeconds > 300 || !Number.isInteger(seconds) || seconds <= 0 || seconds > maxSeconds || !/^[A-Za-z0-9_-]+$/.test(config.freshnessCookie)) return handler(request, env, context);
-    if (config.cookieNames !== undefined && (!Array.isArray(config.cookieNames) || config.cookieNames.length === 0 || !config.cookieNames.every((name) => typeof name === 'string' && /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name)) || new Set(config.cookieNames).size !== config.cookieNames.length || !config.credentialHeaders.some((name) => name.toLowerCase() === 'cookie') || (config.freshnessCookieMode === 'generation' && !config.cookieNames.includes(config.freshnessCookie)))) return handler(request, env, context);
+    if (!Number.isInteger(refreshAhead) || refreshAhead < 0 || refreshAhead > maxSeconds || !Number.isInteger(maxSeconds) || maxSeconds < 1 || maxSeconds > 300 || !Number.isInteger(seconds) || seconds <= 0 || seconds > maxSeconds || !/^[A-Za-z0-9_-]+$/.test(config.freshnessCookie)) return serve(request);
+    if (config.cookieNames !== undefined && (!Array.isArray(config.cookieNames) || config.cookieNames.length === 0 || !config.cookieNames.every((name) => typeof name === 'string' && /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name)) || new Set(config.cookieNames).size !== config.cookieNames.length || !config.credentialHeaders.some((name) => name.toLowerCase() === 'cookie') || (config.freshnessCookieMode === 'generation' && !config.cookieNames.includes(config.freshnessCookie)))) return serve(request);
     const generationMode = config.freshnessCookieMode === 'generation' && config.credentialHeaders.some((name) => name.toLowerCase() === 'cookie');
     if (isMutation(request.method)) {
       const response = await handler(request, env, context);
       if (response.status < 200 || response.status >= 300 || !needsFreshness(request.method, new URL(request.url).pathname, config.freshnessCookieExcludedPaths)) return response;
+      warming.invalidate();
       const headers = new Headers(response.headers);
       headers.append('set-cookie', `${config.freshnessCookie}=${generationMode ? crypto.randomUUID() : '1'}; Max-Age=${maxSeconds}; Path=/; HttpOnly; SameSite=Lax${new URL(request.url).protocol === 'https:' ? '; Secure' : ''}`);
       return new Response(response.body, { status:response.status, statusText:response.statusText, headers });
     }
-    if (request.method !== 'GET') return handler(request, env, context);
-    if (hasFreshnessCookie(request, config.freshnessCookie) && (!generationMode || !hasFreshnessGeneration(request, config.freshnessCookie))) return handler(noCache(request), env, context);
-    if (config.freshnessHeader !== undefined && !validFreshnessHeader(config.freshnessHeader)) return handler(noCache(request), env, context);
+    if (request.method !== 'GET') return serve(request);
+    if (hasFreshnessCookie(request, config.freshnessCookie) && (!generationMode || !hasFreshnessGeneration(request, config.freshnessCookie))) return serve(noCache(request));
+    if (config.freshnessHeader !== undefined && !validFreshnessHeader(config.freshnessHeader)) return serve(noCache(request));
     const forceSource = config.freshnessHeader !== undefined && request.headers.has(config.freshnessHeader);
     const url = new URL(request.url);
     const headerValue = (name: string): string | null => name.toLowerCase() === 'cookie' && config.cookieNames !== undefined ? selectedCookies(request.headers.get('cookie'), config.cookieNames) : request.headers.get(name);
@@ -188,31 +215,58 @@ export function createReadResponseLease<Env, Context>(handler: (request: Request
       if (name.toLowerCase() !== 'cookie' || config.cookieNames === undefined) return !!value?.trim();
       return (value ?? '').split(';').some((pair) => { const separator = pair.indexOf('='); return separator > 0 && pair.slice(0, separator).trim() !== config.freshnessCookie && !!pair.slice(separator + 1).trim(); });
     };
-    if (bypass(request, config.ignoreRequestCacheControl === true) || !matchesPath(url.pathname, config.paths) || config.bypassQueryParams?.some((name) => url.searchParams.has(name)) || !config.credentialHeaders.some(hasCredential)) return handler(forceSource ? noCache(request) : request, env, context);
+    if (bypass(request, config.ignoreRequestCacheControl === true) || !matchesPath(url.pathname, config.paths) || config.bypassQueryParams?.some((name) => url.searchParams.has(name)) || !config.credentialHeaders.some(hasCredential)) return serve(forceSource ? noCache(request) : request);
     const identity = resolved.identity();
-    if (!identity) return handler(noCache(request), env, context);
+    if (!identity) return serve(noCache(request));
     const names = [...new Set([...config.credentialHeaders, ...config.varyHeaders].map((name) => name.toLowerCase()))].sort();
     const permittedVary = new Set(names);
     const ttl = seconds * 1000;
     const key = await responseLeaseKey(ttl, [identity[0], request.method, request.url, ...identity.slice(1), names.map((name) => [name, headerValue(name)])]);
-    if (!key) return handler(noCache(request), env, context);
+    if (!key) return serve(noCache(request));
     const cached = forceSource ? null : await readLease(key, ttl, permittedVary);
+    const warmOptions = config.warmup;
+    const warmGroup = warmOptions && typeof warmOptions.scopeHeader === 'string' && /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(warmOptions.scopeHeader) && config.varyHeaders.some((name) => name.toLowerCase() === warmOptions.scopeHeader.toLowerCase()) ? await responseLeaseKey(ttl, ['response-warmup-group', identity, names.map((name) => [name, headerValue(name)]), request.headers.get(warmOptions.scopeHeader)]) : null;
+    const credentialGroup = warmOptions?.catalogScope === 'credential' && warmGroup && !config.credentialHeaders.some((name) => name.toLowerCase() === warmOptions.scopeHeader.toLowerCase()) ? await responseLeaseKey(ttl, ['response-warmup-credential-group', identity, names.filter((name) => name !== warmOptions.scopeHeader.toLowerCase()).map((name) => [name, name === 'cookie' ? withoutCookie(headerValue(name), config.freshnessCookie) : headerValue(name)])]) : null;
+    const eligible = (target: URL) => matchesPath(target.pathname, config.paths) && !config.bypassQueryParams?.some((name) => target.searchParams.has(name));
+    const scheduleWarm = (response: Response) => {
+      let transferred = false;
+      try {
+        if (!warmOptions || !warmGroup || warming.isInternal(request) || !warming.current(requestGeneration)) return;
+        const wait: unknown = context && typeof context === 'object' ? Reflect.get(context, 'waitUntil') : undefined;
+        if (typeof wait !== 'function') return;
+        const task = warming.start(warmOptions, request, response, identity, warmGroup, eligible, env, context, config.freshnessHeader, credentialGroup ?? undefined);
+        transferred = true;
+        Reflect.apply(wait, context, [task]);
+      } catch { /* Warming is optional. */ }
+      finally { if (!transferred) void response.body?.cancel().catch(() => undefined); }
+    };
     const fillResponse = async (response: Response, lease: LeaseScope, started: number, allowed: () => boolean, beforePut?: Promise<void>) => {
       if (lease.deadline === undefined || !Number.isFinite(lease.deadline)) return;
+      let warmResponse: Response | undefined;
+      if (warmOptions && warmGroup && !warming.isInternal(request) && typeof waitUntil === 'function') {
+        try { warmResponse = response.clone(); } catch { /* Warming is optional. */ }
+      }
       const expires = Math.floor(Math.min(started + ttl, lease.deadline, lease.dataDeadline ?? Infinity));
       try {
         const entry = await responseEntry(response, permittedVary);
         if (entry && beforePut) await beforePut;
-        if (entry && Number.isSafeInteger(expires) && expires > Date.now() && allowed()) {
+        if (entry && Number.isSafeInteger(expires) && expires > Date.now() && allowed() && warming.current(requestGeneration) && warming.allowed(request)) {
+          warming.verify(request);
+          if (warmResponse) { const owned = warmResponse; warmResponse = undefined; scheduleWarm(owned); }
           const headers = new Headers(response.headers);
           headers.set(metadataHeader, JSON.stringify([Math.floor(started), expires, headers.get('cache-control')]));
           headers.set('cache-control', 'public, max-age=300');
           await caches.default.put(key, new Response(entry, { status:response.status, statusText:response.statusText, headers }));
         }
       } catch { /* Cache filling must not affect the source response. */ }
+      finally { if (warmResponse) void warmResponse.body?.cancel().catch(() => undefined); }
     };
     const waitUntil: unknown = context && typeof context === 'object' ? Reflect.get(context, 'waitUntil') : undefined;
     if (cached) {
+      warming.verify(request);
+      if (warmOptions && warmGroup && !warming.isInternal(request) && typeof waitUntil === 'function') {
+        try { scheduleWarm(cached.response.clone()); } catch { /* Warming is optional. */ }
+      }
       if (refreshAhead > 0 && refreshAhead <= seconds && cached.expires - Date.now() <= refreshAhead * 1000 && typeof waitUntil === 'function' && !pending.has(key)) {
         const refresh = { valid:true, task:Promise.resolve() };
         let accepted = false;
@@ -241,20 +295,22 @@ export function createReadResponseLease<Env, Context>(handler: (request: Request
     const lease: LeaseScope = {};
     const source = noCache(request);
     if (config.freshnessHeader !== undefined) source.headers.set(config.freshnessHeader, '1');
-    const response = await scope.run(lease, () => handler(source, env, context));
+    const response = await scope.run(lease, () => serve(source));
     const fill = fillResponse(response, lease, requestStarted, () => true, priorRefresh?.task);
     try {
-      if (typeof waitUntil === 'function') { Reflect.apply(waitUntil, context, [fill]); return response; }
+      if (!warming.isInternal(request) && typeof waitUntil === 'function') { Reflect.apply(waitUntil, context, [fill]); return response; }
     } catch { /* Await the fill if the request context is unavailable. */ }
     await fill;
     return response;
   };
+  return wrapped;
 }
 
 export function wrapReadResponseLease<Env, Context>(handler: (request: Request, env: Env, context: Context) => Promise<Response>, options: ReadResponseLeaseOptions): (request: Request, env: Env, context: Context) => Promise<Response> {
   return createReadResponseLease(handler, () => {
     if (![options.namespace, options.deployment, options.database].every((value) => typeof value === 'string' && value.trim().length > 0)) return null;
-    return { config: options, seconds: options.seconds, identity: () => ['response-lease-v1', options] };
+    const { warmup: _warmup, ...identity } = options;
+    return { config: options, seconds: options.seconds, identity: () => ['response-lease-v1', identity] };
   });
 }
 

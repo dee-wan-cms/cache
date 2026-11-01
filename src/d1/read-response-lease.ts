@@ -1,10 +1,10 @@
 import { d1CacheRuntime } from './env';
 import { isD1BindingName, type D1CacheProfile } from './profile';
-import { createReadResponseLease } from '../response-lease';
+import { createReadResponseLease, type ReadResponseWarmupOptions } from '../response-lease';
 
 export { limitReadResponseLeaseUntil as limitD1ReadLeaseUntil, wrapReadResponseLeaseOrigin as wrapD1ReadLeaseOrigin, forwardReadLease as forwardD1ReadLease } from '../response-lease';
 
-export function wrapD1ReadResponseLease<Env extends object, Context>(handler: (request: Request, env: Env, context: Context) => Promise<Response>, profile: D1CacheProfile): (request: Request, env: Env, context: Context) => Promise<Response> {
+export function wrapD1ReadResponseLease<Env extends object, Context>(handler: (request: Request, env: Env, context: Context) => Promise<Response>, profile: D1CacheProfile, options?: { warmup?: ReadResponseWarmupOptions }): (request: Request, env: Env, context: Context) => Promise<Response> {
   return createReadResponseLease(handler, (env) => {
     const config = profile.readResponseLease;
     if (!config) return null;
@@ -14,7 +14,7 @@ export function wrapD1ReadResponseLease<Env extends object, Context>(handler: (r
     const database: unknown = Reflect.get(env, config.databaseBinding);
     const runtime = database && typeof database === 'object' ? d1CacheRuntime(database) : undefined;
     if (!isD1BindingName(config.databaseBinding, profile) || typeof release !== 'string' || !release.trim() || !runtime?.readsEnabled || !runtime.regionalIdentity) return null;
-    return { config, seconds, identity: () => {
+    return { config: options?.warmup ? { ...config, warmup:options.warmup } : config, seconds, identity: () => {
       const identities: unknown[] = [];
       for (const [name, value] of Object.entries(env)) {
         if (!isD1BindingName(name, profile)) continue;

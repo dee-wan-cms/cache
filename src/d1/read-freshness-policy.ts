@@ -4,7 +4,9 @@ export function matchesPath(pathname: string, patterns: readonly string[]): bool
   const actual = pathname.split('/');
   return patterns.some((pattern) => {
     const parts = pattern.split('/');
-    return parts.length === actual.length && parts.every((part, index) => part === '*' ? !!actual[index] : !part.includes('*') && part === actual[index]);
+    const recursive = parts.at(-1) === '**';
+    if (recursive) parts.pop();
+    return (recursive ? actual.length > parts.length : parts.length === actual.length) && parts.every((part, index) => part === '*' ? !!actual[index] : !part.includes('*') && part === actual[index]);
   });
 }
 

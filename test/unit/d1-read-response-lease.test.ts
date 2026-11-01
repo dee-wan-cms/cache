@@ -970,3 +970,20 @@ it('closes an unsafe background response body and disables windows larger than t
   await validWindow(f.req(), f.env, context); await tasks[0];
   expect(cancelled).toBe(true);
 });
+
+it('accepts optional warmup outside the D1 profile identity', async () => {
+  const f = fixture();
+  const seen: Array<[string, string | null]> = [];
+  const handler = vi.fn(async (request: Request) => {
+    seen.push([new URL(request.url).pathname, request.headers.get('x-site-id')]);
+    limitD1ReadLeaseUntil(Date.now() + 10000);
+    return Response.json({});
+  });
+  const wrapped = wrapD1ReadResponseLease(handler, profile, { warmup:{ scopeHeader:'x-site-id', catalogScope:'credential', seeds:[{ url:'/items/a', scope:'site-two' }] } });
+  const tasks: Promise<unknown>[] = [];
+  const context = { waitUntil(task: Promise<unknown>) { tasks.push(task); } };
+  await wrapped(f.req({ 'x-site-id':'site-one' }), f.env, context);
+  while (tasks.length) await Promise.all(tasks.splice(0));
+  expect(seen).toEqual([['/metadata', 'site-one'], ['/items/a', 'site-two']]);
+  expect(profile.readResponseLease).not.toHaveProperty('warmup');
+});

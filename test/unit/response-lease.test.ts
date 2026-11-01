@@ -80,3 +80,123 @@ it('caps a standalone response lease at a scoped value hit deadline', async () =
   expect(await (await wrapped(request(), {}, undefined)).json()).toEqual({ value:2 });
   expect(handler).toHaveBeenCalledTimes(2);
 });
+
+it('warms eligible siblings once and rejects external targets', async () => {
+  const calls: string[] = [];
+  const handler = vi.fn(async (req: Request) => {
+    calls.push(new URL(req.url).pathname);
+    limitReadResponseLeaseUntil(Date.now() + 5000);
+    return Response.json({ path:new URL(req.url).pathname });
+  });
+  const wrapped = wrapReadResponseLease(handler, { ...policy, namespace:'warm-siblings', paths:['/api/**'], warmup:{ scopeHeader:'x-site-id', seeds:['/api/sibling', '/api/sibling', 'https://elsewhere.test/api/bad'], maxTargets:4 } });
+  const jobs: Promise<unknown>[] = [];
+  const ctx = { waitUntil(task: Promise<unknown>) { jobs.push(task); } };
+  const req = (path: string) => new Request(`https://example.test${path}`, { headers:{ cookie:'session=a', 'x-site-id':'one' } });
+  await wrapped(req('/api/first'), {}, ctx);
+  while (jobs.length) await Promise.all(jobs.splice(0));
+  expect(calls).toEqual(['/api/first', '/api/sibling']);
+  await wrapped(req('/api/sibling'), {}, ctx);
+  while (jobs.length) await Promise.all(jobs.splice(0));
+  expect(calls).toEqual(['/api/first', '/api/sibling']);
+});
+
+it('replays portable URLs with the current actor credentials', async () => {
+  const calls: string[] = [];
+  const handler = vi.fn(async (req: Request) => {
+    calls.push(`${new URL(req.url).pathname}:${req.headers.get('cookie')}`);
+    limitReadResponseLeaseUntil(Date.now() + 5000);
+    return Response.json({ actor:req.headers.get('cookie') });
+  });
+  const options: ReadResponseLeaseOptions = { ...policy, namespace:'warm-catalog', paths:['/api/**'], warmup:{ scopeHeader:'x-site-id', seeds:[], portable:() => true } };
+  const wrapped = wrapReadResponseLease(handler, options);
+  const jobs: Promise<unknown>[] = [];
+  const ctx = { waitUntil(task: Promise<unknown>) { jobs.push(task); } };
+  const req = (path: string, actor: string) => new Request(`https://example.test${path}`, { headers:{ cookie:`session=${actor}`, 'x-site-id':'one' } });
+  await wrapped(req('/api/popular', 'a'), {}, ctx);
+  while (jobs.length) await Promise.all(jobs.splice(0));
+  await wrapped(req('/api/other', 'b'), {}, ctx);
+  while (jobs.length) await Promise.all(jobs.splice(0));
+  expect(calls).toContain('/api/popular:session=b');
+  expect(await (await wrapped(req('/api/popular', 'b'), {}, undefined)).json()).toEqual({ actor:'session=b' });
+});
+
+it('requires authorization proof before scheduling warmup', async () => {
+  const handler = vi.fn(async () => Response.json({ ok:true }));
+  const wrapped = wrapReadResponseLease(handler, { ...policy, namespace:'warm-no-proof', paths:['/api/**'], warmup:{ scopeHeader:'x-site-id', seeds:['/api/sibling'] } });
+  const jobs: Promise<unknown>[] = [];
+  const context = { waitUntil(task: Promise<unknown>) { jobs.push(task); } };
+  await wrapped(new Request('https://example.test/api/first', { headers:{ cookie:'session=a', 'x-site-id':'one' } }), {}, context);
+  while (jobs.length) await Promise.all(jobs.splice(0));
+  expect(handler).toHaveBeenCalledOnce();
+});
+
+it('cancels queued warm reads after a successful write', async () => {
+  let release: (() => void) | undefined;
+  let started: (() => void) | undefined;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const warmStarted = new Promise<void>((resolve) => { started = resolve; });
+  const calls: string[] = [];
+  const handler = vi.fn(async (req: Request) => {
+    const path = new URL(req.url).pathname;
+    calls.push(`${req.method}:${path}`);
+    if (path === '/api/held' && req.method === 'GET') { started?.(); await blocked; }
+    limitReadResponseLeaseUntil(Date.now() + 5000);
+    return Response.json({ path });
+  });
+  const wrapped = wrapReadResponseLease(handler, { ...policy, namespace:'warm-cancel', paths:['/api/**'], warmup:{ scopeHeader:'x-site-id', seeds:['/api/held', '/api/queued'], concurrency:1 } });
+  const jobs: Promise<unknown>[] = [];
+  const ctx = { waitUntil(task: Promise<unknown>) { jobs.push(task); } };
+  const req = (path: string, method = 'GET') => new Request(`https://example.test${path}`, { method, headers:{ cookie:'session=a', 'x-site-id':'one' } });
+  await wrapped(req('/api/first'), {}, ctx);
+  await warmStarted;
+  const write = await wrapped(req('/api/write', 'POST'), {}, ctx);
+  expect(write.headers.get('set-cookie')).toMatch(/^fresh=/);
+  release?.();
+  while (jobs.length) await Promise.all(jobs.splice(0));
+  expect(calls).not.toContain('GET:/api/queued');
+  await wrapped(req('/api/held'), {}, undefined);
+  expect(calls.filter((call) => call === 'GET:/api/held')).toHaveLength(2);
+});
+
+it.each([
+  { path:'/api/presence/entry', status:200 },
+  { path:'/api/working-drafts/entry', status:200 },
+  { path:'/api/content/entry/preview', status:200 },
+  { path:'/api/write', status:500 },
+])('keeps queued warm reads after $path returns $status', async ({ path, status }) => {
+  let release: (() => void) | undefined;
+  let started: (() => void) | undefined;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const warmStarted = new Promise<void>((resolve) => { started = resolve; });
+  const calls: string[] = [];
+  const handler = vi.fn(async (req: Request) => {
+    const target = new URL(req.url).pathname;
+    calls.push(`${req.method}:${target}`);
+    if (target === '/api/held' && req.method === 'GET') { started?.(); await blocked; }
+    limitReadResponseLeaseUntil(Date.now() + 5000);
+    return Response.json({ path:target }, { status:req.method === 'POST' ? status : 200 });
+  });
+  const wrapped = wrapReadResponseLease(handler, {
+    ...policy,
+    namespace:`warm-excluded-${path}-${status}`,
+    paths:['/api/**'],
+    freshnessCookieExcludedPaths:['/api/presence/*', '/api/working-drafts/*', '/api/content/*/preview'],
+    warmup:{ scopeHeader:'x-site-id', seeds:['/api/held', '/api/queued'], concurrency:1 },
+  });
+  const jobs: Promise<unknown>[] = [];
+  const ctx = { waitUntil(task: Promise<unknown>) { jobs.push(task); } };
+  const req = (target: string, method = 'GET') => new Request(`https://example.test${target}`, { method, headers:{ cookie:'session=a', 'x-site-id':'one' } });
+  await wrapped(req('/api/first'), {}, ctx);
+  await warmStarted;
+  try {
+    const response = await wrapped(req(path, 'POST'), {}, ctx);
+    expect(response.status).toBe(status);
+    expect(response.headers.has('set-cookie')).toBe(false);
+  } finally {
+    release?.();
+  }
+  while (jobs.length) await Promise.all(jobs.splice(0));
+  expect(calls).toContain('GET:/api/queued');
+  await wrapped(req('/api/held'), {}, undefined);
+  expect(calls.filter((call) => call === 'GET:/api/held')).toHaveLength(1);
+});
