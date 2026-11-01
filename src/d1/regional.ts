@@ -1,9 +1,9 @@
 import { decode, encode, sha256Hex, stableStringify } from '../core/codec';
-import { boundedValue } from './read';
+import { boundedValue } from '../core/bounded-value';
 import type { DecimalConstructor } from '../core/types';
 
 const MAX_IDENTITY_BYTES = 32_768;
-const MAX_VALUE_BYTES = 1_500_000;
+export const MAX_VALUE_BYTES = 1_500_000;
 export const MAX_RESPONSE_LEASE_BYTES = 8_000_000;
 
 function sameEncodedValue(left: unknown, right: unknown): boolean {
@@ -19,7 +19,9 @@ function sameEncodedValue(left: unknown, right: unknown): boolean {
   return same(left, right, 0);
 }
 
-function createRegionalCache(maxMs: number, maxValueBytes = MAX_VALUE_BYTES) {
+export function createRegionalCache(maxMs: number, maxValueBytes = MAX_VALUE_BYTES, options: { cache?: () => Pick<Cache, 'match' | 'put'>; now?: () => number } = {}) {
+  const cache = options.cache ?? (() => caches.default);
+  const now = options.now ?? (() => Date.now());
   async function regionalKey(ttl: number | undefined, identity: unknown): Promise<string | null> {
     if (!Number.isFinite(ttl) || !ttl || ttl <= 0 || ttl > maxMs || !boundedValue(identity, MAX_IDENTITY_BYTES, true)) return null;
     try {
@@ -32,8 +34,8 @@ function createRegionalCache(maxMs: number, maxValueBytes = MAX_VALUE_BYTES) {
   async function regionalRead(key: string | null, ttl = maxMs, decimal?: DecimalConstructor): Promise<{ value: unknown; expires: number } | null> {
     if (!key) return null;
     try {
-      const response = await caches.default.match(key);
-      if (!response) return null;
+      const response = await cache().match(key);
+      if (!response || response.status !== 200 || response.headers.has('set-cookie')) return null;
       const reader = response.body?.getReader();
       if (!reader) return null;
       const chunks: Uint8Array[] = [];
@@ -57,21 +59,21 @@ function createRegionalCache(maxMs: number, maxValueBytes = MAX_VALUE_BYTES) {
       for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
       const text = new TextDecoder('utf-8', { fatal:true, ignoreBOM:false }).decode(bytes);
       const envelope: unknown = JSON.parse(text);
-      const now = Date.now();
-      if (!Number.isFinite(ttl) || ttl <= 0 || ttl > maxMs || !envelope || typeof envelope !== 'object' || !('started' in envelope) || typeof envelope.started !== 'number' || !Number.isSafeInteger(envelope.started) || envelope.started > now || !('expires' in envelope) || typeof envelope.expires !== 'number' || !Number.isSafeInteger(envelope.expires) || envelope.expires <= now || envelope.expires > envelope.started + ttl || envelope.expires > now + ttl || !('value' in envelope)) return null;
+      const currentTime = now();
+      if (!Number.isFinite(ttl) || ttl <= 0 || ttl > maxMs || !envelope || typeof envelope !== 'object' || !('started' in envelope) || typeof envelope.started !== 'number' || !Number.isSafeInteger(envelope.started) || envelope.started > currentTime || !('expires' in envelope) || typeof envelope.expires !== 'number' || !Number.isSafeInteger(envelope.expires) || envelope.expires <= currentTime || envelope.expires > envelope.started + ttl || envelope.expires > currentTime + ttl || !('value' in envelope)) return null;
       const value = decode(envelope.value, decimal);
       return value !== null && value !== undefined && boundedValue(value, maxValueBytes, false) && sameEncodedValue(encode(value), envelope.value) ? { value, expires: envelope.expires } : null;
     } catch { return null; }
   }
 
   async function regionalWrite(key: string | null, ttl: number | undefined, started: number, value: unknown): Promise<void> {
-    if (!key || !ttl || !Number.isFinite(ttl) || ttl <= 0 || ttl > maxMs || value === null || value === undefined || !boundedValue(value, maxValueBytes, false)) return;
+    if (!key || !ttl || !Number.isFinite(ttl) || ttl <= 0 || ttl > maxMs || !Number.isSafeInteger(started) || !Number.isSafeInteger(Math.floor(started + ttl)) || value === null || value === undefined || !boundedValue(value, maxValueBytes, false)) return;
     try {
       const expires = Math.floor(started + ttl);
-      if (expires <= Date.now()) return;
+      if (expires <= now()) return;
       const text = JSON.stringify({ started: Math.floor(started), expires, value: encode(value) });
       if (new TextEncoder().encode(text).byteLength > maxValueBytes) return;
-      await caches.default.put(key, new Response(text, { headers: { 'Cache-Control': `public, max-age=${maxMs / 1000}` } }));
+      await cache().put(key, new Response(text, { headers: { 'Cache-Control': `public, max-age=${maxMs / 1000}` } }));
     } catch { /* Cache API is optional. */ }
   }
 
