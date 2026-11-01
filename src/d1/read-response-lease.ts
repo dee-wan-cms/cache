@@ -96,7 +96,7 @@ function selectedCookies(header: string | null, names: readonly string[]): strin
 
 const metadataHeader = 'x-dee-wan-lease-meta';
 
-async function readLease(key: string, ttl: number, permittedVary: Set<string>): Promise<Response | null> {
+async function readLease(key: string, ttl: number, permittedVary: Set<string>): Promise<{ response: Response; expires: number } | null> {
   try {
     const cached = await caches.default.match(key);
     if (!cached || cached.status !== 200 || !eligibleHeaders(cached.headers, permittedVary)) return null;
@@ -111,7 +111,7 @@ async function readLease(key: string, ttl: number, permittedVary: Set<string>): 
     headers.delete(metadataHeader);
     if (control === null) headers.delete('cache-control');
     else headers.set('cache-control', control);
-    return new Response(cached.body, { status:cached.status, statusText:cached.statusText, headers });
+    return { response:new Response(cached.body, { status:cached.status, statusText:cached.statusText, headers }), expires };
   } catch { return null; }
 }
 
@@ -150,13 +150,15 @@ async function responseEntry(response: Response, permittedVary: Set<string>): Pr
 }
 
 export function wrapD1ReadResponseLease<Env extends object, Context>(handler: (request: Request, env: Env, context: Context) => Promise<Response>, profile: D1CacheProfile): (request: Request, env: Env, context: Context) => Promise<Response> {
+  const pending = new Map<string, { valid: boolean; task: Promise<void> }>();
   return async (request, env, context) => {
     const requestStarted = Date.now();
     const config = profile.readResponseLease;
     const rawSeconds: unknown = Reflect.get(env, `${profile.envPrefix}_READ_ACCESS_SECONDS`);
     const maxSeconds = config?.maxSeconds ?? 5;
     const seconds = typeof rawSeconds === 'string' && /^(?:0|[1-9]\d{0,2})$/.test(rawSeconds) ? Number(rawSeconds) : 0;
-    if (!config || !Number.isInteger(maxSeconds) || maxSeconds < 1 || maxSeconds > 300 || !seconds || seconds > maxSeconds || !/^[A-Za-z0-9_-]+$/.test(config.freshnessCookie)) return handler(request, env, context);
+    const refreshAhead = config?.refreshAheadSeconds ?? 0;
+    if (!config || !Number.isInteger(refreshAhead) || refreshAhead < 0 || refreshAhead > maxSeconds || !Number.isInteger(maxSeconds) || maxSeconds < 1 || maxSeconds > 300 || !seconds || seconds > maxSeconds || !/^[A-Za-z0-9_-]+$/.test(config.freshnessCookie)) return handler(request, env, context);
     if (config.cookieNames !== undefined && (!Array.isArray(config.cookieNames) || config.cookieNames.length === 0 || !config.cookieNames.every((name) => typeof name === 'string' && /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name)) || new Set(config.cookieNames).size !== config.cookieNames.length || !config.credentialHeaders.some((name) => name.toLowerCase() === 'cookie') || (config.freshnessCookieMode === 'generation' && !config.cookieNames.includes(config.freshnessCookie)))) return handler(request, env, context);
     const release: unknown = Reflect.get(env, config.deploymentEnv);
     const database: unknown = Reflect.get(env, config.databaseBinding);
@@ -196,28 +198,53 @@ export function wrapD1ReadResponseLease<Env extends object, Context>(handler: (r
     const key = await responseLeaseKey(ttl, ['d1-response-lease-v2', request.method, request.url, profile, release, identities, names.map((name) => [name, headerValue(name)])]);
     if (!key) return handler(noCache(request), env, context);
     const cached = forceSource ? null : await readLease(key, ttl, permittedVary);
-    if (cached) return conditionalHit(request, cached);
-    const started = requestStarted;
-    const lease: LeaseScope = {};
-    const source = noCache(request);
-    if (config.freshnessHeader !== undefined) source.headers.set(config.freshnessHeader, '1');
-    const response = await scope.run(lease, () => handler(source, env, context));
-    if (lease.deadline === undefined || !Number.isFinite(lease.deadline)) return response;
-    const fillTtl = Math.min(ttl, lease.deadline - started, (lease.dataDeadline ?? Infinity) - started);
-    const fill = (async () => {
+    const fillResponse = async (response: Response, lease: LeaseScope, started: number, allowed: () => boolean, beforePut?: Promise<void>) => {
+      if (lease.deadline === undefined || !Number.isFinite(lease.deadline)) return;
+      const expires = Math.floor(Math.min(started + ttl, lease.deadline, lease.dataDeadline ?? Infinity));
       try {
         const entry = await responseEntry(response, permittedVary);
-        const expires = Math.floor(started + fillTtl);
-        if (entry && Number.isSafeInteger(expires) && expires > Date.now()) {
+        if (entry && beforePut) await beforePut;
+        if (entry && Number.isSafeInteger(expires) && expires > Date.now() && allowed()) {
           const headers = new Headers(response.headers);
           headers.set(metadataHeader, JSON.stringify([Math.floor(started), expires, headers.get('cache-control')]));
           headers.set('cache-control', 'public, max-age=300');
           await caches.default.put(key, new Response(entry, { status:response.status, statusText:response.statusText, headers }));
         }
       } catch { /* Cache filling must not affect the source response. */ }
-    })();
+    };
+    const waitUntil: unknown = context && typeof context === 'object' ? Reflect.get(context, 'waitUntil') : undefined;
+    if (cached) {
+      if (refreshAhead > 0 && refreshAhead <= seconds && cached.expires - Date.now() <= refreshAhead * 1000 && typeof waitUntil === 'function' && !pending.has(key)) {
+        const refresh = { valid:true, task:Promise.resolve() };
+        let accepted = false;
+        refresh.task = Promise.resolve().then(async () => {
+          if (!accepted) return;
+          const started = Date.now();
+          const headers = new Headers(request.headers);
+          for (const name of ['range', 'if-match', 'if-unmodified-since', 'if-range', 'if-none-match', 'if-modified-since']) headers.delete(name);
+          headers.set('cache-control', 'no-cache');
+          if (config.freshnessHeader !== undefined) headers.set(config.freshnessHeader, '1');
+          const source = new Request(request.url, { method:'GET', headers, signal:new AbortController().signal });
+          const lease: LeaseScope = {};
+          try {
+            const response = await scope.run(lease, () => handler(source, env, context));
+            try { await fillResponse(response, lease, started, () => refresh.valid); }
+            finally { void response.body?.cancel().catch(() => undefined); }
+          } catch { /* Refresh failures leave the old lease untouched. */ }
+        }).finally(() => { if (pending.get(key) === refresh) pending.delete(key); });
+        pending.set(key, refresh);
+        try { Reflect.apply(waitUntil, context, [refresh.task]); accepted = true; } catch { pending.delete(key); }
+      }
+      return conditionalHit(request, cached.response);
+    }
+    const priorRefresh = pending.get(key);
+    if (priorRefresh) priorRefresh.valid = false;
+    const lease: LeaseScope = {};
+    const source = noCache(request);
+    if (config.freshnessHeader !== undefined) source.headers.set(config.freshnessHeader, '1');
+    const response = await scope.run(lease, () => handler(source, env, context));
+    const fill = fillResponse(response, lease, requestStarted, () => true, priorRefresh?.task);
     try {
-      const waitUntil: unknown = context && typeof context === 'object' ? Reflect.get(context, 'waitUntil') : undefined;
       if (typeof waitUntil === 'function') { Reflect.apply(waitUntil, context, [fill]); return response; }
     } catch { /* Await the fill if the request context is unavailable. */ }
     await fill;

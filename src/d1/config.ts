@@ -13,6 +13,10 @@ const hints = new Set(['wnam', 'enam', 'sam', 'weur', 'eeur', 'apac', 'oc', 'afr
 const bindingsOf = (config: D1WorkerConfig, profile: D1CacheProfile) => (config.d1_databases ?? []).filter(({ binding }) => isD1BindingName(binding, profile));
 
 export function d1CacheProblem(config: D1WorkerConfig, profile: D1CacheProfile, coordinatorScript?: string): string | null {
+  const lease = profile.readResponseLease;
+  const maxSeconds = lease?.maxSeconds ?? 5;
+  const refreshAhead = lease?.refreshAheadSeconds ?? 0;
+  if (lease && (!Number.isInteger(maxSeconds) || maxSeconds < 1 || maxSeconds > 300 || !Number.isInteger(refreshAhead) || refreshAhead < 0 || refreshAhead > maxSeconds)) return 'Invalid response lease duration or refresh-ahead window.';
   const vars = config.vars ?? {};
   const field = (name: string) => vars[`${profile.envPrefix}_${name}`];
   const enabled = field('ENABLED');

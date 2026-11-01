@@ -267,6 +267,7 @@ let calls = 0;
 const handler = wrapD1ReadLeaseOrigin(async () => {
   calls++;
   limitD1ReadLeaseUntil(Date.now() + 30000);
+  if (calls > 1) return Response.json({ calls });
   const stream = new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('{"calls":' + calls)); setTimeout(() => { controller.enqueue(new TextEncoder().encode('}')); controller.close(); }, 1200); } });
   return new Response(stream, { headers:{ 'content-type':'application/json', 'cache-control':'private, no-store' } });
 });
@@ -274,7 +275,7 @@ export default { fetch:handler };`;
 const streamingGatewaySource = `
 import { createD1CacheRuntime } from './env';
 import { wrapD1ReadResponseLease, forwardD1ReadLease } from './read-response-lease';
-const profile = { envPrefix:'TEST', bindingNames:['DB'], bindingPrefixes:[], coordinatorNamePrefix:'test:', coordinatorClass:'CacheCoordinator', readModels:[], unfencedWriteTables:[], readResponseLease:{ databaseBinding:'DB', deploymentEnv:'RELEASE', paths:['/metadata'], credentialHeaders:['cookie'], varyHeaders:[], freshnessCookie:'fresh' } };
+const profile = { envPrefix:'TEST', bindingNames:['DB'], bindingPrefixes:[], coordinatorNamePrefix:'test:', coordinatorClass:'CacheCoordinator', readModels:[], unfencedWriteTables:[], readResponseLease:{ databaseBinding:'DB', deploymentEnv:'RELEASE', paths:['/metadata'], credentialHeaders:['cookie'], varyHeaders:[], freshnessCookie:'fresh', refreshAheadSeconds:5 } };
 const store = { read:async () => { throw Error('unexpected'); }, write:async () => { throw Error('unexpected'); }, release:async () => {}, beginWrite:async () => {}, endWrite:async () => {}, invalidate:async () => {} };
 const handler = wrapD1ReadResponseLease((request, env) => forwardD1ReadLease(request, env.ORIGIN), profile);
 let completed = 0;
@@ -310,5 +311,12 @@ it('streams a service-binding response before its background Cache API fill comp
     }
     expect(filled).toBe(true);
     expect(await (await worker.dispatchFetch('https://cache.test/metadata', { headers })).json()).toEqual({ calls:1 });
+    let refreshed = false;
+    for (let attempt = 0; attempt < 50 && !refreshed; attempt++) {
+      const state: unknown = await (await worker.dispatchFetch('https://cache.test/fill-state')).json();
+      refreshed = !!state && typeof state === 'object' && Reflect.get(state, 'completed') >= 2;
+    }
+    expect(refreshed).toBe(true);
+    expect(await (await worker.dispatchFetch('https://cache.test/metadata', { headers })).json()).toEqual({ calls:2 });
   } finally { await worker.dispose(); }
 });

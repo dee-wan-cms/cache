@@ -39,3 +39,11 @@ describe('generic D1 writer configuration', () => {
   });
 
 });
+
+it('validates the response lease refresh-ahead window', () => {
+  const lease = { databaseBinding:'DB', deploymentEnv:'RELEASE', paths:['/metadata'], credentialHeaders:['cookie'], varyHeaders:[], freshnessCookie:'fresh', maxSeconds:30 };
+  for (const refreshAheadSeconds of [-1, 1.5, 31]) {
+    expect(d1CacheProblem(admin, { ...profile, readResponseLease:{ ...lease, refreshAheadSeconds } })).toMatch(/refresh-ahead/);
+  }
+  expect(d1CacheProblem(admin, { ...profile, readResponseLease:{ ...lease, refreshAheadSeconds:30 } })).toBeNull();
+});

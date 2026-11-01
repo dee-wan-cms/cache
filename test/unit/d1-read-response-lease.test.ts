@@ -845,3 +845,128 @@ it('reuses large nested UTF-8 JSON responses without changing their contents', a
   expect(await (await wrapped(f.req(), f.env, undefined)).text()).toBe(body);
   expect(source).toHaveBeenCalledTimes(1);
 });
+
+it('refreshes a valid hit once without waiting and keeps the detached request identity', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(100_000);
+  const f = fixture();
+  const base = profile.readResponseLease;
+  if (!base) throw Error('lease policy missing');
+  let release: (() => void) | undefined;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let calls = 0;
+  const source = vi.fn(async (request: Request) => {
+    const call = ++calls;
+    limitD1ReadLeaseUntil(120_000);
+    if (call === 2) {
+      expect(request.signal.aborted).toBe(false);
+      expect(request.headers.get('cookie')).toBe('session=a');
+      expect(request.headers.get('origin')).toBe('https://site.example');
+      expect(request.headers.get('cache-control')).toBe('no-cache');
+      expect(request.headers.get('x-read-fresh')).toBe('1');
+      expect(request.headers.has('if-none-match')).toBe(false);
+      await held;
+      expect(request.signal.aborted).toBe(false);
+    }
+    return Response.json({ call });
+  });
+  const wrapped = wrapD1ReadResponseLease(source, { ...profile, readResponseLease:{ ...base, refreshAheadSeconds:2, freshnessHeader:'x-read-fresh' } });
+  await wrapped(f.req(), f.env, undefined);
+  vi.setSystemTime(103_000);
+  const tasks: Promise<void>[] = [];
+  const context = { waitUntil(task: Promise<void>) { tasks.push(task); } };
+  const controller = new AbortController();
+  const request = new Request(f.req({ 'if-none-match':'"old"' }), { signal:controller.signal });
+  expect(await (await wrapped(request, f.env, context)).json()).toEqual({ call:1 });
+  controller.abort();
+  expect(await (await wrapped(f.req(), f.env, context)).json()).toEqual({ call:1 });
+  expect(tasks).toHaveLength(1);
+  release?.(); await tasks[0];
+  vi.setSystemTime(105_001);
+  expect(await (await wrapped(f.req(), f.env, undefined)).json()).toEqual({ call:2 });
+  expect(source).toHaveBeenCalledTimes(2);
+});
+
+it('keeps old expiry for failed refreshes and never refreshes without waitUntil', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(100_000);
+  const f = fixture(); const base = profile.readResponseLease;
+  if (!base) throw Error('lease policy missing');
+  let calls = 0;
+  const source = vi.fn(async () => {
+    limitD1ReadLeaseUntil(120_000); calls++;
+    if (calls === 2) return new Response(null, { status:304 });
+    if (calls === 3) return new Response('bad', { headers:{ 'content-type':'application/json' } });
+    return Response.json({ calls });
+  });
+  const wrapped = wrapD1ReadResponseLease(source, { ...profile, readResponseLease:{ ...base, refreshAheadSeconds:2 } });
+  await wrapped(f.req(), f.env, undefined); vi.setSystemTime(103_000);
+  await wrapped(f.req(), f.env, undefined);
+  expect(calls).toBe(1);
+  const tasks: Promise<void>[] = []; const context = { waitUntil(task: Promise<void>) { tasks.push(task); } };
+  await wrapped(f.req(), f.env, context); await tasks[0];
+  await wrapped(f.req(), f.env, context); await tasks[1];
+  expect(await (await wrapped(f.req(), f.env, undefined)).json()).toEqual({ calls:1 });
+  vi.setSystemTime(105_000);
+  expect(await (await wrapped(f.req(), f.env, undefined)).json()).toEqual({ calls:4 });
+});
+
+it('caps refreshed expiry at the new authorization deadline', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(100_000);
+  const f = fixture(); const base = profile.readResponseLease;
+  if (!base) throw Error('lease policy missing');
+  let calls = 0;
+  const source = vi.fn(async () => { calls++; limitD1ReadLeaseUntil(calls === 2 ? 106_000 : 120_000); return Response.json({ calls }); });
+  const wrapped = wrapD1ReadResponseLease(source, { ...profile, readResponseLease:{ ...base, refreshAheadSeconds:2 } });
+  await wrapped(f.req(), f.env, undefined); vi.setSystemTime(103_000);
+  const tasks: Promise<void>[] = []; const context = { waitUntil(task: Promise<void>) { tasks.push(task); } };
+  await wrapped(f.req(), f.env, context); await tasks[0];
+  vi.setSystemTime(105_500); expect(await (await wrapped(f.req(), f.env, undefined)).json()).toEqual({ calls:2 });
+  vi.setSystemTime(106_000); expect(await (await wrapped(f.req(), f.env, undefined)).json()).toEqual({ calls:3 });
+});
+
+it('does not let an older pending refresh overwrite an explicit fresh response', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(100_000);
+  const f = fixture(); const base = profile.readResponseLease;
+  if (!base) throw Error('lease policy missing');
+  let release: (() => void) | undefined;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let calls = 0;
+  const source = vi.fn(async () => { const call = ++calls; limitD1ReadLeaseUntil(120_000); if (call === 2) await held; return Response.json({ call }); });
+  const wrapped = wrapD1ReadResponseLease(source, { ...profile, readResponseLease:{ ...base, refreshAheadSeconds:2, freshnessHeader:'x-read-fresh' } });
+  await wrapped(f.req(), f.env, undefined); vi.setSystemTime(103_000);
+  const tasks: Promise<void>[] = []; const context = { waitUntil(task: Promise<void>) { tasks.push(task); } };
+  await wrapped(f.req(), f.env, context);
+  expect(await (await wrapped(f.req({ 'x-read-fresh':'1' }), f.env, context)).json()).toEqual({ call:3 });
+  release?.(); await Promise.all(tasks);
+  expect(await (await wrapped(f.req(), f.env, undefined)).json()).toEqual({ call:3 });
+});
+
+it('rejects invalid refresh-ahead settings', async () => {
+  const f = fixture(); const base = profile.readResponseLease;
+  if (!base) throw Error('lease policy missing');
+  for (const refreshAheadSeconds of [-1, 1.5, 6]) {
+    const wrapped = wrapD1ReadResponseLease(f.handler, { ...profile, readResponseLease:{ ...base, refreshAheadSeconds } });
+    await wrapped(f.req(), f.env, undefined); await wrapped(f.req(), f.env, undefined);
+  }
+  expect(f.handler).toHaveBeenCalledTimes(6);
+});
+
+it('closes an unsafe background response body and disables windows larger than the active lease', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(100_000);
+  const f = fixture(); const base = profile.readResponseLease;
+  if (!base) throw Error('lease policy missing');
+  let calls = 0; let cancelled = false;
+  const source = vi.fn(async () => {
+    limitD1ReadLeaseUntil(120_000); calls++;
+    if (calls === 3) return new Response(new ReadableStream({ cancel() { cancelled = true; } }), { headers:{ 'content-type':'text/event-stream' } });
+    return Response.json({ calls });
+  });
+  const tasks: Promise<void>[] = []; const context = { waitUntil(task: Promise<void>) { tasks.push(task); } };
+  const invalidWindow = wrapD1ReadResponseLease(source, { ...profile, readResponseLease:{ ...base, maxSeconds:10, refreshAheadSeconds:6 } });
+  await invalidWindow(f.req(), f.env, undefined); vi.setSystemTime(104_000);
+  await invalidWindow(f.req(), f.env, context);
+  expect(tasks).toHaveLength(0);
+  const validWindow = wrapD1ReadResponseLease(source, { ...profile, readResponseLease:{ ...base, maxSeconds:10, refreshAheadSeconds:2 } });
+  await validWindow(f.req(), f.env, undefined); vi.setSystemTime(108_000);
+  await validWindow(f.req(), f.env, context); await tasks[0];
+  expect(cancelled).toBe(true);
+});
