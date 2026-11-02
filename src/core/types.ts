@@ -20,7 +20,7 @@ export interface GeneratedCacheConfig {
 }
 
 export type ReadResponse =
-  | { epochs: Record<string, number>; kind: "hit"; refreshToken: null | string; value: string }
+  | { epochs: Record<string, number>; freshUntil?: number; kind: "hit"; refreshToken: null | string; value: string }
   | {
       epochs: Record<string, number>;
       kind: "miss";
