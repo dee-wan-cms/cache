@@ -326,26 +326,33 @@ it('caps warm source concurrency across actors and scopes', async () => {
 });
 
 it('drops a queued warm request when its deadline expires', async () => {
-  vi.useFakeTimers();
+  let now = Date.now();
+  vi.spyOn(Date, 'now').mockImplementation(() => now);
   let release: (() => void) | undefined;
   let ready: (() => void) | undefined;
+  let queued: (() => void) | undefined;
   const blocked = new Promise<void>((resolve) => { release = resolve; });
   const firstStarted = new Promise<void>((resolve) => { ready = resolve; });
+  const secondQueued = new Promise<void>((resolve) => { queued = resolve; });
   const calls: string[] = [];
-  const wrapped = wrapReadResponseLease(async (request) => {
-    if (new URL(request.url).pathname === '/api/seed') { calls.push(request.headers.get('cookie') ?? ''); ready?.(); await blocked; }
-    limitReadResponseLeaseUntil(Date.now() + 5000);
+  const warm = createResponseWarmup(async (request: Request) => {
+    calls.push(request.headers.get('cookie') ?? '');
+    ready?.();
+    await blocked;
     return Response.json({});
-  }, { ...options, namespace:'shared-deadline', warmup:{ scopeHeader:'x-site-id', seeds:['/api/seed'], concurrency:1, maxMilliseconds:100 } });
-  const ctx = context();
-  await wrapped(req('/api/root', 'session=a'), {}, ctx); await ctx.jobs[0]; await driveUntil(() => calls.includes('session=a')); await firstStarted;
-  const beforeSecond = ctx.jobs.length;
-  await wrapped(req('/api/root', 'session=b'), {}, ctx); await ctx.jobs[beforeSecond];
-  await vi.advanceTimersByTimeAsync(101);
-  await ctx.drain();
+  });
+  const config = { scopeHeader:'x-site-id', seeds:['/api/seed'], concurrency:1, maxMilliseconds:100 };
+  const first = warm.start(config, req('/api/root', 'session=a'), Response.json({}), ['identity'], 'actor-a', () => true, {}, undefined);
+  await firstStarted;
+  const second = warm.start(config, req('/api/root', 'session=b'), Response.json({}), ['identity'], 'actor-b', (url) => {
+    if (url.pathname === '/api/seed') queued?.();
+    return true;
+  }, {}, undefined);
+  await secondQueued;
+  now += 101;
+  await Promise.all([first, second]);
   expect(calls).toEqual(['session=a']);
   release?.();
-  vi.useRealTimers();
 });
 
 it('cancels semaphore waiters across actors on a successful write', async () => {
