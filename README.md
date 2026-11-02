@@ -194,7 +194,7 @@ Models that reference the target through a foreign key are invalidated too. Unkn
 
 ## Runtime requirements
 
-- Cloudflare Workers with a SQLite-backed Durable Object and D1. No `nodejs_compat` needed.
+- Cloudflare Workers with a SQLite-backed Durable Object and D1. The core and Cloudflare entries do not require `nodejs_compat`; Workers importing `@dee-wan/cache/d1` require it.
 - Prisma 6.19.3 or newer 6.x with `@prisma/adapter-d1` (tested with 6.19.3).
 - Generator: Node 20 or newer (CI runs it on 20, 22 and 24). Wrangler 4 and Miniflare need Node 22.
 
@@ -348,3 +348,33 @@ Defaults are 48 targets per batch, 4 concurrent requests across all warmup batch
 `createIntentWarmup(cooldownMs?, now?)` warms reads on navigation intent, without storing response values. Call `setScope(siteAndActor)` before use and `warm(key, async isCurrent => ...)` on mouse hover or keyboard focus. One task runs; only the latest waiting intent remains. Check `isCurrent()` between sequential reads. Successful tasks cool for 60 seconds by default. Scope changes and `invalidate()` clear waiting tasks and cooldowns; old completions cannot warm a new scope. Use silent, bounded, read-only requests with the same URL, credentials and headers as normal reads. Do not adopt results into active editor stores or start a startup fanout.
 
 `cacheReadValue` from `@dee-wan/cache/scoped-read` provides a Cache API value cache without D1 or a Durable Object. Pass a nonempty `namespace`, a bounded structured `key`, and a `validate` type guard with the source loader. Include every authorization and result-varying scope in the key; do not put credentials in cached values. `ttlMs` defaults to 5000 and cannot exceed 5000. `maxBytes` defaults to 1,500,000 and can be lowered. Optional `cache` and `now` allow a Cache API implementation and clock to be supplied. Cache failures, invalid values, and expired entries fall back to the loader; loader errors propagate. Expiry starts before the loader runs.
+
+### D1 bookmark client transport
+
+`createD1BookmarkFetch(fetch)` wraps a fetch implementation and remembers valid
+`X-Dee-Wan-D1-Bookmarks` response headers. Later requests include the greatest
+bookmark seen for each physical database. Create one wrapper per independent
+client context. Bookmark maps are bounded to 64 database UUIDs and 8192
+characters; invalid maps are ignored. Pass `{ storage }` as the second argument to persist per-origin maps in a `getItem`/`setItem` store such as sessionStorage. Storage errors fall back to memory.
+
+### D1 sessions
+
+Cloudflare Workers importing `@dee-wan/cache/d1` require the `nodejs_compat`
+compatibility flag, including when D1 sessions are not enabled.
+
+Wrap HTTP handlers with `wrapD1ReadSessionHandler(handler, options)` outside
+`wrapD1Handler`. Set `bindingNames`, `bindingPrefixes`, `databaseIdsEnv`, and
+optionally `primaryBindings`, `freshnessHeader`, and `ignoreRequestCacheControl`. The named environment variable contains a JSON
+map from each configured binding name to its physical D1 UUID. Bindings that
+share a UUID share a request session. If the variable is absent, bindings keep
+their original behavior. Invalid maps fail configuration; invalid bookmark
+headers return HTTP 400.
+
+For a reusable Prisma D1 adapter, pass `prismaD1SessionDatabase(database)` to
+`PrismaD1` and run every Prisma operation through
+`runD1SessionOperation(database, operation)`, including scheduled operations.
+Admission waits at most 30 seconds for an earlier operation on the same physical database. Apply `sessionD1Env(env, options)` before cache wrapping scheduled bindings so
+those operations use the same facades. Ordinary D1 calls use the regular
+binding. Workers require `nodejs_compat`. Allow and expose
+`X-Dee-Wan-D1-Bookmarks` in CORS configuration where browser clients need it.
+D1 cache source fills start on the primary; cache hits reuse source bookmarks. Generic Prisma caches must set `sessionCache: d1SessionCacheHooks(database)`. Queries started after streaming response headers are sent cannot advance those headers. WebSocket upgrades bypass sessions.

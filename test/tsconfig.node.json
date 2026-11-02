@@ -19,6 +19,7 @@
   ],
   "exclude": [
     "unit/scoped-read.test.ts",
+    "unit/d1-session.test.ts",
     "unit/d1-write-deadline.test.ts",
     "unit/d1-regional.test.ts",
     "unit/regional-response.test.ts",

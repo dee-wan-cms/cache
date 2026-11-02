@@ -125,10 +125,10 @@ export default { async fetch(request, env) {
 } };`;
 
 it('caches authorized explicit reads across real D1 dependencies and bypasses unsafe JSON responses', async () => {
-  const bundle = await build({ stdin: { contents: source, resolveDir: resolve(__dirname, '../../src/d1'), loader:'ts' }, bundle:true, format:'esm', platform:'neutral', target:'es2022', external:['cloudflare:workers'], write:false });
+  const bundle = await build({ stdin: { contents: source, resolveDir: resolve(__dirname, '../../src/d1'), loader:'ts' }, bundle:true, format:'esm', platform:'neutral', target:'es2022', external:['cloudflare:workers', 'node:async_hooks'], write:false });
   const output = bundle.outputFiles[0];
   if (!output) throw new Error('D1 read test bundle was not emitted');
-  const worker = new Miniflare({ modules:true, script:output.text, compatibilityDate:'2026-01-01', d1Databases:['DB','OTHER'], durableObjects:{ TEST_CACHE_COORDINATOR:{ className:'CacheCoordinator', useSQLite:true } } });
+  const worker = new Miniflare({ modules:true, script:output.text, compatibilityDate:'2026-01-01', compatibilityFlags:['nodejs_compat'], d1Databases:['DB','OTHER'], durableObjects:{ TEST_CACHE_COORDINATOR:{ className:'CacheCoordinator', useSQLite:true } } });
   try {
     for (const [name, value] of [['DB','a1'],['OTHER','b1']] as const) {
       const db = await worker.getD1Database(name);

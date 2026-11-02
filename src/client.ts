@@ -197,3 +197,45 @@ export function createMutationInvalidation(policy: Pick<NonNullable<D1CacheProfi
     },
   };
 }
+
+export { D1_BOOKMARK_HEADER, parseD1Bookmarks, serializeD1Bookmarks } from './d1/bookmarks';
+
+import { D1_BOOKMARK_HEADER, mergeD1Bookmarks, parseD1Bookmarks, serializeD1Bookmarks } from './d1/bookmarks';
+
+export interface D1BookmarkStorage {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+}
+
+export function createD1BookmarkFetch(fetcher: typeof fetch = fetch, options: { storage?: D1BookmarkStorage } = {}): typeof fetch {
+  const origins = new Map<string, Record<string, string>>();
+  return async (input, init) => {
+    const request = new Request(input, init);
+    const origin = new URL(request.url).origin;
+    const bookmarks = origins.get(origin) ?? {};
+    if (!origins.has(origin)) origins.set(origin, bookmarks);
+    const key = `dee-wan:d1-bookmarks:${origin}`;
+    const mergeStored = () => {
+      try {
+        const saved = parseD1Bookmarks(options.storage?.getItem(key) ?? null);
+        const combined = { ...bookmarks };
+        if (mergeD1Bookmarks(combined, saved)) Object.assign(bookmarks, combined);
+      } catch { /* Storage is optional. */ }
+    };
+    mergeStored();
+    const headers = new Headers(request.headers);
+    const outgoing = { ...bookmarks };
+    if (!mergeD1Bookmarks(outgoing, parseD1Bookmarks(headers.get(D1_BOOKMARK_HEADER)))) throw new RangeError('D1 bookmark capacity exceeded');
+    const encoded = serializeD1Bookmarks(outgoing);
+    if (encoded && encoded !== '{}') headers.set(D1_BOOKMARK_HEADER, encoded);
+    else headers.delete(D1_BOOKMARK_HEADER);
+    const response = await fetcher(new Request(request, { headers }));
+    mergeStored();
+    if (!mergeD1Bookmarks(bookmarks, parseD1Bookmarks(response.headers.get(D1_BOOKMARK_HEADER)))) throw new RangeError('D1 bookmark capacity exceeded');
+    try {
+      const value = serializeD1Bookmarks(bookmarks);
+      if (value && value !== '{}') options.storage?.setItem(key, value);
+    } catch { /* Storage is optional. */ }
+    return response;
+  };
+}

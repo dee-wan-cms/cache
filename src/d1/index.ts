@@ -10,3 +10,6 @@ export type { D1JsonReadOptions } from './json-read';
 export { cacheRegionalResponse } from './regional-response';
 export type { RegionalResponseOptions } from './regional-response';
 export { regionalD1MetadataTtl } from './request-freshness';
+
+export { wrapD1ReadSessionHandler, runD1SessionOperation, prismaD1SessionDatabase, sessionD1Env, runD1PrismaScope, runIsolatedD1Session, d1SessionWarmupRequest, runPrimaryD1SessionSource, d1SessionCacheHooks } from './session';
+export type { D1ReadSessionOptions } from './session';

@@ -23,11 +23,15 @@ export interface RunResult {
   statements: number;
 }
 
+type FixtureResponse = { status: number; headers: { get(name: string): string | null }; clone(): FixtureResponse; text(): Promise<string>; json(): Promise<unknown> };
+
 export interface Rig {
   barrierState(name: string): Promise<null | string>;
   dispose(): Promise<void>;
   isolateId(worker: WorkerName): Promise<string>;
   release(name: string): Promise<void>;
+  sessionBatch(name: string): Promise<FixtureResponse>;
+  session(name: string, init?: { method?: string; headers?: Record<string, string> }): Promise<FixtureResponse>;
   statusWithoutToken(): Promise<number>;
   reset(): Promise<void>;
   run(body: Record<string, unknown>, worker?: WorkerName): Promise<RunResult>;
@@ -38,6 +42,7 @@ const SMOKE_TOKEN = "rig-token";
 const workerOptions = (name: string, entry: string) => ({
   bindings: { SMOKE_TOKEN },
   compatibilityDate: COMPATIBILITY_DATE,
+  compatibilityFlags: ["nodejs_compat"],
   d1Databases: { DB: DATABASE_ID, OTHER: "cache-test-control" },
   modules: true,
   modulesRules: [{ include: ["**/*.wasm"], type: "CompiledWasm" as const }],
@@ -86,6 +91,14 @@ export async function startRig(): Promise<Rig> {
       (await fetchJson<{ state: null | string }>("cache-test-a", `/barrier?name=${encodeURIComponent(name)}`)).state,
     dispose: () => mf.dispose(),
     isolateId: async (worker) => (await fetchJson<{ isolateId: string }>(worker, "/isolate")).isolateId,
+    sessionBatch: async (name) => {
+      const fetcher = await mf.getWorker('cache-test-a');
+      return fetcher.fetch(`http://rig/session?name=${encodeURIComponent(name)}&batch=1`, { headers:{ 'x-smoke-token':SMOKE_TOKEN } });
+    },
+    session: async (name, init) => {
+      const fetcher = await mf.getWorker('cache-test-a');
+      return fetcher.fetch(`http://rig/session?name=${encodeURIComponent(name)}`, { ...init, headers:{ ...init?.headers, 'x-smoke-token':SMOKE_TOKEN } });
+    },
     release: async (name) => {
       await fetchJson("cache-test-a", `/barrier?name=${encodeURIComponent(name)}`, { method: "POST" });
     },

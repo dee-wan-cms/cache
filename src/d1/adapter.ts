@@ -39,7 +39,7 @@ function operationOf(tokens: string[], start = 0): string | undefined {
   return undefined;
 }
 
-function isReadonly(sql: string): boolean {
+export function isReadonly(sql: string): boolean {
   const tokens = [...sql.matchAll(lexemes)].map(([token = '']) => token).filter((token) => !/^(?:\s|--|\/\*)/.test(token));
   if (tokens.at(-1) === ';') tokens.pop();
   const first = tokens[0]?.toLowerCase();

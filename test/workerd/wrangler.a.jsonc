@@ -2,6 +2,6 @@
   "name": "cache-test-a",
   "main": "worker/a.ts",
   "compatibility_date": "2025-08-01",
-  "compatibility_flags": [],
+  "compatibility_flags": ["nodejs_compat"],
   "find_additional_modules": false
 }
