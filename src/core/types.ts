@@ -20,7 +20,7 @@ export interface GeneratedCacheConfig {
 }
 
 export type ReadResponse =
-  | { epochs: Record<string, number>; kind: "hit"; refreshToken: null | string; value: string }
+  | { epochs: Record<string, number>; freshUntil?: number; kind: "hit"; refreshToken: null | string; value: string }
   | {
       epochs: Record<string, number>;
       kind: "miss";
@@ -65,7 +65,18 @@ export interface EndWriteRequest {
   token: string;
 }
 
+export interface InspectFencesRequest {
+  fences: string[];
+  generation?: string;
+}
+
+export interface InspectFencesResponse {
+  epochs: Record<string, number>;
+  pending: boolean;
+}
+
 export interface CacheStore {
+  inspectFences?(request: InspectFencesRequest): Promise<InspectFencesResponse>;
   beginWrite(request: BeginWriteRequest): Promise<void>;
   endWrite(request: EndWriteRequest): Promise<void>;
   invalidate(fences: string[]): Promise<void>;
@@ -103,6 +114,8 @@ export interface CacheExtensionOptions {
   excludeModels?: string[];
   fillPollDelaysMs?: number[];
   generation?: string;
+  coordinationGeneration?: string;
+  keyArgs?: (args: unknown) => unknown;
   leaseMs?: number;
   lockMs?: number;
   maxValueBytes?: number;

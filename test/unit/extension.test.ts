@@ -160,6 +160,15 @@ describe("review fixes in the extension", () => {
     await call(createCacheExtension({ config, generation: "ops-7", store }), { where: { id: 1 } }, {});
     const generations = calls.filter(([name]) => name === "read").map(([, request]) => (request && typeof request === "object" && "generation" in request ? request.generation : null));
     expect(generations).toEqual([`${PLANNER_VERSION}/t/`, `${PLANNER_VERSION}/t/ops-7`]);
+    await call(createCacheExtension({ config, generation: "ops-7", coordinationGeneration: "1", store }), { where: { id: 1 } }, {});
+    const explicit = calls.filter(([name]) => name === "read").at(-1)?.[1];
+    expect(explicit).toMatchObject({ generation: "1" });
+    await call(createCacheExtension({ config: { ...config, cacheVersion: "next" }, coordinationGeneration: "1", store }), { where: { id: 1 } }, {});
+    const reads = calls.filter(([name]) => name === "read").map(([, request]) => request);
+    expect(reads.at(-1)).toMatchObject({ generation: "1" });
+    expect(reads.at(-1)).not.toMatchObject({ key: (explicit as { key: string }).key });
+    expect(() => createCacheExtension({ config, coordinationGeneration: "", store })).toThrow(/coordinationGeneration/);
+    expect(() => createCacheExtension({ config, coordinationGeneration: "x".repeat(257), store })).toThrow(/coordinationGeneration/);
   });
 
   it("keeps polling a fresh fill lock but stops once its holder has been slower than the whole poll budget", async () => {
@@ -198,4 +207,29 @@ describe("Decimal schemas", () => {
     }
     expect(() => createCacheExtension({ config: { ...config, hasDecimalFields: true }, decimal: Decimal, store })).not.toThrow();
   });
+});
+
+it('uses keyArgs only for read identity and bypasses cache on callback errors', async () => {
+  const values = new Map<string, string>();
+  const { calls, store } = recordingStore({
+    read: async ({ key }) => values.has(key)
+      ? { kind: 'hit', epochs: { g: 0 }, refreshToken: null, value: values.get(key)! }
+      : miss,
+    write: async ({ key, value }) => { values.set(key, value); return { ok: true }; },
+  });
+  const executed: unknown[] = [];
+  const extension = createCacheExtension({ config, store, keyArgs: (args) => {
+    if (typeof args !== 'object' || args === null || !('where' in args)) throw new Error('bad args');
+    const where = args.where;
+    if (typeof where !== 'object' || where === null || !('id' in where)) throw new Error('bad where');
+    return { where: { id: String(where.id).split(':')[0] } };
+  } });
+  const run = (args: unknown) => extension.query.$allModels.$allOperations({ model: 'User', operation: 'findUnique', args, query: async (original) => { executed.push(original); return { id: executed.length }; } });
+  const first = { where: { id: 'a:1' } };
+  expect(await run(first)).toEqual({ id: 1 });
+  expect(await run({ where: { id: 'a:2' } })).toEqual({ id: 1 });
+  expect(await run({ where: { id: 'b:1' } })).toEqual({ id: 2 });
+  expect(await run({ invalid: true })).toEqual({ id: 3 });
+  expect(executed).toEqual([first, { where: { id: 'b:1' } }, { invalid: true }]);
+  expect(calls.filter(([name]) => name === 'read')).toHaveLength(3);
 });

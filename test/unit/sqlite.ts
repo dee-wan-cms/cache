@@ -8,6 +8,7 @@ const toSqlValue = (value: unknown): SqlValue =>
 export interface TestSql extends SqlLike {
   all(query: string, ...bindings: SqlValue[]): Row[];
   transact: Transact;
+  close(): void;
 }
 
 export function memorySql(): TestSql {
@@ -36,6 +37,7 @@ export function memorySql(): TestSql {
     }
   };
   return {
+    close: () => db.close(),
     all,
     exec: (query, ...bindings) => {
       const result = all(query, ...bindings);

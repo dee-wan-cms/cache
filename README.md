@@ -1,7 +1,7 @@
 # @dee-wan/cache
 
 Prisma read cache for Cloudflare Workers and D1. A Durable Object coordinates invalidation, fill locks
-and cached values, so a write through one Worker is seen by every other Worker on its next read.
+and cached values. Default reads check the coordinator. Optional regional reads allow bounded staleness.
 
 The contract, including every invalidation rule and limit, is in
 [docs/cache-contract.md](docs/cache-contract.md).
@@ -74,6 +74,55 @@ They then run on every read, including hits, and the arguments they rewrite (for
 filter) are part of the cache key. An extension applied after the cache is skipped on a hit. Use
 `scope` for anything a caller changes about results without changing the arguments.
 
+## Regional Prisma reads
+
+`createRegionalStore` adds local Cloudflare Cache API reads to the same coordinator store. Opt in to
+at most five seconds of stale data across isolates. Authorization and guard extensions still run.
+
+```ts
+import { createDurableObjectStore, createRegionalStore } from '@dee-wan/cache/cloudflare';
+
+const name = 'main-db';
+const generation = `${deploymentGeneration}:${cacheConfig.cacheVersion}`;
+const store = createRegionalStore(createDurableObjectStore(env.CACHE_COORDINATOR, { name }), {
+  namespace: env.CACHE_COORDINATOR.idFromName(name).toString(),
+  generation,
+  ttlMs: 5000,
+  waitUntil: promise => ctx.waitUntil(promise),
+});
+const extension = createCacheExtension({
+  config: cacheConfig,
+  store,
+  coordinationGeneration: generation,
+  scope: callerScope,
+  decimal: Prisma.Decimal,
+  waitUntil: promise => ctx.waitUntil(promise),
+});
+```
+
+Keep namespace stable across callers and writers. It identifies one coordinator and database, not a
+user. Keep caller permissions in `scope`. `coordinationGeneration` must match the wrapper generation.
+Accepted fills and coordinator hits with a known fresh deadline can populate regional entries. Their
+lifetime never exceeds the source freshness deadline. Old/custom stores without that deadline still
+work, but their hits do not populate regional entries. Refresh tokens are never replayed regionally.
+With `waitUntil`, hits in the latter half of the regional lease renew from the coordinator in the
+background. Renewals are deduplicated per key and keep the same freshness bound. Read/release
+waits are bounded; late locks are released after timeout. Failed renewal permits another attempt
+without delaying the foreground hit; expired entries still use the coordinator.
+Local mutations block old reads and fills. Operations sharing a write token execute in order;
+queued operations stay fenced until the actual coordinator call settles, including after a caller
+timeout. Cross-isolate changes converge within the regional lease.
+After a failed final write fence or explicit invalidation, regional reads stay blocked. With
+`waitUntil`, later reads retry the coordinator in bounded background passes. Caching resumes only
+after acknowledgment, never merely because time passed. Failure tracking overflow or reuse of an
+unresolved failed write token keeps the isolate disabled.
+Cache API failures use the coordinator; coordinator read failures use the original database path.
+
+Generated backends use this wrapper and `createResponseWarmup` from the same entry point. They warm
+bounded generated GET routes through normal authorization, with the current caller's credentials.
+Warming is best effort; unknown query variants and first requests can remain cold. Writes and auth
+decisions are not cached. A warm-read target is not a latency guarantee for all network requests.
+
 ## Options
 
 Invalid options throw a `TypeError` at construction.
@@ -133,7 +182,7 @@ Models that reference the target through a foreign key are invalidated too. Unkn
 - One coordinator Durable Object has a soft limit of 1,000 requests per second. Measured on
   2026-09-17 from one client: about 1,030 cached reads per second at 21 ms p50 with no errors, against
   about 340 per second at 215 ms reading D1 directly. Higher rates are not measured.
-- Each cached hit costs one coordinator call; a miss costs two; a contended miss can cost up to seven;
+- Each coordinator hit costs one call; a miss costs two; a contended miss can cost up to seven;
   each write costs two, plus retries. On the Workers Free plan, requests that make many Prisma calls
   can reach the subrequest limit (see the contract, "Cost per Prisma call").
 - Every write to a model invalidates that model's cached lists, counts and relation reads.
@@ -173,3 +222,129 @@ npx wrangler delete --name <worker> && npx wrangler d1 delete <name>
 ```
 
 `test/workerd/.build/schema.sql` is written by `npm run test:workerd`.
+
+## D1 write fencing with guarded Prisma reads
+
+`@dee-wan/cache/d1` exports `cacheD1Env`, `wrapD1Handler`, `createD1CacheRuntime`,
+`d1PrismaCacheExtension`, and `fenceD1Writes`. A consumer provides a `D1CacheProfile`
+with environment prefix, D1 binding names and prefixes, coordinator object-name prefix,
+Prisma `readModels`, and explicitly proven `unfencedWriteTables`. The write adapter
+passes reads straight through and fences raw D1 writes, including batches, exec, and
+sessions. Unknown or ambiguous writes use the global fence. Exempt a table only when
+its schema proves that its writes cannot change cached data through triggers or cascades.
+
+Wrap every fetch, scheduled handler, and separate writer that can touch a coordinated
+D1 database. Apply `d1PrismaCacheExtension` to a client only after its authorization and
+scope extensions. The runtime returns no extension when caching or cached reads are
+staged off. Independent control and authentication clients should remain uncached.
+`@dee-wan/cache/d1/config` validates Worker bindings, database identity maps, and paired
+writers, and offers generic writer configuration edits. Consumers must supply real D1
+UUIDs, never binding object identities.
+
+`coordinationGeneration` lets a Prisma extension share the literal coordinator generation
+with a raw-D1 write fence during an upgrade. If omitted, the existing planner/config-derived
+coordinator generation remains unchanged. Prisma cache keys always contain planner and
+generated-config versions. Do not mix coordination generations on one coordinator; staged
+rollouts must make every writer participate before enabling cached reads. External D1 writes
+are not intercepted: disable cached reads and writers as appropriate, then use a fresh
+generation before re-enabling caching.
+
+The package's Prisma peer support remains Prisma 6.19.3 and later 6.x. The D1 write adapter
+is independent of Prisma; other Prisma versions have not been validated by this package.
+
+### Explicit authorized reads
+
+`d1CacheEpoch(database)` returns an opaque namespace for a wrapped database's identity,
+generation and global write epoch. Capture it before reading that database and include
+every dependency's captured namespace in an external cache key. A missing runtime,
+disabled reads, pending write or coordinator failure returns `null`; bypass external
+cache reads and fills in that case. Old in-flight fills retain their old namespace.
+This does not authorize a request or invalidate downstream browser caches.
+
+`cacheD1Read(database, { key, scope, dependencies, ttlMs, cacheable }, load)` caches an
+explicitly selected read after the caller has completed authorization. Include the full
+actor, site, current permissions and all query inputs in `scope` and `key`, and list every
+physical D1 binding read by the loader in `dependencies`. The helper inspects each unique
+binding's global fence before lookup, includes its generation and epoch in the key, and
+checks again before serving a hit or storing a fill. A pending write, unknown runtime,
+older coordinator, inspection failure, or disabled reads bypasses the cache. Default TTL
+is 30 seconds, with a maximum of five minutes. Values and keys are bounded; unsupported
+objects bypass caching. Date, bigint and byte arrays use the existing value codec.
+
+`cacheD1JsonRead(database, { key, scope, dependencies, ttlMs, request, buffered: true }, load)`
+is an explicit opt-in for responses the caller knows are buffered JSON. It keeps the
+original response on a miss and preserves response headers on a hit. Conditional, range,
+preview and capability requests, error responses, cookies, downloads, unsafe `Vary`,
+encoded bodies and oversized bodies bypass caching. Without `buffered: true`, responses
+bypass; never set it for streams. Response buffering is byte-bounded and time-bounded.
+These helpers use private Durable Object storage, not the public Cache API.
+
+For native Prisma reads that also depend on another D1 database, use
+`withD1PrismaCache(client, database, config, { scope, dependencies })` after the caller's
+guards. Scope must include the complete actor, site and permission context. Per-operation
+keys include dependency epochs and recheck dependencies on hits. The original three-argument
+form retains its existing behavior. All participating writers must fence through the same
+physical-database coordinator.
+
+D1 coordinator calls have a 2-second deadline each. Reads fall back to D1 on failure;
+writes require a successful begin. A failed end preserves the database result and keeps
+the lease conservative. Late begins and read locks are cleaned up after they settle.
+
+`keyArgs` optionally maps read arguments to cache-key identity. Preserve every result-changing input in that identity. Execution and invalidation use the original arguments. Callback errors bypass the cache.
+
+### Regional read cache
+
+`cacheD1Read` and scoped `d1PrismaCacheExtension` / `withD1PrismaCache` accept `regionalTtlMs` from 0 to 5000. The default is 0 (strict coordination). A positive value opts in to bounded stale results in the local Cloudflare Cache API; changes by other writers may remain invisible for up to that interval. Use 0 for a strict read. Cache API failure falls back to the strict path. This option caches values, not HTTP responses.
+
+Keys include database and coordinator identities, generations, scope, and query identity. `regionalModels` optionally limits Prisma regional reads to queries whose root and all related models are listed. Callers must supply a scope that separates every authorization context affecting the result. `keyArgs` must preserve every result-changing argument. For custom `createD1CacheRuntime` stores, supply a stable, unique `regionalIdentity` per coordinator; without one the regional layer is bypassed.
+
+`cacheRegionalResponse(request, { namespace, ttlMs, waitUntil? }, load)` is an opt-in regional cache for anonymous public GET JSON responses. Use a stable deployment/version namespace and a TTL no greater than 5000 ms. Credential, preview, conditional and cache-bypass requests reach `load`. Only explicitly public responses with positive `s-maxage` qualify. Browser responses require revalidation; the internal expiry remains bounded from the start of `load`. Cache API errors fall back to `load`. Callers must apply this only to public routes and must include every response-varying request input in the request or namespace.
+
+`wrapD1ReadResponseLease(handler, profile)` from `@dee-wan/cache/d1/response-lease` optionally reuses authenticated GET responses. Set `readResponseLease.maxSeconds` from 1 to 300 (default 5), and explicitly set `<PREFIX>_READ_ACCESS_SECONDS` from 1 to that maximum (default 0). Wrap it inside `wrapD1Handler`. JSON response bodies are validated at fill up to 8,000,000 raw bytes; hits stream the cached body without decoding and preserve client headers. Ordinary regional read values remain capped at 1,500,000 bytes. The profile supplies the database binding, deployment environment variable, admitted paths, credential and vary headers, and a freshness-cookie name. A `*` path segment matches one nonempty segment. Keys include the full request URL, configured credential and vary headers, profile, release, and configured D1 identities. Optional `cookieNames` selects case-sensitive cookie names for the key while retaining every occurrence and its order; it requires `cookie` in `credentialHeaders` and, in generation mode, the freshness cookie in the list. Include every cookie used for authentication or response variation. Without it, the full Cookie header is used. `bypassQueryParams` optionally lists exact query keys that bypass the lease. `ignoreRequestCacheControl` optionally allows lease hits when the browser sends `no-cache` or `no-store`; it defaults to false. Set `refreshAheadSeconds` to an integer from 0 to `maxSeconds` (default 0) to refresh valid leases in the background near expiry when `waitUntil` is available. Refresh-ahead is disabled when the window exceeds the active lease duration. Hits remain immediate and refreshes coalesce per key within an isolate. A successful fresh, authorized response creates a new bounded lease; failed refreshes leave the old expiry unchanged. A configured `freshnessHeader` forces a source read. An eligible successful response replaces its ordinary lease; unsafe responses do not replace it. Expiry stays bounded by the new source request and authorization/data deadlines. Configure every credential and response-varying header. Workers require `nodejs_compat`.
+
+After successful authentication, call `limitD1ReadLeaseUntil` with the credential's absolute expiry in epoch milliseconds. Missing, undefined or expired deadlines prevent a fill. The source receives `Cache-Control: no-cache` on a lease miss. A successful mutation sets an HttpOnly freshness cookie for the configured maximum. In the default `bypass` mode, requests carrying it bypass the lease. Optional `freshnessCookieMode: 'generation'` requires `cookie` in `credentialHeaders`: each mutation creates a new cookie value, and its first read uses fresh data before its response can be reused. Legacy or invalid markers still bypass. A reused regional query value caps the response lease at that value’s original expiry; a fresh source load is not capped by the query-cache TTL. `freshnessCookieExcludedPaths` optionally excludes known non-mutating paths from this cookie using the same whole-segment path matching. On a valid lease hit, matching `If-None-Match` or `If-Modified-Since` returns a bodyless 304; `If-None-Match` takes precedence. Other preconditions and ranges reach the handler. Client response headers remain unchanged on reads apart from the bodyless 304. Writes always execute the handler. Authorization changes by other actors can take up to the lease duration to take effect on cached reads.
+
+When authentication runs in a separate trusted service binding, wrap that service's handler with `wrapD1ReadLeaseOrigin(handler)` and use `forwardD1ReadLease(request, service)` inside the gateway lease handler. The origin wrapper supplies the request-local deadline scope. The forwarder transfers the verified deadline only over the binding and removes its internal header before returning the response. A gateway must trust the bound service to verify credentials and protect this internal proof.
+
+Browser clients can import `createReadFreshness(policy)` from `@dee-wan/cache/client` using the same `readResponseLease` policy. Call `observe(scope, method, url, transport?)` after a successful response, then merge `headers(scope, method)` into requests. With generation mode, pass the request origin, base URL and `withCredentials: true` to use the cookie for confirmed same-origin writes; other transports keep the fresh-header fallback. Data mutations otherwise enable fresh GET headers for the configured maximum per scope; excluded paths use the same whole-segment rules as the server.
+
+For applications without D1 coordination, import `wrapReadResponseLease` and `limitReadResponseLeaseUntil` from `@dee-wan/cache/response-lease`. Pass the handler and an options object containing stable nonempty `namespace`, `deployment`, and `database` identities, an active `seconds` value, and the same response-lease policy fields described above (excluding `databaseBinding` and `deploymentEnv`). After authentication, call `limitReadResponseLeaseUntil` with the actual credential expiry in epoch milliseconds; without a future deadline no response is stored. The identity must change whenever the deployment or underlying data source changes. This entry uses Cache API storage and does not require D1 runtime or a Durable Object. It requires Workers `nodejs_compat` for request-local deadline scope. The optional `wrapReadResponseLeaseOrigin` and `forwardReadLease` support the same trusted service-binding deadline transport as the D1 adapter.
+
+The standalone response lease accepts an optional `warmup` policy. With a `waitUntil` context, it starts background GET reads after an eligible cache hit or a successful JSON source response with a future authorization deadline. A first cold miss still reaches the source. After any required scope bootstrap, explicit seeds with `scope: null` run first, then learned targets, before ordinary seeds. Configure `scopeHeader` in `varyHeaders`; warming is disabled if it is missing. For example, add these fields to the standalone lease options:
+
+```ts
+{
+  varyHeaders: ['x-scope-id'],
+  warmup: {
+    scopeHeader: 'x-scope-id',
+    seeds: ['/api/context', '/api/items'],
+    discoverScopeFrom: '/api/context',
+    discover: (url, body) => {
+      if (url.pathname === '/api/context' && body && typeof body === 'object' && 'scope' in body && typeof body.scope === 'string') {
+        return { scope: body.scope, targets: ['/api/items/recent'] };
+      }
+      return { targets: [] };
+    },
+    portable: (url) => url.pathname === '/api/items/recent',
+  },
+}
+```
+
+`seeds` and discovered targets must be same-origin URLs admitted by the lease paths and query policy. A terminal `**` path segment matches descendants; `*` still matches one nonempty segment. Import `matchesReadResponsePath` from `@dee-wan/cache/response-lease` to apply the same path matching in caller policies. Discovery may supply a scope when the original request has no scope header. Set `discoverScopeFrom` to an eligible seed to run it alone when the foreground response has not supplied a scope; remaining targets wait for its authorized response and valid scope. The batch stops if scope discovery fails. When scope is already known, the scope seed runs as an ordinary deduplicated seed. It counts toward the target budget when run. This option requires `discover` and an entry in `seeds`. Only mark a URL `portable` when its path and query contain no secrets and are safe to share within that scope; the default is false. The regional catalog stores only portable URLs, approximate counts, and times, not credentials or response bodies. Cached responses remain keyed by the current actor credentials and vary headers. Regional Cache API updates are approximate and may race.
+
+For per-credential, multi-scope warming, set `catalogScope: 'credential'`. The bounded catalog is keyed by the configured credential and vary headers except `scopeHeader`, plus the lease identity. It ranks scopes by their combined URL counts, then URLs by count. Use `{ url, scope }` in `seeds` or discovered targets to set the scope header for one read; `scope: null` removes it. String targets use the current scope. The optional third `discover` argument contains the triggering request `scope` (or the scope resolved by bootstrap) and ranked `popularScopes` from that credential catalog. Set `discoveryPriority: 'next'` to schedule discovered targets ahead of queued cold seeds, after explicit unscoped seeds and catalog targets; they still share the same target budget. Each response still uses its ordinary credential and scope lease key and authorization. The scope header must not also be a credential header. Only `portable` URLs enter the catalog. The catalog credential identity omits the freshness cookie, so learned popularity survives saves; response keys and batch grouping retain that cookie.
+
+For D1, pass `{ warmup }` as the optional third argument to `wrapD1ReadResponseLease`; keep the profile serializable.
+
+Defaults are 48 targets per batch, 4 concurrent requests across all warmup batches in one wrapper, a 25-second deadline including slot wait, and 32 catalog entries per scope with a 24-hour TTL. The default 30-second cooldown starts after the batch deadline. A completed batch retains its cooldown; an abandoned batch with unfinished work releases its own cooldown so the next eligible foreground read can retry. During cooldown, eligible foreground visits still update popularity but do not start another batch. Override these with `maxTargets`, `concurrency`, `maxMilliseconds`, `maxEntries`, `catalogTtlMs`, and `cooldownMs`. Queued warm source calls yield to active foreground GET handlers. Warming uses the caller's credentials and ordinary lease authorization. Warm reads do not trigger further batches or popularity updates. An optional pure `isCurrent()` callback returns false when the wrapper configuration is retired; queued and running work checks it and stops, and later batches do not start. A successful write outside `freshnessCookieExcludedPaths` cancels queued work and prevents older foreground reads from filling leases or starting a batch within the current isolate; freshness generations keep subsequent response leases separate. Excluded presence, draft and preview operations keep warm batches running. Cache or warmup failures do not change the foreground response.
+
+
+`createMutationInvalidation(policy)` from `@dee-wan/cache/client` signals successful writes between listeners and browser tabs. Call `publish(scope, method, url)` after success and `subscribe(scope, listener)` to receive `{ scope, method, pathname }`; call the returned function to unsubscribe and `dispose()` when finished. The URL's query and credentials are not sent. Use a credential-free scope. Read methods and `freshnessCookieExcludedPaths` are ignored. The channel is opened only when the factory runs in a browser.
+
+`createRevalidationWindow(intervalMs, now?)` coalesces automatic checks per scope. `remaining(scope)` establishes a deadline without moving it on later calls; `take(scope)` permits an uninitialized scope immediately and an initialized scope at or after its deadline. Mutation notifications remain immediate and do not use this window.
+
+`createSingleFlight<Key, Value>()` shares concurrent `run(key, load)` calls. Completed and failed calls are removed; `forget(key)` allows a new call while an older one is still running.
+
+`createIntentWarmup(cooldownMs?, now?)` warms reads on navigation intent, without storing response values. Call `setScope(siteAndActor)` before use and `warm(key, async isCurrent => ...)` on mouse hover or keyboard focus. One task runs; only the latest waiting intent remains. Check `isCurrent()` between sequential reads. Successful tasks cool for 60 seconds by default. Scope changes and `invalidate()` clear waiting tasks and cooldowns; old completions cannot warm a new scope. Use silent, bounded, read-only requests with the same URL, credentials and headers as normal reads. Do not adopt results into active editor stores or start a startup fanout.
+
+`cacheReadValue` from `@dee-wan/cache/scoped-read` provides a Cache API value cache without D1 or a Durable Object. Pass a nonempty `namespace`, a bounded structured `key`, and a `validate` type guard with the source loader. Include every authorization and result-varying scope in the key; do not put credentials in cached values. `ttlMs` defaults to 5000 and cannot exceed 5000. `maxBytes` defaults to 1,500,000 and can be lowered. Optional `cache` and `now` allow a Cache API implementation and clock to be supplied. Cache failures, invalid values, and expired entries fall back to the loader; loader errors propagate. Expiry starts before the loader runs.

@@ -3,6 +3,8 @@ import { DurableObject } from "cloudflare:workers";
 import type {
   BeginWriteRequest,
   EndWriteRequest,
+  InspectFencesRequest,
+  InspectFencesResponse,
   ReadRequest,
   ReadResponse,
   ReleaseRequest,
@@ -20,6 +22,10 @@ export class CacheCoordinator<Env = unknown> extends DurableObject<Env> {
     const transact: Transact = (run) => ctx.storage.transactionSync(run);
     migrate(ctx.storage.sql, transact);
     this.core = createCoordinatorCore(ctx.storage.sql, () => crypto.randomUUID(), transact);
+  }
+
+  inspectFences(request: InspectFencesRequest): InspectFencesResponse {
+    return this.core.inspectFences(request, Date.now());
   }
 
   read(request: ReadRequest): ReadResponse {

@@ -14,6 +14,7 @@ export function createDurableObjectStore<Env>(
     retryTransient(() => call(stub()), attempts, sleep);
 
   return {
+    inspectFences: async (request) => stub().inspectFences(request),
     beginWrite: (request) => withRetry(async (coordinator) => void (await coordinator.beginWrite(request))),
     endWrite: (request) => withRetry(async (coordinator) => void (await coordinator.endWrite(request))),
     invalidate: (fences) => withRetry(async (coordinator) => void (await coordinator.invalidate(fences))),

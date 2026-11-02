@@ -17,6 +17,8 @@ export interface StepResult {
 export interface RunResult {
   errors: string[];
   inner: number;
+  cacheReads: number;
+  inspections: number;
   results: StepResult[];
   statements: number;
 }
@@ -36,7 +38,7 @@ const SMOKE_TOKEN = "rig-token";
 const workerOptions = (name: string, entry: string) => ({
   bindings: { SMOKE_TOKEN },
   compatibilityDate: COMPATIBILITY_DATE,
-  d1Databases: { DB: DATABASE_ID },
+  d1Databases: { DB: DATABASE_ID, OTHER: "cache-test-control" },
   modules: true,
   modulesRules: [{ include: ["**/*.wasm"], type: "CompiledWasm" as const }],
   name,
@@ -62,6 +64,9 @@ export async function startRig(): Promise<Rig> {
       .map((statement) => statement.replace(/^--.*$/gm, "").trim())
       .filter((statement) => statement.length > 0);
     for (const statement of ddl) await db.prepare(statement).run();
+    const other = await mf.getD1Database("OTHER", "cache-test-a");
+    await other.prepare('CREATE TABLE IF NOT EXISTS ControlState (id INTEGER PRIMARY KEY, value TEXT)').run();
+    await other.prepare("INSERT OR REPLACE INTO ControlState (id,value) VALUES (1,'initial')").run();
   } catch (error) {
     await mf.dispose();
     throw error;

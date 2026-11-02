@@ -77,6 +77,26 @@ describe("storage upgrades", () => {
   });
 });
 
+describe("fence inspection", () => {
+  it("observes generation and live leases without creating entries or locks", () => {
+    const before = core.inspectFences({ fences: ['g'], generation: '1' }, 100);
+    expect(before.pending).toBe(false);
+    expect(before.epochs.g).toBeGreaterThan(0);
+    expect(count('entries')).toBe(0);
+    expect(count('locks')).toBe(0);
+    const token = begin(['g'], 1000, 101, '1');
+    const active = core.inspectFences({ fences: ['g'], generation: '1' }, 102);
+    expect(active.pending).toBe(true);
+    expect(active.epochs.g).toBeGreaterThan(before.epochs.g ?? 0);
+    core.endWrite({ fences: ['g'], token }, 103);
+    const after = core.inspectFences({ fences: ['g'], generation: '1' }, 104);
+    expect(after.pending).toBe(false);
+    expect(after.epochs.g).toBeGreaterThan(active.epochs.g ?? 0);
+    expect(count('entries')).toBe(0);
+    expect(count('locks')).toBe(0);
+  });
+});
+
 describe("generations", () => {
   it("invalidates everything once when the generation changes, including the first one seen", () => {
     fill("k", ["g"], 0);
@@ -207,8 +227,10 @@ describe("refresh", () => {
     fill("k", ["g"], 0);
     const early = read("k", ["g"], 100, { refresh: true });
     expect(early.kind === "hit" && early.refreshToken).toBeNull();
+    expect(early.kind === "hit" && early.freshUntil).toBe(500);
     const late = read("k", ["g"], 600, { refresh: true });
     expect(late.kind === "hit" && late.refreshToken).toBeTruthy();
+    expect(late.kind === "hit" && late.freshUntil).toBe(500);
     core.release({ key: "k", lockToken: late.kind === "hit" ? (late.refreshToken ?? "") : "" });
     begin(["w:Other"], 1000, 601);
     const leased = read("k", ["g", "w:Other"], 602, { refresh: true });

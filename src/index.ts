@@ -7,5 +7,7 @@ export type {
   DecimalConstructor,
   GeneratedCacheConfig,
   InvalidationTarget,
+  InspectFencesRequest,
+  InspectFencesResponse,
   RelationInfo,
 } from "./core/types";

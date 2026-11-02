@@ -64,6 +64,39 @@ describe("read-through cache on workerd", () => {
     expect(second.value).toEqual(first.value);
   });
 
+  it("caches aggregates and invalidates them after a value change", async () => {
+    await seedUsers();
+    const aggregate = op("post", "aggregate", { _count: { _all: true }, _max: { id: true } });
+    const first = await one(aggregate);
+    expect(first.statements).toBeGreaterThan(0);
+    expect(first.value).toEqual({ _count: { _all: 1 }, _max: { id: 10 } });
+    expect((await expectCached(aggregate)).value).toEqual(first.value);
+    await one(op("post", "create", { data: { authorId: 2, id: 11, title: "Second" } }));
+    const refreshed = await one(aggregate);
+    expect(refreshed.statements).toBeGreaterThan(0);
+    expect(refreshed.value).toEqual({ _count: { _all: 2 }, _max: { id: 11 } });
+    expect((await expectCached(aggregate)).value).toEqual(refreshed.value);
+  });
+
+  it("caches grouped counts and invalidates them after a membership change", async () => {
+    await seedUsers();
+    await one(op("post", "create", { data: { authorId: 2, id: 11, title: "Second" } }));
+    const grouped = op("post", "groupBy", { by: ["authorId"], _count: { _all: true }, orderBy: { authorId: "asc" } });
+    const first = await one(grouped);
+    expect(first.statements).toBeGreaterThan(0);
+    expect(first.value).toEqual([
+      { authorId: 1, _count: { _all: 1 } },
+      { authorId: 2, _count: { _all: 1 } },
+    ]);
+    const warm = await expectCached(grouped);
+    expect(warm.value).toEqual(first.value);
+    await one(op("post", "update", { where: { id: 10 }, data: { authorId: 2 } }));
+    const refreshed = await one(grouped);
+    expect(refreshed.statements).toBeGreaterThan(0);
+    expect(refreshed.value).toEqual([{ authorId: 2, _count: { _all: 2 } }]);
+    expect((await expectCached(grouped)).value).toEqual(refreshed.value);
+  });
+
   it("caches a negative lookup and invalidates it when the row is created", async () => {
     await one(op("user", "findUnique", { where: { id: 99 } }));
     expect((await one(op("user", "findUnique", { where: { id: 99 } }))).statements).toBe(0);
@@ -240,6 +273,76 @@ describe("concurrency", () => {
     expect(raced.value).toMatchObject({ name: "Ada" });
     expect(raced.result.errors).toContain("write: cache write rejected: fence");
     expect((await one(findUser(1))).value).toMatchObject({ name: "After race" });
+  });
+
+  it("uses one cache read and no fence inspections for a primary-only Prisma hit", async () => {
+    await seedUsers();
+    const mode = { dependencyScope: 'actor-a', primaryOnly: true };
+    await one(findUser(1), mode);
+    const warm = await one(findUser(1), mode);
+    expect(warm.statements).toBe(0);
+    expect(warm.result.cacheReads).toBe(1);
+    expect(warm.result.inspections).toBe(0);
+  });
+
+  it("scopes guarded Prisma hits by actor and a separate control database epoch", async () => {
+    await seedUsers();
+    const oneScope = { dependencyScope: 'actor-a' };
+    const first = await one(findUser(1), oneScope);
+    expect(first.statements).toBeGreaterThan(0);
+    expect((await one(findUser(1), oneScope)).statements).toBe(0);
+    expect((await one(findUser(1), { dependencyScope: 'actor-b' })).statements).toBeGreaterThan(0);
+    await one({ rawDependency: "UPDATE ControlState SET value='changed' WHERE id=1" }, oneScope);
+    const refreshed = await one(findUser(1), oneScope);
+    expect(refreshed.statements).toBeGreaterThan(0);
+    expect(refreshed.value).toEqual(first.value);
+    expect((await one(findUser(1), oneScope)).statements).toBe(0);
+    const writer = one({ rawDependency: "UPDATE ControlState SET value='pending' WHERE id=1" }, { ...oneScope, rawBarrier: 'control-lease' });
+    await until(() => rig.barrierState('control-lease'), (state) => state === 'waiting', 'control writer at barrier');
+    expect((await one(findUser(1), oneScope)).statements).toBeGreaterThan(0);
+    await rig.release('control-lease');
+    await writer;
+    expect((await one(findUser(1), oneScope)).statements).toBeGreaterThan(0);
+  });
+
+  it("rechecks a control dependency before returning a concurrent Prisma cache hit", async () => {
+    await seedUsers();
+    const mode = { dependencyScope: 'actor-a' };
+    await one(findUser(1), mode);
+    expect((await one(findUser(1), mode)).statements).toBe(0);
+    const reading = one(findUser(1), { ...mode, barrierOnHit: 'control-hit' });
+    await until(() => rig.barrierState('control-hit'), (state) => state === 'waiting', 'cached hit at barrier');
+    await one({ rawDependency: "UPDATE ControlState SET value='changed' WHERE id=1" }, mode);
+    await rig.release('control-hit');
+    const result = await reading;
+    expect(result.value).toMatchObject({ name: 'Ada' });
+    expect(result.statements).toBeGreaterThan(0);
+  });
+
+  it("shares the legacy global generation with raw D1 writes during a write lease", async () => {
+    await seedUsers();
+    const mode = { coordinationGeneration: "1" };
+    await one(findUser(1), mode);
+    expect((await one(findUser(1), mode)).statements).toBe(0);
+    const writer = one({ raw: "UPDATE User SET name = ? WHERE id = ?", params: ["Raw update", 1] }, { ...mode, fencedRaw: true, rawBarrier: "raw-lease" });
+    await until(() => rig.barrierState("raw-lease"), (state) => state === "waiting", "raw writer at barrier");
+    const during = await one(findUser(1), mode);
+    expect(during.statements).toBeGreaterThan(0);
+    expect(during.value).toMatchObject({ name: "Ada" });
+    await rig.release("raw-lease");
+    await writer;
+    expect((await one(findUser(1), mode)).value).toMatchObject({ name: "Raw update" });
+  });
+
+  it("does not publish a Prisma fill overtaken by a legacy-generation raw write", async () => {
+    await seedUsers();
+    const mode = { coordinationGeneration: "1" };
+    const reader = one(findUser(1), { ...mode, barrierAfterFill: "raw-fill" });
+    await until(() => rig.barrierState("raw-fill"), (state) => state === "waiting", "Prisma fill at barrier");
+    await one({ raw: "UPDATE User SET name = ? WHERE id = ?", params: ["After raw race", 1] }, { ...mode, fencedRaw: true });
+    await rig.release("raw-fill");
+    await reader;
+    expect((await one(findUser(1), mode)).value).toMatchObject({ name: "After raw race" });
   });
 
   it("does not serve or cache pre-write state while a write lease is open, even if the end bump is lost", async () => {

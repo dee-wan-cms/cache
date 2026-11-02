@@ -6,7 +6,7 @@ import { isPlainRecord, pkFromRow, pkFromWhere } from "./pk";
 export const MAX_NESTED_WRITE_DEPTH = 5;
 export const MAX_ENTITY_FENCES_PER_MODEL = 100;
 
-export const READ_OPERATIONS = new Set(["count", "findFirst", "findFirstOrThrow", "findMany", "findUnique", "findUniqueOrThrow"]);
+export const READ_OPERATIONS = new Set(["aggregate", "count", "findFirst", "findFirstOrThrow", "findMany", "findUnique", "findUniqueOrThrow", "groupBy"]);
 
 export const WRITE_OPERATIONS = new Set([
   "create",

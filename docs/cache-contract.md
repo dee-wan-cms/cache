@@ -11,7 +11,7 @@ request flow. Fail to the database, never to stale cache.
 
 - Epochs, leases, fill locks and values live in ONE Durable Object.
 - Reason: check-and-write must be atomic. DO storage is transactional and strongly consistent.
-- Cache API rejected: one data center only, `cache.delete` is local, no compare-and-set.
+- Cache API cannot coordinate writes: one data center only, `cache.delete` is local, no compare-and-set.
 - KV rejected: eventually consistent (60 s+), 1 write/s per key.
 - One DO has a soft limit of 1,000 requests/s. Every cached read and every write calls it.
 - One DO has one location. Hit latency = round trip to it. Coordinator far from users: hits slower than
@@ -20,6 +20,32 @@ request flow. Fail to the database, never to stale cache.
   behind one coordinator name share entries: data leak.
 - Exactly one coordinator name per D1 database. Two coordinators over the same data never see each
   other's writes: stale reads.
+
+## Optional regional reads
+
+- `createRegionalStore`: opt-in Cache API layer; max 5000 ms. Default store stays strict.
+- Regional hits skip foreground DO calls. Auth and guards stay outside this layer.
+- Optional waitUntil: latter-half hits renew from DO in background, once per key. No stale extension.
+  Reject renewal across local writes. Bound renewal read/release waits; release late locks after timeout.
+  Failed renewal leaves hit unchanged; next hit may retry.
+- Key: stable coordinator/database namespace, coordination generation, query key, normalized fences.
+  Caller isolation stays in the query key. No isolate nonce in shared key.
+- Promote accepted fills or DO hits with known future `freshUntil`; no refresh token replay.
+  Cap lease by source soft/hard freshness. Old stores without deadline: no hit promotion.
+- Same-token begin/end/repair operations run in order. Queued operations block regional reads.
+  A waiter timeout does not release ownership before the coordinator operation settles.
+- Same-isolate mutations block reads and promotion, advance a freshness floor, and reject old fills.
+  Independently sourced regional entries require a source timestamp newer than that floor.
+- Other isolates can read pre-write data for at most the regional lease. Worker clocks must be aligned
+  for the local timestamp floor; DO epochs remain the strict invalidation authority.
+- Regional cache failure: use DO. DO read failure: use database. Write fences remain mandatory.
+- Failed end-write or invalidation: keep regional reads blocked. With waitUntil, later reads retry
+  acknowledged ends and global invalidation. One repair pass per namespace; one-second failure backoff.
+  At most four end repairs per pass. Re-enable only after acknowledgment; reject stale fills.
+  Capacity overflow or reuse of a failed write token keeps the isolate disabled.
+- Generated warmup: authorized generated GETs only; same credentials; bounded seeds and recent exact
+  query URLs. Max 24 targets, concurrency 2, deadline 10 s, cooldown 30 s. No recursive warm waves.
+- No cold-read, write or auth latency guarantee. Sub-200 ms is a measured warm-read acceptance target.
 
 ## Fences
 
@@ -240,3 +266,25 @@ warming and repair (depended on the removed hot-query tracker).
 - `npm run test:consumer`: packed tarball in a fresh Worker project: generator bin, types, wrangler
   bundle, fill/hit/invalidation on workerd.
 - Deployed smoke (`test/deployed`, see README): a temporary Worker, D1 and DO on a real account.
+
+The D1 integration fences raw writes with the same global fence and explicit coordinator
+generation as the guarded Prisma extension. It does not classify or cache SQL reads. Named
+write exemptions require schema proof against triggers and cascading changes. Coordinated
+writers may stage with cached reads disabled; every writer must participate before reads
+are enabled. The default Prisma extension generation remains planner/config-derived when
+no explicit coordination generation is supplied.
+
+Explicit D1 read results use the same global fence and a key containing each unique physical
+D1 dependency's identity, generation and global epoch. A pending dependency write or failed
+inspection bypasses caching. Hits are checked against all dependency epochs again before
+returning; a fill under an old dependency epoch cannot be selected by a later read. Native
+Prisma callers may opt into the same dependency stamp and must supply complete authorization
+scope. JSON responses require an explicit buffered-response contract and retain private
+HTTP headers; unknown streams, credentials in response cookies and conditional requests
+are never cached.
+
+D1 coordinator calls have a 2-second deadline per RPC. Read failure falls through to D1.
+Begin failure refuses the write before the query. A late begin is ended after it settles;
+late read locks are released. End failure preserves the database result and leaves the
+lease active until cleanup or expiry. This applies to scoped and unscoped Prisma clients,
+raw D1 writes, and explicit invalidation. Multiple RPCs can exceed 2 seconds in total.
