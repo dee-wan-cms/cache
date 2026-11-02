@@ -142,14 +142,17 @@ export function createCacheExtension(options: CacheExtensionOptions) {
 
   async function fill(ctx: ReadContext, lockToken: string, epochs: Record<string, number>): Promise<unknown> {
     let value: unknown;
+    let cached: unknown;
     try {
-      value = await ctx.query(ctx.args);
+      const loaded = options.sessionCache ? await options.sessionCache.fill(() => ctx.query(ctx.args)) : { value:await ctx.query(ctx.args), cached:undefined };
+      value = loaded.value;
+      cached = options.sessionCache ? loaded.cached : value;
       await hooks?.afterFillQuery?.();
     } catch (error) {
       await release(ctx.key, lockToken);
       throw error;
     }
-    const serialized = serialize(value);
+    const serialized = serialize(cached);
     if (serialized === null) {
       await release(ctx.key, lockToken);
       return value;
@@ -180,7 +183,8 @@ export function createCacheExtension(options: CacheExtensionOptions) {
     if (!token) return;
     if (!options.waitUntil) return release(ctx.key, token);
     try {
-      options.waitUntil(fill(ctx, token, response.epochs).catch((error) => report(error, "refresh")));
+      const refresh = () => fill(ctx, token, response.epochs).then(() => undefined);
+      options.waitUntil((options.sessionCache?.background ? options.sessionCache.background(refresh) : refresh()).catch((error) => report(error, "refresh")));
     } catch (error) {
       report(error, "waitUntil");
       await release(ctx.key, token);
@@ -190,7 +194,7 @@ export function createCacheExtension(options: CacheExtensionOptions) {
   async function handleRead(model: string, operation: string, args: unknown, query: Query, dataPath: unknown[]): Promise<unknown> {
     let key: string;
     try {
-      const identity = [PLANNER_VERSION, config.cacheVersion, scope, model, operation, dataPath, (options.keyArgs ? options.keyArgs(args) : args) ?? null];
+      const identity = [PLANNER_VERSION, config.cacheVersion, scope, ...(options.sessionCache ? [options.sessionCache.key()] : []), model, operation, dataPath, (options.keyArgs ? options.keyArgs(args) : args) ?? null];
       key = `${model}:${await sha256Hex(stableStringify(identity))}`;
     } catch (error) {
       report(error, "key");
@@ -210,6 +214,14 @@ export function createCacheExtension(options: CacheExtensionOptions) {
         let value: unknown;
         try {
           value = decode(JSON.parse(response.value), options.decimal);
+          if (options.sessionCache) {
+            const cached = options.sessionCache.read(value);
+            if (!cached) {
+              if (response.refreshToken) await release(key, response.refreshToken);
+              return (await options.sessionCache.fill(() => query(args))).value;
+            }
+            value = cached.value;
+          }
         } catch (error) {
           report(error, "decode");
           if (response.refreshToken) await release(key, response.refreshToken);

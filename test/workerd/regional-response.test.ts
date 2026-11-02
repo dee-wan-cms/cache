@@ -11,10 +11,10 @@ export default { async fetch(request) {
 } };`;
 
 it('reuses an anonymous JSON response across HTTP invocations', async () => {
-  const bundle = await build({ stdin:{ contents:source, resolveDir:resolve(__dirname, '../../src/d1'), loader:'ts' }, bundle:true, format:'esm', platform:'neutral', target:'es2022', external:['cloudflare:workers'], write:false });
+  const bundle = await build({ stdin:{ contents:source, resolveDir:resolve(__dirname, '../../src/d1'), loader:'ts' }, bundle:true, format:'esm', platform:'neutral', target:'es2022', external:['cloudflare:workers', 'node:async_hooks'], write:false });
   const output = bundle.outputFiles[0];
   if (!output) throw Error('bundle missing');
-  const worker = new Miniflare({ modules:true, script:output.text, compatibilityDate:'2026-01-01' });
+  const worker = new Miniflare({ modules:true, script:output.text, compatibilityDate:'2026-01-01', compatibilityFlags:['nodejs_compat'] });
   try {
     expect(await (await worker.dispatchFetch('https://a.test/data')).json()).toEqual({ loads:1 });
     const warm = await worker.dispatchFetch('https://a.test/data');

@@ -824,3 +824,41 @@ it('keeps the triggering scope in discovery context for a scope-free child', asy
   expect(calls).toEqual([['/api/dashboard', 'site-9'], ['/api/sites', null]]);
   expect(contexts).toEqual(['site-9']);
 });
+
+it('drops an expired queued lease warmup across actors', async () => {
+  let now = Date.now();
+  vi.spyOn(Date, 'now').mockImplementation(() => now);
+  let release: (() => void) | undefined;
+  let started: (() => void) | undefined;
+  let queued: (() => void) | undefined;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const firstStarted = new Promise<void>((resolve) => { started = resolve; });
+  const secondQueued = new Promise<void>((resolve) => { queued = resolve; });
+  const calls: string[] = [];
+  const wrapped = wrapReadResponseLease(async (request) => {
+    if (new URL(request.url).pathname === '/api/seed') {
+      calls.push(request.headers.get('cookie') ?? '');
+      started?.();
+      await held;
+    }
+    limitReadResponseLeaseUntil(Date.now() + 5000);
+    return Response.json({});
+  }, { ...options, namespace:'lease-queued-deadline', warmup:{ scopeHeader:'x-site-id', seeds:['/api/seed'], concurrency:1, maxMilliseconds:100 } });
+  const ctx = context();
+  await wrapped(req('/api/root', 'session=a'), {}, ctx);
+  await firstStarted;
+  now += 90;
+  const nativeTimer = globalThis.setTimeout;
+  vi.spyOn(globalThis, 'setTimeout').mockImplementation((callback, delay, ...args) => {
+    if (delay === 25) queued?.();
+    return nativeTimer(callback, delay, ...args);
+  });
+  const nextJob = ctx.jobs.length;
+  await wrapped(req('/api/root', 'session=b'), {}, ctx);
+  await ctx.jobs[nextJob];
+  await secondQueued;
+  now += 101;
+  await ctx.drain();
+  expect(calls).toEqual(['session=a']);
+  release?.();
+});

@@ -5,7 +5,7 @@ import type { CacheShape, CacheStore, CacheTestHooks, InvalidationTarget } from 
 
 import { createDurableObjectStore } from "../../../dist/cloudflare/index.js";
 import { createCacheExtension } from "../../../dist/index.js";
-import { createD1CacheRuntime, fenceD1Writes, withD1PrismaCache } from "../../../dist/d1/index.js";
+import { createD1CacheRuntime, fenceD1Writes, withD1PrismaCache, wrapD1ReadSessionHandler, prismaD1SessionDatabase, runD1SessionOperation } from "../../../dist/d1/index.js";
 import { cacheConfig } from "../generated/cache/cache-config";
 import { Prisma, PrismaClient } from "../generated/prisma";
 
@@ -261,11 +261,45 @@ async function run(request: RunRequest, env: Env, ctx: ExecutionContext): Promis
   return Response.json({ elapsedMs, errors, inner: counter.inner, results, statements: counter.statements, cacheReads: counter.cacheReads, inspections: counter.inspections }, { headers: { "cache-control": "no-store" } });
 }
 
+const sessionOptions = { bindingNames:['DB'], bindingPrefixes:['SITE_'], databaseIdsEnv:'SESSION_IDS' };
+let sessionClientCount = 0;
+let sessionCacheHits = 0;
+function createSessionClient(database: D1Database, env: Env) {
+  const underlying = createDurableObjectStore(env.COORDINATOR, { name:'session-prisma-cache' });
+  const store: CacheStore = { ...underlying, async read(input) {
+    const result = await underlying.read(input);
+    if (result.kind === 'hit') sessionCacheHits++;
+    return result;
+  } };
+  const profile = { envPrefix:'SESSION', bindingNames:['DB'], bindingPrefixes:[], coordinatorNamePrefix:'session:', coordinatorClass:'CacheCoordinator', readModels:['User'], unfencedWriteTables:[] };
+  const fenced = createD1CacheRuntime(database, { store, databaseId:'00000000-0000-0000-0000-000000000001', generation:'1', profile });
+  const base = new PrismaClient({ adapter:new PrismaD1(prismaD1SessionDatabase(fenced)) });
+  const admitted = base.$extends({ query:{ $allOperations({ args, query }) { return runD1SessionOperation(fenced, async () => query(args)); } } });
+  return withD1PrismaCache(admitted, fenced, cacheConfig, { scope:'session-test' }, Prisma.Decimal);
+}
+const sessionClients = new WeakMap<D1Database, ReturnType<typeof createSessionClient>>();
+const sessionHandler = wrapD1ReadSessionHandler(async (request: Request, env: Env & { SITE_alias: D1Database; SESSION_IDS: string }) => {
+  let client = sessionClients.get(env.DB);
+  if (!client) {
+    client = createSessionClient(env.DB, env);
+    sessionClients.set(env.DB, client);
+    sessionClientCount++;
+  }
+  const url = new URL(request.url);
+  const name = url.searchParams.get('name') ?? '';
+  if (request.method === 'POST') await client.user.create({ data:{ email:`${name}@example.test`, name } });
+  const rows = await client.user.findMany({ where:{ name } });
+  const batch = url.searchParams.has('batch') ? await client.$transaction([client.user.findMany({ where:{ name } }), client.user.count({ where:{ name } })]) : null;
+  const alias = await env.SITE_alias.prepare('SELECT COUNT(*) AS total FROM User WHERE name = ?').bind(name).first();
+  return Response.json({ rows, batch, alias, clientCount:sessionClientCount, cacheHits:sessionCacheHits });
+}, sessionOptions);
+
 export async function handle(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   if (env.SMOKE_TOKEN !== undefined && request.headers.get("x-smoke-token") !== env.SMOKE_TOKEN) {
     return new Response("forbidden", { status: 403 });
   }
   const url = new URL(request.url);
+  if (url.pathname === '/session') return sessionHandler(request, { ...env, SITE_alias:env.DB, SESSION_IDS:JSON.stringify({ DB:'00000000-0000-0000-0000-000000000001', SITE_alias:'00000000-0000-0000-0000-000000000001' }) }, ctx);
   if (url.pathname === "/isolate") {
     isolateId ??= crypto.randomUUID();
     return Response.json({ isolateId });

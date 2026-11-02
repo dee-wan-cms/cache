@@ -5,6 +5,7 @@ import { MAX_VALUE_BYTES } from '../core/limits';
 import { d1CacheRuntime, type D1CacheRuntime } from './env';
 import { regionalKey, regionalRead, regionalWrite } from './regional';
 import { limitRegionalDataUntil } from './regional-deadline';
+import { wrapD1SessionCacheValue, unwrapD1SessionCacheValue, advanceD1SessionBookmarks, d1SessionBookmarkFloor, trackD1SessionSource, runPrimaryD1SessionSource } from './session';
 
 const FENCES = ['g'];
 const DEFAULT_TTL_MS = 30_000;
@@ -74,45 +75,54 @@ export async function cacheD1Read<T>(database: D1Database, options: D1ReadOption
   const primary = d1CacheRuntime(database);
   const ttl = options.ttlMs ?? DEFAULT_TTL_MS;
   if (!primary || !primary.readsEnabled || !Number.isFinite(ttl) || ttl <= 0 || ttl > MAX_TTL_MS || options.scope === undefined || options.scope === null || !boundedValue(options.scope, MAX_IDENTITY_BYTES, true) || !boundedValue(options.key, MAX_IDENTITY_BYTES, true)) return load();
+  const source = () => runPrimaryD1SessionSource(load);
   const runtimes = dependencyRuntimes(database, options.dependencies ?? []);
-  if (!runtimes) return load();
+  if (!runtimes) return source();
   const regionalIdentities = [primary, ...runtimes].map((runtime) => [runtime.databaseId, runtime.generation, runtime.coordinatorName, runtime.regionalIdentity]);
   const regional = regionalIdentities.every((identity) => identity[3])
-    ? await regionalKey(options.regionalTtlMs, ['d1-read', options.regionalTtlMs, regionalIdentities, options.scope, options.key]) : null;
+    ? await regionalKey(options.regionalTtlMs, ['d1-read', d1SessionBookmarkFloor() ? 'session-v1' : null, options.regionalTtlMs, regionalIdentities, options.scope, options.key]) : null;
   const hit = await regionalRead(regional, options.regionalTtlMs);
-  if (hit) { limitRegionalDataUntil(hit.expires); return hit.value as T; }
+  if (hit) {
+    const cached = unwrapD1SessionCacheValue(hit.value, [primary, ...runtimes].map((runtime) => runtime.databaseId));
+    if (cached) { if (cached.bookmarks) advanceD1SessionBookmarks(cached.bookmarks); limitRegionalDataUntil(hit.expires); return cached.value as T; }
+  }
   const started = Date.now();
   const snapshot = await inspect(runtimes);
-  if (!snapshot) return load();
+  if (!snapshot) return source();
   let key: string;
   try {
-    const identity = stableStringify(['d1-read-v1', primary.databaseId, primary.generation, options.scope, options.key, snapshot.map(({ runtime, epoch }) => [runtime.databaseId, runtime.generation, epoch])]);
+    const identity = stableStringify(['d1-read-v1', d1SessionBookmarkFloor() ? 'session-v1' : null, primary.databaseId, primary.generation, options.scope, options.key, snapshot.map(({ runtime, epoch }) => [runtime.databaseId, runtime.generation, epoch])]);
     if (new TextEncoder().encode(identity).byteLength > MAX_IDENTITY_BYTES) return load();
     key = `d1:${await sha256Hex(identity)}`;
   } catch { return load(); }
   let result;
   try { result = await primary.store.read({ key, fences: FENCES, generation: primary.generation, lockMs: 30_000, refresh: false }); }
-  catch { return load(); }
+  catch { return source(); }
   if (result.kind === 'hit') {
     try {
-      const value: unknown = decode(JSON.parse(result.value));
-      if (boundedValue(value, MAX_VALUE_SIZE, false) && sameSnapshots(snapshot, await inspect(runtimes))) {
-        await regionalWrite(regional, options.regionalTtlMs, started, value);
+      const raw: unknown = decode(JSON.parse(result.value));
+      const cached = unwrapD1SessionCacheValue(raw, [primary, ...runtimes].map((runtime) => runtime.databaseId));
+      const value = cached?.value;
+      if (cached && boundedValue(value, MAX_VALUE_SIZE, false) && sameSnapshots(snapshot, await inspect(runtimes))) {
+        if (cached.bookmarks) advanceD1SessionBookmarks(cached.bookmarks);
+        await regionalWrite(regional, options.regionalTtlMs, started, raw);
         return value as T;
       }
     } catch { /* Invalid cached values are read from the source. */ }
-    return load();
+    return source();
   }
-  if (!result.lockToken || result.pending) return load();
+  if (!result.lockToken || result.pending) return source();
   const lockToken = result.lockToken;
   try {
-    const value = await load();
+    const tracked = await trackD1SessionSource(source);
+    const value = tracked.value;
     try {
       if (value !== null && value !== undefined && boundedValue(value, MAX_VALUE_SIZE, false) && (options.cacheable?.(value) ?? true)) {
-        const text = JSON.stringify(encode(value));
+        const cachedValue = wrapD1SessionCacheValue(value, tracked.bookmarks);
+        const text = JSON.stringify(encode(cachedValue));
         if (new TextEncoder().encode(text).byteLength <= MAX_VALUE_SIZE && sameSnapshots(snapshot, await inspect(runtimes))) {
           const written = await primary.store.write({ key, lockToken, snapshot: result.epochs, ttlMs: ttl, softTtlMs: ttl, value: text });
-          if (regional && written.ok && sameSnapshots(snapshot, await inspect(runtimes))) await regionalWrite(regional, options.regionalTtlMs, started, value);
+          if (regional && written.ok && sameSnapshots(snapshot, await inspect(runtimes))) await regionalWrite(regional, options.regionalTtlMs, started, cachedValue);
         }
       }
     } catch { /* The source result remains authoritative when caching fails. */ }

@@ -107,6 +107,13 @@ export interface DecimalConstructor {
   new (value: string): unknown;
 }
 
+export interface CacheSessionHooks {
+  key(): unknown;
+  read(value: unknown): { value: unknown } | null;
+  fill(load: () => Promise<unknown>): Promise<{ value: unknown; cached: unknown }>;
+  background?(operation: () => Promise<void>): Promise<void>;
+}
+
 export interface CacheExtensionOptions {
   config: GeneratedCacheConfig;
   decimal?: DecimalConstructor;
@@ -121,6 +128,7 @@ export interface CacheExtensionOptions {
   maxValueBytes?: number;
   onError?: (error: unknown, context: string) => void;
   scope?: string;
+  sessionCache?: CacheSessionHooks;
   shape?: { byModel?: Record<string, CacheShape>; default?: CacheShape };
   store: CacheStore;
   /** Test-only fault injection. Never set in production: `skipEndWrite` disables invalidation. */

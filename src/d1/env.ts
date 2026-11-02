@@ -11,6 +11,7 @@ import { boundedD1Store } from './bounded-store';
 import { regionalKey, regionalRead, regionalWrite } from './regional';
 import { limitRegionalDataUntil } from './regional-deadline';
 import { readTargets } from '../core/targets';
+import { registerD1SessionAlias, d1SessionBookmarkFloor, wrapD1SessionCacheValue, unwrapD1SessionCacheValue, advanceD1SessionBookmarks, trackD1SessionSource, runPrimaryD1SessionSource } from './session';
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const hints = new Set(['wnam', 'enam', 'sam', 'weur', 'eeur', 'apac', 'oc', 'afr', 'me']);
@@ -22,6 +23,7 @@ export function createD1CacheRuntime(database: D1Database, options: { store: Cac
   const { generation, databaseId, profile, readsEnabled = true } = options;
   const store = boundedD1Store(options.store);
   const fenced = fenceD1Writes(database, { store, generation, policy: profile });
+  registerD1SessionAlias(fenced, database);
   runtimes.set(fenced, { store, generation, databaseId, readsEnabled, readModels: profile.readModels, coordinatorIdentity: options.coordinatorIdentity ?? options.store, coordinatorName: options.coordinatorName ?? '', regionalIdentity: options.regionalIdentity });
   return fenced;
 }
@@ -94,8 +96,10 @@ export function d1PrismaCacheExtension(database: object, config: GeneratedCacheC
   const scopedConfig = { ...config, cacheableByModel: Object.fromEntries(Object.entries(config.cacheableByModel).map(([model, enabled]) => [model, enabled && allowed.has(model)])) };
   const common = { config: scopedConfig, store: runtime.store, generation: runtime.generation, coordinationGeneration: runtime.generation, ...(decimal ? { decimal } : {}), ...(options?.keyArgs ? { keyArgs: options.keyArgs } : {}) };
   const base = createCacheExtension({ ...common, scope: runtime.databaseId });
-  if (!options) return base;
   const operation = base.query.$allModels.$allOperations;
+  if (!options) return { ...base, query: { $allModels: { $allOperations(params: Parameters<typeof operation>[0]) {
+    return d1SessionBookmarkFloor() ? params.query(params.args) : operation(params);
+  } } } };
   return {
     ...base,
     query: { $allModels: { async $allOperations(params: Parameters<typeof operation>[0]) {
@@ -118,42 +122,59 @@ export function d1PrismaCacheExtension(database: object, config: GeneratedCacheC
           normalizedArgs = options.keyArgs ? options.keyArgs(params.args) : params.args;
           normalized = true;
           const configDigest = await sha256Hex(stableStringify(config));
-          regional = await regionalKey(options.regionalTtlMs, ['prisma', options.regionalTtlMs, identities, configDigest, options.scope, params.model, params.operation, dataPath, normalizedArgs ?? null]);
+          regional = await regionalKey(options.regionalTtlMs, ['prisma', d1SessionBookmarkFloor() ? 'session-v1' : null, options.regionalTtlMs, identities, configDigest, options.scope, params.model, params.operation, dataPath, normalizedArgs ?? null]);
         }
       } catch { /* Key callbacks use the strict path on failure. */ }
       const hit = await regionalRead(regional, options.regionalTtlMs, decimal);
-      if (hit) { limitRegionalDataUntil(hit.expires); return hit.value; }
+      if (hit) {
+        const cached = unwrapD1SessionCacheValue(hit.value, [runtime, ...dependencies].map((item) => item.databaseId));
+        if (cached) { if (cached.bookmarks) advanceD1SessionBookmarks(cached.bookmarks); limitRegionalDataUntil(hit.expires); return cached.value; }
+      }
       let started = Date.now();
       const snapshot = await inspect(dependencies);
       if (!snapshot) return params.query(params.args);
       let scope: string;
       try {
-        scope = stableStringify([runtime.databaseId, runtime.generation, options.scope, snapshot.map(({ runtime: dependency, epoch }) => [dependency.databaseId, dependency.generation, epoch])]);
+        scope = stableStringify([d1SessionBookmarkFloor() ? 'session-v1' : null, runtime.databaseId, runtime.generation, options.scope, snapshot.map(({ runtime: dependency, epoch }) => [dependency.databaseId, dependency.generation, epoch])]);
         if (new TextEncoder().encode(scope).byteLength > 32_768) return params.query(params.args);
       } catch { return params.query(params.args); }
       let verifiedHit = false;
+      let hitBookmarks: Record<string, string> | undefined;
       let verifiedWrite = false;
       let queried = false;
       const store: CacheStore = { ...runtime.store,
         async write(request) {
-          const result = await runtime.store.write(request);
+          const value = d1SessionBookmarkFloor() ? JSON.stringify(wrapD1SessionCacheValue(request.value)) : request.value;
+          const result = await runtime.store.write({ ...request, value });
           verifiedWrite = result.ok;
           return result;
         },
         async read(request) {
         const result = await runtime.store.read(request);
         if (result.kind === 'hit' && !sameSnapshots(snapshot, await inspect(dependencies))) return { kind: 'miss', epochs: result.epochs, lockHeldForMs: null, lockToken: null, pending: true };
+        if (result.kind === 'hit' && d1SessionBookmarkFloor()) {
+          let cached;
+          try { cached = unwrapD1SessionCacheValue(JSON.parse(result.value), [runtime, ...dependencies].map((item) => item.databaseId)); } catch { cached = null; }
+          if (!cached || typeof cached.value !== 'string') return { kind:'miss', epochs:result.epochs, lockHeldForMs:null, lockToken:null, pending:true };
+          hitBookmarks = cached.bookmarks;
+          verifiedHit = true;
+          return { ...result, value:cached.value };
+        }
         if (result.kind === 'hit') verifiedHit = true;
         return result;
       } };
       const scoped = createCacheExtension({ ...common, store, scope, ...(normalized ? { keyArgs: () => normalizedArgs } : {}) });
-      const value = await scoped.query.$allModels.$allOperations({ ...params, query: async (args) => {
-        queried = true;
-        started = Date.now();
-        return params.query(args);
-      } });
-      if (regional && ((!queried && verifiedHit) || verifiedWrite) && sameSnapshots(snapshot, await inspect(dependencies))) await regionalWrite(regional, options.regionalTtlMs, started, value);
-      return value;
+      const tracked = await trackD1SessionSource(async () => {
+        const value = await scoped.query.$allModels.$allOperations({ ...params, query: async (args) => {
+          queried = true;
+          started = Date.now();
+          return runPrimaryD1SessionSource(() => params.query(args));
+        } });
+        if (!queried && verifiedHit && hitBookmarks) advanceD1SessionBookmarks(hitBookmarks);
+        return value;
+      });
+      if (regional && ((!queried && verifiedHit) || verifiedWrite) && sameSnapshots(snapshot, await inspect(dependencies))) await regionalWrite(regional, options.regionalTtlMs, started, wrapD1SessionCacheValue(tracked.value, tracked.bookmarks));
+      return tracked.value;
     } } },
   };
 }
