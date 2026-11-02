@@ -14,17 +14,35 @@
       "import": "./dist/index.js",
       "default": "./dist/index.js"
     },
-    "./scoped-read": { "types": "./dist/scoped-read.d.ts", "import": "./dist/scoped-read.js" },
-    "./client": { "types": "./dist/client.d.ts", "import": "./dist/client.js" },
-    "./response-lease": { "types": "./dist/response-lease.d.ts", "import": "./dist/response-lease.js" },
+    "./scoped-read": {
+      "types": "./dist/scoped-read.d.ts",
+      "import": "./dist/scoped-read.js"
+    },
+    "./client": {
+      "types": "./dist/client.d.ts",
+      "import": "./dist/client.js"
+    },
+    "./response-lease": {
+      "types": "./dist/response-lease.d.ts",
+      "import": "./dist/response-lease.js"
+    },
     "./cloudflare": {
       "types": "./dist/cloudflare/index.d.ts",
       "import": "./dist/cloudflare/index.js",
       "default": "./dist/cloudflare/index.js"
     },
-    "./d1": { "types": "./dist/d1/index.d.ts", "import": "./dist/d1/index.js" },
-    "./d1/config": { "types": "./dist/d1/config.d.ts", "import": "./dist/d1/config.js" },
-    "./d1/response-lease": { "types": "./dist/d1/response-lease.d.ts", "import": "./dist/d1/response-lease.js" },
+    "./d1": {
+      "types": "./dist/d1/index.d.ts",
+      "import": "./dist/d1/index.js"
+    },
+    "./d1/config": {
+      "types": "./dist/d1/config.d.ts",
+      "import": "./dist/d1/config.js"
+    },
+    "./d1/response-lease": {
+      "types": "./dist/d1/response-lease.d.ts",
+      "import": "./dist/d1/response-lease.js"
+    },
     "./generator": {
       "types": "./dist/generator/config.d.ts",
       "import": "./dist/generator/config.js",
@@ -72,7 +90,9 @@
     "@prisma/client": ">=6.19.3 <7"
   },
   "peerDependenciesMeta": {
-    "@prisma/client": { "optional": true }
+    "@prisma/client": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260730.1",
