@@ -137,7 +137,7 @@ it('retries an unfinished batch immediately, but cools a drained batch and does 
     return Response.json({});
   });
   const config = { scopeHeader:'x-site-id', seeds:['/api/first', '/api/second'], concurrency:1, maxMilliseconds:100, cooldownMs:30_000 };
-  const start = () => warm.start(config, req('/api/root'), Response.json({}), ['identity'], 'retry-group', () => true, {}, undefined);
+  const start = () => warm.start(config, req('/api/root', 'session=a', null), Response.json({}), ['identity'], 'retry-group', () => true, {}, undefined);
   const first = start();
   await driveUntil(() => calls.length === 1);
   await start();
@@ -166,7 +166,7 @@ it('does not let an abandoned older batch clear a newer batch cooldown', async (
     if (path === '/api/old') await held;
     return Response.json({});
   });
-  const begin = (seeds: string[]) => warm.start({ scopeHeader:'x-site-id', seeds, concurrency:2, maxMilliseconds:100, cooldownMs:30_000 }, req('/api/root'), Response.json({}), ['identity'], 'ownership-group', () => true, {}, undefined);
+  const begin = (seeds: string[]) => warm.start({ scopeHeader:'x-site-id', seeds, concurrency:2, maxMilliseconds:100, cooldownMs:30_000 }, req('/api/root', 'session=a', null), Response.json({}), ['identity'], 'ownership-group', () => true, {}, undefined);
   const old = begin(['/api/old', '/api/old-queued']);
   await driveUntil(() => calls.includes('/api/old'));
   warm.invalidate();
@@ -377,10 +377,11 @@ it('cancels semaphore waiters across actors on a successful write', async () => 
 });
 
 it('retires the lifecycle, cancels queued work and prevents late fills from starting it again', async () => {
-  vi.useFakeTimers();
   let releaseWarm: (() => void) | undefined;
   let releaseLate: (() => void) | undefined;
   let warmReady: (() => void) | undefined;
+  let abortReady: (() => void) | undefined;
+  const abortObserved = new Promise<void>((resolve) => { abortReady = resolve; });
   const blockedWarm = new Promise<void>((resolve) => { releaseWarm = resolve; });
   const blockedLate = new Promise<void>((resolve) => { releaseLate = resolve; });
   const warmStarted = new Promise<void>((resolve) => { warmReady = resolve; });
@@ -391,7 +392,7 @@ it('retires the lifecycle, cancels queued work and prevents late fills from star
     const path = new URL(request.url).pathname;
     calls.push(`${path}:${request.headers.get('cookie')}`);
     if (path === '/api/seed') {
-      request.signal.addEventListener('abort', () => { aborted = true; }, { once:true });
+      request.signal.addEventListener('abort', () => { aborted = true; abortReady?.(); }, { once:true });
       warmReady?.(); await blockedWarm;
     }
     if (path === '/api/late') await blockedLate;
@@ -399,12 +400,12 @@ it('retires the lifecycle, cancels queued work and prevents late fills from star
     return Response.json({ path });
   }, { ...options, namespace:'warm-lifecycle', warmup:{ scopeHeader:'x-site-id', seeds:['/api/seed'], concurrency:1, isCurrent:() => current } });
   const ctx = context();
-  await wrapped(req('/api/root', 'session=a'), {}, ctx); await ctx.jobs[0]; await driveUntil(() => calls.includes('/api/seed:session=a')); await warmStarted;
+  await wrapped(req('/api/root', 'session=a'), {}, ctx); await warmStarted;
   const beforeSecond = ctx.jobs.length;
   await wrapped(req('/api/root', 'session=b'), {}, ctx); await ctx.jobs[beforeSecond];
   const late = wrapped(req('/api/late', 'session=c'), {}, ctx);
   current = false;
-  await vi.advanceTimersByTimeAsync(25);
+  await abortObserved;
   expect(aborted).toBe(true);
   releaseLate?.();
   expect(await (await late).json()).toEqual({ path:'/api/late' });
@@ -443,15 +444,17 @@ it('keeps the shared slot until an aborted source actually settles', async () =>
 });
 
 it('waits for an active foreground source before starting the next warm read', async () => {
-  vi.useFakeTimers();
   let releaseWarm: (() => void) | undefined;
   let releaseForeground: (() => void) | undefined;
   let warmReady: (() => void) | undefined;
   let foregroundReady: (() => void) | undefined;
+  let blockedReady: (() => void) | undefined;
   const heldWarm = new Promise<void>((resolve) => { releaseWarm = resolve; });
   const heldForeground = new Promise<void>((resolve) => { releaseForeground = resolve; });
   const warmStarted = new Promise<void>((resolve) => { warmReady = resolve; });
   const foregroundStarted = new Promise<void>((resolve) => { foregroundReady = resolve; });
+  const blocked = new Promise<void>((resolve) => { blockedReady = resolve; });
+  let firstFillDone = false;
   const calls: string[] = [];
   const wrapped = wrapReadResponseLease(async (request) => {
     const path = new URL(request.url).pathname; calls.push(path);
@@ -461,14 +464,24 @@ it('waits for an active foreground source before starting the next warm read', a
     return Response.json({ path });
   }, { ...options, namespace:'foreground-priority', warmup:{ scopeHeader:'x-site-id', seeds:['/api/first', '/api/second'], concurrency:1 } });
   const ctx = context();
-  await wrapped(req('/api/root'), {}, ctx); await ctx.jobs[0]; await driveUntil(() => calls.includes('/api/first')); await warmStarted;
+  await wrapped(req('/api/root'), {}, ctx); await warmStarted;
   const foreground = wrapped(req('/api/foreground'), {}, ctx); await foregroundStarted;
+  const originalPut = caches.default.put.bind(caches.default);
+  vi.spyOn(caches.default, 'put').mockImplementation(async (key, value) => {
+    const body = await value.clone().json();
+    await originalPut(key, value);
+    if (body.path === '/api/first') firstFillDone = true;
+  });
+  const nativeTimer = globalThis.setTimeout;
+  vi.spyOn(globalThis, 'setTimeout').mockImplementation((callback, delay, ...args) => {
+    if (delay === 25 && firstFillDone) blockedReady?.();
+    return nativeTimer(callback, delay, ...args);
+  });
   releaseWarm?.();
-  await vi.advanceTimersByTimeAsync(50);
+  await blocked;
   expect(calls).not.toContain('/api/second');
   releaseForeground?.();
   expect(await (await foreground).json()).toEqual({ path:'/api/foreground' });
-  await driveUntil(() => calls.includes('/api/second'));
   await ctx.drain();
   expect(calls.filter((path) => path === '/api/second')).toHaveLength(1);
 });
@@ -496,21 +509,33 @@ it('disposes owned warmup bodies on discovery, cooldown and invalid configuratio
 
 it('disposes the warm clone when a source response is invalid JSON', async () => {
   const original = Response.prototype.clone;
-  const cancellations: Array<() => number> = [];
+  let source: Response | undefined;
+  let cancelRequested: (() => void) | undefined;
+  const cancelled = new Promise<void>((resolve) => { cancelRequested = resolve; });
+  let warmClone: Response | undefined;
   vi.spyOn(Response.prototype, 'clone').mockImplementation(function (this: Response) {
     const copy = original.call(this);
-    if (copy.body) { const cancel = vi.spyOn(copy.body, 'cancel'); cancellations.push(() => cancel.mock.calls.length); }
+    if (this === source && !warmClone && copy.body) {
+      warmClone = copy;
+      const cancel = copy.body.cancel.bind(copy.body);
+      vi.spyOn(copy.body, 'cancel').mockImplementation((reason) => {
+        cancelRequested?.();
+        return cancel(reason);
+      });
+    }
     return copy;
   });
   const wrapped = wrapReadResponseLease(async () => {
     limitReadResponseLeaseUntil(Date.now() + 5000);
-    return new Response('invalid json', { headers:{ 'content-type':'application/json' } });
+    source = new Response('invalid json', { headers:{ 'content-type':'application/json' } });
+    return source;
   }, { ...options, namespace:'invalid-body-disposal', warmup:{ scopeHeader:'x-site-id', seeds:['/api/sibling'] } });
   const ctx = context();
   const response = await wrapped(req('/api/root'), {}, ctx);
   expect(await response.text()).toBe('invalid json');
   await ctx.drain();
-  expect(cancellations[0]?.()).toBeGreaterThan(0);
+  await cancelled;
+  expect(warmClone?.body?.cancel).toHaveBeenCalled();
 });
 
 it('releases the owned body before catalog reads on normal and cooldown paths', async () => {
