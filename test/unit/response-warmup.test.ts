@@ -49,9 +49,13 @@ it('bounds concurrency and unique targets and does not recurse or restart during
   const ctx = context();
   await wrapped(req('/api/root'), {}, ctx); await ctx.jobs[0]; await twoStarted;
   await wrapped(req('/api/root'), {}, ctx);
+  expect(calls[0]).toBe('/api/root');
+  expect(calls.slice(1)).toEqual(expect.arrayContaining(['/api/a', '/api/b']));
+  expect(calls).toHaveLength(3);
   release?.(); await ctx.drain();
   expect(peak).toBe(2);
-  expect(calls).toEqual(['/api/root', '/api/a', '/api/b', '/api/c']);
+  expect(calls).toHaveLength(4);
+  expect(calls[3]).toBe('/api/c');
 });
 
 it('expires catalog entries and cooldown without extending response leases', async () => {
