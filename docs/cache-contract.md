@@ -11,7 +11,7 @@ request flow. Fail to the database, never to stale cache.
 
 - Epochs, leases, fill locks and values live in ONE Durable Object.
 - Reason: check-and-write must be atomic. DO storage is transactional and strongly consistent.
-- Cache API rejected: one data center only, `cache.delete` is local, no compare-and-set.
+- Cache API cannot coordinate writes: one data center only, `cache.delete` is local, no compare-and-set.
 - KV rejected: eventually consistent (60 s+), 1 write/s per key.
 - One DO has a soft limit of 1,000 requests/s. Every cached read and every write calls it.
 - One DO has one location. Hit latency = round trip to it. Coordinator far from users: hits slower than
@@ -20,6 +20,32 @@ request flow. Fail to the database, never to stale cache.
   behind one coordinator name share entries: data leak.
 - Exactly one coordinator name per D1 database. Two coordinators over the same data never see each
   other's writes: stale reads.
+
+## Optional regional reads
+
+- `createRegionalStore`: opt-in Cache API layer; max 5000 ms. Default store stays strict.
+- Regional hits skip foreground DO calls. Auth and guards stay outside this layer.
+- Optional waitUntil: latter-half hits renew from DO in background, once per key. No stale extension.
+  Reject renewal across local writes. Bound renewal read/release waits; release late locks after timeout.
+  Failed renewal leaves hit unchanged; next hit may retry.
+- Key: stable coordinator/database namespace, coordination generation, query key, normalized fences.
+  Caller isolation stays in the query key. No isolate nonce in shared key.
+- Promote accepted fills or DO hits with known future `freshUntil`; no refresh token replay.
+  Cap lease by source soft/hard freshness. Old stores without deadline: no hit promotion.
+- Same-token begin/end/repair operations run in order. Queued operations block regional reads.
+  A waiter timeout does not release ownership before the coordinator operation settles.
+- Same-isolate mutations block reads and promotion, advance a freshness floor, and reject old fills.
+  Independently sourced regional entries require a source timestamp newer than that floor.
+- Other isolates can read pre-write data for at most the regional lease. Worker clocks must be aligned
+  for the local timestamp floor; DO epochs remain the strict invalidation authority.
+- Regional cache failure: use DO. DO read failure: use database. Write fences remain mandatory.
+- Failed end-write or invalidation: keep regional reads blocked. With waitUntil, later reads retry
+  acknowledged ends and global invalidation. One repair pass per namespace; one-second failure backoff.
+  At most four end repairs per pass. Re-enable only after acknowledgment; reject stale fills.
+  Capacity overflow or reuse of a failed write token keeps the isolate disabled.
+- Generated warmup: authorized generated GETs only; same credentials; bounded seeds and recent exact
+  query URLs. Max 24 targets, concurrency 2, deadline 10 s, cooldown 30 s. No recursive warm waves.
+- No cold-read, write or auth latency guarantee. Sub-200 ms is a measured warm-read acceptance target.
 
 ## Fences
 

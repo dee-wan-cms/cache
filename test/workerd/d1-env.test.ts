@@ -54,10 +54,10 @@ export default {
 };`;
 
 it('wires optional, disabled, required and alias configurations through the real coordinator', async () => {
-  const bundle = await build({ stdin: { contents: source, resolveDir: resolve(__dirname, '../../src/d1'), loader: 'ts' }, bundle: true, format: 'esm', platform: 'neutral', target: 'es2022', external: ['cloudflare:workers'], write: false });
+  const bundle = await build({ stdin: { contents: source, resolveDir: resolve(__dirname, '../../src/d1'), loader: 'ts' }, bundle: true, format: 'esm', platform: 'neutral', target: 'es2022', external: ['cloudflare:workers', 'node:async_hooks'], write: false });
   const output = bundle.outputFiles[0];
   if (!output) throw new Error('D1 environment test bundle was not emitted');
-  const worker = new Miniflare({ modules: true, script: output.text, compatibilityDate: '2026-01-01', d1Databases: ['DB'], durableObjects: { CMS_CACHE_COORDINATOR: { className: 'CacheCoordinator', useSQLite: true } } });
+  const worker = new Miniflare({ modules: true, script: output.text, compatibilityDate: '2026-01-01', compatibilityFlags:['nodejs_compat'], d1Databases: ['DB'], durableObjects: { CMS_CACHE_COORDINATOR: { className: 'CacheCoordinator', useSQLite: true } } });
   try {
     const db = await worker.getD1Database('DB');
     await db.batch([

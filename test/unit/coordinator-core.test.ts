@@ -227,8 +227,10 @@ describe("refresh", () => {
     fill("k", ["g"], 0);
     const early = read("k", ["g"], 100, { refresh: true });
     expect(early.kind === "hit" && early.refreshToken).toBeNull();
+    expect(early.kind === "hit" && early.freshUntil).toBe(500);
     const late = read("k", ["g"], 600, { refresh: true });
     expect(late.kind === "hit" && late.refreshToken).toBeTruthy();
+    expect(late.kind === "hit" && late.freshUntil).toBe(500);
     core.release({ key: "k", lockToken: late.kind === "hit" ? (late.refreshToken ?? "") : "" });
     begin(["w:Other"], 1000, 601);
     const leased = read("k", ["g", "w:Other"], 602, { refresh: true });

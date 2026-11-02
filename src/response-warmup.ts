@@ -24,7 +24,7 @@ export interface ReadResponseWarmupOptions {
 type Entry = { url: string; count: number; time: number; scope?: string | null };
 type WarmJob = { url: string; scope: string | null; override: boolean; priority: number };
 const catalog = createRegionalCache(86_400_000, 128_000);
-const validScope = (value: string | null | undefined): value is string => !!value && value.length <= 256 && !/[\x00-\x1f\x7f]/.test(value);
+const validScope = (value: string | null | undefined): value is string => !!value && value.length <= 256 && ![...value].some((character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127);
 
 export function createResponseWarmup<Env, Context>(run: (request: Request, env: Env, context: Context) => Promise<Response>, canRun: () => boolean = () => true) {
   let generation = 0;

@@ -155,7 +155,7 @@ beforeAll(() => {
   );
   writeFileSync(
     join(project, "wrangler.jsonc"),
-    JSON.stringify({ compatibility_date: "2025-08-01", main: "src/index.ts", name: "cache-consumer" }),
+    JSON.stringify({ compatibility_date: "2025-08-01", compatibility_flags: ["nodejs_compat"], main: "src/index.ts", name: "cache-consumer" }),
   );
 }, 600_000);
 
@@ -183,6 +183,7 @@ describe("installed package in a fresh Worker project", () => {
     const { Miniflare } = await import(pathToFileURL(join(project, "node_modules/miniflare/dist/src/index.js")).href);
     const mf = new Miniflare({
       compatibilityDate: "2025-08-01",
+      compatibilityFlags: ["nodejs_compat"],
       d1Databases: { DB: "consumer-db" },
       durableObjects: { CACHE_COORDINATOR: { className: "CacheCoordinator", useSQLite: true } },
       modules: true,

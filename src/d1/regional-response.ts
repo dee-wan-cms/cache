@@ -1,5 +1,7 @@
 import { responseEntry, type JsonResponseEntry } from './json-read';
 import { regionalKey, regionalRead, regionalWrite } from './regional';
+import { D1_BOOKMARK_HEADER, decodeD1Bookmarks, serializeD1Bookmarks } from './bookmarks';
+import { d1SessionBookmarkFloor, trackD1SessionSource, responseD1SessionBookmarks, advanceD1SessionBookmarks, varyD1Bookmarks, runPrimaryD1SessionSource } from './session';
 
 export interface RegionalResponseOptions {
   namespace: string;
@@ -21,7 +23,7 @@ function identity(request: Request): unknown | null {
   const headers: [string, string][] = [];
   for (const [name, value] of request.headers) {
     if (sensitive.test(name) || conditional.test(name) || /(?:^|[-_])(?:capability|preview)(?:[-_]|$)/i.test(name)) return null;
-    if (!ephemeral.test(name)) headers.push([name, value]);
+    if (!ephemeral.test(name) && name.toLowerCase() !== D1_BOOKMARK_HEADER.toLowerCase()) headers.push([name, value]);
   }
   headers.sort(([a], [b]) => a.localeCompare(b));
   return [url.toString(), headers];
@@ -60,15 +62,34 @@ export async function cacheRegionalResponse(request: Request, options: RegionalR
   let requestIdentity: unknown | null;
   try { requestIdentity = identity(request); } catch { return load(); }
   if (requestIdentity === null || typeof options.namespace !== 'string' || !options.namespace.trim()) return load();
-  const key = await regionalKey(options.ttlMs, ['http-response', options.namespace, options.ttlMs, requestIdentity]);
+  const floor = d1SessionBookmarkFloor();
+  const key = await regionalKey(options.ttlMs, ['http-response', floor ? 'session-v1' : null, options.namespace, options.ttlMs, requestIdentity]);
   if (!key) return load();
   const cached = await regionalRead(key, options.ttlMs);
   if (cached) {
     const response = reconstruct(cached.value);
-    if (response) return response;
+    if (response) {
+      if (!floor) return response;
+      const raw = response.headers.get(D1_BOOKMARK_HEADER);
+      const source = decodeD1Bookmarks(raw);
+      if (raw && source && Object.entries(floor).every(([id, bookmark]) => source[id] && source[id] >= bookmark)) {
+        advanceD1SessionBookmarks(source);
+        return response;
+      }
+      void response.body?.cancel().catch(() => undefined);
+    }
   }
   const started = Date.now();
-  const response = await load();
+  const tracked = await trackD1SessionSource(() => runPrimaryD1SessionSource(load));
+  let response = tracked.value;
+  const bookmarks = responseD1SessionBookmarks(response.headers, tracked.bookmarks);
+  if (bookmarks) {
+    const headers = new Headers(response.headers);
+    const encoded = serializeD1Bookmarks(bookmarks);
+    if (encoded) headers.set(D1_BOOKMARK_HEADER, encoded);
+    varyD1Bookmarks(headers);
+    response = new Response(response.body, { status:response.status, statusText:response.statusText, headers });
+  }
   if (!eligible(response.headers)) return response;
   let entry: JsonResponseEntry | null;
   try { entry = await responseEntry(response); } catch { return response; }

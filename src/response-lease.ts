@@ -5,6 +5,8 @@ import { registerRegionalDeadlineReporter } from './d1/regional-deadline';
 import type { D1CacheProfile } from './d1/profile';
 import { MAX_RESPONSE_LEASE_BYTES, responseLeaseKey } from './d1/regional';
 import { isMutation, matchesPath, needsFreshness } from './d1/read-freshness-policy';
+import { D1_BOOKMARK_HEADER, decodeD1Bookmarks, serializeD1Bookmarks } from './d1/bookmarks';
+import { d1SessionBookmarkFloor, advanceD1SessionBookmarks, runIsolatedD1Session, trackD1SessionSource, responseD1SessionBookmarks, varyD1Bookmarks, runPrimaryD1SessionSource } from './d1/session';
 import { hasCacheBypass, hasFreshnessCookie, hasFreshnessGeneration, validFreshnessHeader } from './d1/request-freshness';
 
 interface LeaseScope { deadline?: number; dataDeadline?: number }
@@ -178,7 +180,7 @@ interface ResolvedLease { config: LeaseConfig; seconds: number; identity: () => 
 export function createReadResponseLease<Env, Context>(handler: (request: Request, env: Env, context: Context) => Promise<Response>, resolve: (env: Env) => ResolvedLease | null): (request: Request, env: Env, context: Context) => Promise<Response> {
   const pending = new Map<string, { valid: boolean; task: Promise<void> }>();
   let foreground = 0;
-  const warming = createResponseWarmup<Env, Context>((request, env, context) => wrapped(request, env, context), () => foreground === 0);
+  const warming = createResponseWarmup<Env, Context>((request, env, context) => runIsolatedD1Session(request, () => wrapped(request, env, context)), () => foreground === 0);
   const wrapped = async (request: Request, env: Env, context: Context): Promise<Response> => {
     const requestStarted = Date.now();
     const requestGeneration = warming.snapshot();
@@ -219,11 +221,20 @@ export function createReadResponseLease<Env, Context>(handler: (request: Request
     const identity = resolved.identity();
     if (!identity) return serve(noCache(request));
     const names = [...new Set([...config.credentialHeaders, ...config.varyHeaders].map((name) => name.toLowerCase()))].sort();
-    const permittedVary = new Set(names);
+    const permittedVary = new Set([...names, D1_BOOKMARK_HEADER.toLowerCase()]);
     const ttl = seconds * 1000;
     const key = await responseLeaseKey(ttl, [identity[0], request.method, request.url, ...identity.slice(1), names.map((name) => [name, headerValue(name)])]);
     if (!key) return serve(noCache(request));
-    const cached = forceSource ? null : await readLease(key, ttl, permittedVary);
+    let cached = forceSource ? null : await readLease(key, ttl, permittedVary);
+    const bookmarkFloor = d1SessionBookmarkFloor();
+    if (cached && bookmarkFloor) {
+      const rawBookmarks = cached.response.headers.get(D1_BOOKMARK_HEADER);
+      const source = decodeD1Bookmarks(rawBookmarks);
+      if (!rawBookmarks || !source || Object.entries(bookmarkFloor).some(([id, floor]) => !source[id] || source[id] < floor)) {
+        void cached.response.body?.cancel().catch(() => undefined);
+        cached = null;
+      } else advanceD1SessionBookmarks(source);
+    }
     const warmOptions = config.warmup;
     const warmGroup = warmOptions && typeof warmOptions.scopeHeader === 'string' && /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(warmOptions.scopeHeader) && config.varyHeaders.some((name) => name.toLowerCase() === warmOptions.scopeHeader.toLowerCase()) ? await responseLeaseKey(ttl, ['response-warmup-group', identity, names.map((name) => [name, headerValue(name)]), request.headers.get(warmOptions.scopeHeader)]) : null;
     const credentialGroup = warmOptions?.catalogScope === 'credential' && warmGroup && !config.credentialHeaders.some((name) => name.toLowerCase() === warmOptions.scopeHeader.toLowerCase()) ? await responseLeaseKey(ttl, ['response-warmup-credential-group', identity, names.filter((name) => name !== warmOptions.scopeHeader.toLowerCase()).map((name) => [name, name === 'cookie' ? withoutCookie(headerValue(name), config.freshnessCookie) : headerValue(name)])]) : null;
@@ -234,7 +245,11 @@ export function createReadResponseLease<Env, Context>(handler: (request: Request
         if (!warmOptions || !warmGroup || warming.isInternal(request) || !warming.current(requestGeneration)) return;
         const wait: unknown = context && typeof context === 'object' ? Reflect.get(context, 'waitUntil') : undefined;
         if (typeof wait !== 'function') return;
-        const task = warming.start(warmOptions, request, response, identity, warmGroup, eligible, env, context, config.freshnessHeader, credentialGroup ?? undefined);
+        const warmHeaders = new Headers(request.headers);
+        const sourceBookmarks = response.headers.get(D1_BOOKMARK_HEADER);
+        if (sourceBookmarks) warmHeaders.set(D1_BOOKMARK_HEADER, sourceBookmarks);
+        const warmRequest = new Request(request, { headers:warmHeaders });
+        const task = warming.start(warmOptions, warmRequest, response, identity, warmGroup, eligible, env, context, config.freshnessHeader, credentialGroup ?? undefined);
         transferred = true;
         Reflect.apply(wait, context, [task]);
       } catch { /* Warming is optional. */ }
@@ -263,6 +278,7 @@ export function createReadResponseLease<Env, Context>(handler: (request: Request
     };
     const waitUntil: unknown = context && typeof context === 'object' ? Reflect.get(context, 'waitUntil') : undefined;
     if (cached) {
+      const cachedResponse = cached.response;
       warming.verify(request);
       if (warmOptions && warmGroup && !warming.isInternal(request) && typeof waitUntil === 'function') {
         try { scheduleWarm(cached.response.clone()); } catch { /* Warming is optional. */ }
@@ -276,13 +292,26 @@ export function createReadResponseLease<Env, Context>(handler: (request: Request
           const headers = new Headers(request.headers);
           for (const name of ['range', 'if-match', 'if-unmodified-since', 'if-range', 'if-none-match', 'if-modified-since']) headers.delete(name);
           headers.set('cache-control', 'no-cache');
+          const cachedBookmarks = cachedResponse.headers.get(D1_BOOKMARK_HEADER);
+          if (cachedBookmarks) headers.set(D1_BOOKMARK_HEADER, cachedBookmarks);
           if (config.freshnessHeader !== undefined) headers.set(config.freshnessHeader, '1');
           const source = new Request(request.url, { method:'GET', headers, signal:new AbortController().signal });
           const lease: LeaseScope = {};
           try {
-            const response = await scope.run(lease, () => handler(source, env, context));
-            try { await fillResponse(response, lease, started, () => refresh.valid); }
-            finally { void response.body?.cancel().catch(() => undefined); }
+            await runIsolatedD1Session(source, async () => {
+              const tracked = await trackD1SessionSource(() => runPrimaryD1SessionSource(() => scope.run(lease, () => handler(source, env, context))));
+              let response = tracked.value;
+              const bookmarks = responseD1SessionBookmarks(response.headers, tracked.bookmarks);
+              if (bookmarks) {
+                const headers = new Headers(response.headers);
+                const encoded = serializeD1Bookmarks(bookmarks);
+                if (encoded) headers.set(D1_BOOKMARK_HEADER, encoded);
+                varyD1Bookmarks(headers);
+                response = new Response(response.body, { status:response.status, statusText:response.statusText, headers });
+              }
+              try { await fillResponse(response, lease, started, () => refresh.valid); }
+              finally { void response.body?.cancel().catch(() => undefined); }
+            });
           } catch { /* Refresh failures leave the old lease untouched. */ }
         }).finally(() => { if (pending.get(key) === refresh) pending.delete(key); });
         pending.set(key, refresh);
@@ -295,7 +324,16 @@ export function createReadResponseLease<Env, Context>(handler: (request: Request
     const lease: LeaseScope = {};
     const source = noCache(request);
     if (config.freshnessHeader !== undefined) source.headers.set(config.freshnessHeader, '1');
-    const response = await scope.run(lease, () => serve(source));
+    const sourceResult = await trackD1SessionSource(() => runPrimaryD1SessionSource(() => scope.run(lease, () => serve(source))));
+    let response = sourceResult.value;
+    const sourceBookmarks = responseD1SessionBookmarks(response.headers, sourceResult.bookmarks);
+    if (sourceBookmarks) {
+      const headers = new Headers(response.headers);
+      varyD1Bookmarks(headers);
+      const encoded = serializeD1Bookmarks(sourceBookmarks);
+      if (encoded) headers.set(D1_BOOKMARK_HEADER, encoded);
+      response = new Response(response.body, { status:response.status, statusText:response.statusText, headers });
+    }
     const fill = fillResponse(response, lease, requestStarted, () => true, priorRefresh?.task);
     try {
       if (!warming.isInternal(request) && typeof waitUntil === 'function') { Reflect.apply(waitUntil, context, [fill]); return response; }
@@ -309,7 +347,8 @@ export function createReadResponseLease<Env, Context>(handler: (request: Request
 export function wrapReadResponseLease<Env, Context>(handler: (request: Request, env: Env, context: Context) => Promise<Response>, options: ReadResponseLeaseOptions): (request: Request, env: Env, context: Context) => Promise<Response> {
   return createReadResponseLease(handler, () => {
     if (![options.namespace, options.deployment, options.database].every((value) => typeof value === 'string' && value.trim().length > 0)) return null;
-    const { warmup: _warmup, ...identity } = options;
+    const identity = { ...options };
+    delete identity.warmup;
     return { config: options, seconds: options.seconds, identity: () => ['response-lease-v1', identity] };
   });
 }

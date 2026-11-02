@@ -1,7 +1,7 @@
 # @dee-wan/cache
 
 Prisma read cache for Cloudflare Workers and D1. A Durable Object coordinates invalidation, fill locks
-and cached values, so a write through one Worker is seen by every other Worker on its next read.
+and cached values. Default reads check the coordinator. Optional regional reads allow bounded staleness.
 
 The contract, including every invalidation rule and limit, is in
 [docs/cache-contract.md](docs/cache-contract.md).
@@ -74,6 +74,55 @@ They then run on every read, including hits, and the arguments they rewrite (for
 filter) are part of the cache key. An extension applied after the cache is skipped on a hit. Use
 `scope` for anything a caller changes about results without changing the arguments.
 
+## Regional Prisma reads
+
+`createRegionalStore` adds local Cloudflare Cache API reads to the same coordinator store. Opt in to
+at most five seconds of stale data across isolates. Authorization and guard extensions still run.
+
+```ts
+import { createDurableObjectStore, createRegionalStore } from '@dee-wan/cache/cloudflare';
+
+const name = 'main-db';
+const generation = `${deploymentGeneration}:${cacheConfig.cacheVersion}`;
+const store = createRegionalStore(createDurableObjectStore(env.CACHE_COORDINATOR, { name }), {
+  namespace: env.CACHE_COORDINATOR.idFromName(name).toString(),
+  generation,
+  ttlMs: 5000,
+  waitUntil: promise => ctx.waitUntil(promise),
+});
+const extension = createCacheExtension({
+  config: cacheConfig,
+  store,
+  coordinationGeneration: generation,
+  scope: callerScope,
+  decimal: Prisma.Decimal,
+  waitUntil: promise => ctx.waitUntil(promise),
+});
+```
+
+Keep namespace stable across callers and writers. It identifies one coordinator and database, not a
+user. Keep caller permissions in `scope`. `coordinationGeneration` must match the wrapper generation.
+Accepted fills and coordinator hits with a known fresh deadline can populate regional entries. Their
+lifetime never exceeds the source freshness deadline. Old/custom stores without that deadline still
+work, but their hits do not populate regional entries. Refresh tokens are never replayed regionally.
+With `waitUntil`, hits in the latter half of the regional lease renew from the coordinator in the
+background. Renewals are deduplicated per key and keep the same freshness bound. Read/release
+waits are bounded; late locks are released after timeout. Failed renewal permits another attempt
+without delaying the foreground hit; expired entries still use the coordinator.
+Local mutations block old reads and fills. Operations sharing a write token execute in order;
+queued operations stay fenced until the actual coordinator call settles, including after a caller
+timeout. Cross-isolate changes converge within the regional lease.
+After a failed final write fence or explicit invalidation, regional reads stay blocked. With
+`waitUntil`, later reads retry the coordinator in bounded background passes. Caching resumes only
+after acknowledgment, never merely because time passed. Failure tracking overflow or reuse of an
+unresolved failed write token keeps the isolate disabled.
+Cache API failures use the coordinator; coordinator read failures use the original database path.
+
+Generated backends use this wrapper and `createResponseWarmup` from the same entry point. They warm
+bounded generated GET routes through normal authorization, with the current caller's credentials.
+Warming is best effort; unknown query variants and first requests can remain cold. Writes and auth
+decisions are not cached. A warm-read target is not a latency guarantee for all network requests.
+
 ## Options
 
 Invalid options throw a `TypeError` at construction.
@@ -133,7 +182,7 @@ Models that reference the target through a foreign key are invalidated too. Unkn
 - One coordinator Durable Object has a soft limit of 1,000 requests per second. Measured on
   2026-09-17 from one client: about 1,030 cached reads per second at 21 ms p50 with no errors, against
   about 340 per second at 215 ms reading D1 directly. Higher rates are not measured.
-- Each cached hit costs one coordinator call; a miss costs two; a contended miss can cost up to seven;
+- Each coordinator hit costs one call; a miss costs two; a contended miss can cost up to seven;
   each write costs two, plus retries. On the Workers Free plan, requests that make many Prisma calls
   can reach the subrequest limit (see the contract, "Cost per Prisma call").
 - Every write to a model invalidates that model's cached lists, counts and relation reads.
@@ -145,7 +194,7 @@ Models that reference the target through a foreign key are invalidated too. Unkn
 
 ## Runtime requirements
 
-- Cloudflare Workers with a SQLite-backed Durable Object and D1. No `nodejs_compat` needed.
+- Cloudflare Workers with a SQLite-backed Durable Object and D1. The core and Cloudflare entries do not require `nodejs_compat`; Workers importing `@dee-wan/cache/d1` require it.
 - Prisma 6.19.3 or newer 6.x with `@prisma/adapter-d1` (tested with 6.19.3).
 - Generator: Node 20 or newer (CI runs it on 20, 22 and 24). Wrangler 4 and Miniflare need Node 22.
 
@@ -299,3 +348,33 @@ Defaults are 48 targets per batch, 4 concurrent requests across all warmup batch
 `createIntentWarmup(cooldownMs?, now?)` warms reads on navigation intent, without storing response values. Call `setScope(siteAndActor)` before use and `warm(key, async isCurrent => ...)` on mouse hover or keyboard focus. One task runs; only the latest waiting intent remains. Check `isCurrent()` between sequential reads. Successful tasks cool for 60 seconds by default. Scope changes and `invalidate()` clear waiting tasks and cooldowns; old completions cannot warm a new scope. Use silent, bounded, read-only requests with the same URL, credentials and headers as normal reads. Do not adopt results into active editor stores or start a startup fanout.
 
 `cacheReadValue` from `@dee-wan/cache/scoped-read` provides a Cache API value cache without D1 or a Durable Object. Pass a nonempty `namespace`, a bounded structured `key`, and a `validate` type guard with the source loader. Include every authorization and result-varying scope in the key; do not put credentials in cached values. `ttlMs` defaults to 5000 and cannot exceed 5000. `maxBytes` defaults to 1,500,000 and can be lowered. Optional `cache` and `now` allow a Cache API implementation and clock to be supplied. Cache failures, invalid values, and expired entries fall back to the loader; loader errors propagate. Expiry starts before the loader runs.
+
+### D1 bookmark client transport
+
+`createD1BookmarkFetch(fetch)` wraps a fetch implementation and remembers valid
+`X-Dee-Wan-D1-Bookmarks` response headers. Later requests include the greatest
+bookmark seen for each physical database. Create one wrapper per independent
+client context. Bookmark maps are bounded to 64 database UUIDs and 8192
+characters; invalid maps are ignored. Pass `{ storage }` as the second argument to persist per-origin maps in a `getItem`/`setItem` store such as sessionStorage. Storage errors fall back to memory.
+
+### D1 sessions
+
+Cloudflare Workers importing `@dee-wan/cache/d1` require the `nodejs_compat`
+compatibility flag, including when D1 sessions are not enabled.
+
+Wrap HTTP handlers with `wrapD1ReadSessionHandler(handler, options)` outside
+`wrapD1Handler`. Set `bindingNames`, `bindingPrefixes`, `databaseIdsEnv`, and
+optionally `primaryBindings`, `freshnessHeader`, and `ignoreRequestCacheControl`. The named environment variable contains a JSON
+map from each configured binding name to its physical D1 UUID. Bindings that
+share a UUID share a request session. If the variable is absent, bindings keep
+their original behavior. Invalid maps fail configuration; invalid bookmark
+headers return HTTP 400.
+
+For a reusable Prisma D1 adapter, pass `prismaD1SessionDatabase(database)` to
+`PrismaD1` and run every Prisma operation through
+`runD1SessionOperation(database, operation)`, including scheduled operations.
+Admission waits at most 30 seconds for an earlier operation on the same physical database. Apply `sessionD1Env(env, options)` before cache wrapping scheduled bindings so
+those operations use the same facades. Ordinary D1 calls use the regular
+binding. Allow and expose
+`X-Dee-Wan-D1-Bookmarks` in CORS configuration where browser clients need it.
+D1 cache source fills start on the primary; cache hits reuse source bookmarks. Generic Prisma caches must set `sessionCache: d1SessionCacheHooks(database)`. Queries started after streaming response headers are sent cannot advance those headers. WebSocket upgrades bypass sessions.
