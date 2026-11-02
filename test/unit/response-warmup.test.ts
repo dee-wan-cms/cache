@@ -470,7 +470,7 @@ it('waits for an active foreground source before starting the next warm read', a
   vi.spyOn(caches.default, 'put').mockImplementation(async (key, value) => {
     const body = await value.clone().json();
     await originalPut(key, value);
-    if (body.path === '/api/first') firstFillDone = true;
+    if (body !== null && typeof body === 'object' && 'path' in body && body.path === '/api/first') firstFillDone = true;
   });
   const nativeTimer = globalThis.setTimeout;
   vi.spyOn(globalThis, 'setTimeout').mockImplementation((callback, delay, ...args) => {
