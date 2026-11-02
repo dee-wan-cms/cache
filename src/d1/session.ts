@@ -451,7 +451,7 @@ export function wrapD1ReadSessionHandler<Env extends object, Context>(handler: (
     const decoded = decodeD1Bookmarks(request.headers.get(D1_BOOKMARK_HEADER));
     if (!decoded) return new Response('Invalid D1 bookmarks', { status:400 });
     const configured = new Set(Object.entries(scoped).flatMap(([name, value]) => isD1BindingName(name, { ...options, envPrefix:'', coordinatorNamePrefix:'', coordinatorClass:'', readModels:[], unfencedWriteTables:[] }) && value && typeof value === 'object' ? [infos.get(value)?.id].filter((id): id is string => !!id) : []));
-    const input = Object.fromEntries(Object.entries(decoded).filter(([id]) => configured.has(id))); 
+    const input = Object.fromEntries(Object.entries(decoded).filter(([id]) => configured.has(id)));
     const sessionContext: SessionContext = { input, sessions:new Map(), bookmarks:{}, primaryIds:new Set(), allowedIds:configured, operations:new Map(), primary: !['GET', 'HEAD', 'OPTIONS'].includes(request.method.toUpperCase()) || (options.ignoreRequestCacheControl !== true && hasCacheBypass(request)) || (options.freshnessHeader !== undefined && request.headers.has(options.freshnessHeader)), closed:false };
     return storage.run(sessionContext, async () => {
       try {
