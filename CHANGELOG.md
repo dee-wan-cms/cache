@@ -1,3 +1,14 @@
+# [2.0.0](https://github.com/dee-wan-cms/cache/compare/v1.1.0...v2.0.0) (2026-11-02)
+
+
+* feat(d1)!: preserve replica read consistency ([5dd7276](https://github.com/dee-wan-cms/cache/commit/5dd727669607734ae0a3e67866af457adbb3e46c))
+
+
+### BREAKING CHANGES
+
+* Workers importing @dee-wan/cache/d1 must enable
+nodejs_compat. CMS and generated Workers already enable this flag.
+
 # [1.1.0](https://github.com/dee-wan-cms/cache/compare/v1.0.1...v1.1.0) (2026-11-02)
 
 
