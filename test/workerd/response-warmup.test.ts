@@ -397,3 +397,32 @@ it('learns and replays a long selected-media URL in the native credential and si
     expect(await (await worker.dispatchFetch('https://cache.test/calls')).json()).toEqual(expected);
   } finally { await worker.dispose(); }
 });
+
+it('fills the scoped bootstrap lease after unscoped scope discovery', async () => {
+  const bootstrapSource = `
+import { wrapReadResponseLease, limitReadResponseLeaseUntil } from './response-lease';
+const calls = [];
+const wrapped = wrapReadResponseLease(async request => {
+  const path = new URL(request.url).pathname, site = request.headers.get('x-site-id');
+  calls.push([path, site]);
+  limitReadResponseLeaseUntil(Date.now() + 5000);
+  return Response.json(path === '/api/layout' ? { scope:'one', site } : {});
+}, { namespace:'native-scoped-bootstrap', deployment:'v1', database:'db', seconds:5, paths:['/api/**'], credentialHeaders:['cookie'], cookieNames:['session', 'fresh'], varyHeaders:['x-site-id'], freshnessCookie:'fresh', freshnessCookieMode:'generation', warmup:{ scopeHeader:'x-site-id', seeds:['/api/layout'], discoverScopeFrom:'/api/layout', concurrency:1, discover:url => ({ ...(url.pathname === '/api/layout' ? { scope:'one' } : {}), targets:[] }) } });
+export default { async fetch(request, env) {
+  if (new URL(request.url).pathname === '/calls') return Response.json(calls);
+  const jobs = [], context = { waitUntil(task) { jobs.push(task); } };
+  const response = await wrapped(request, env, context);
+  while (jobs.length) await Promise.all(jobs.splice(0));
+  return response;
+} };`;
+  const bundle = await build({ stdin:{ contents:bootstrapSource, resolveDir:resolve(__dirname, '../../src'), loader:'ts' }, bundle:true, format:'esm', platform:'neutral', target:'es2022', external:['cloudflare:workers', 'node:async_hooks'], write:false });
+  const output = bundle.outputFiles[0];
+  if (!output) throw Error('bundle missing');
+  const worker = new Miniflare({ modules:true, script:output.text, compatibilityDate:'2026-01-01', compatibilityFlags:['nodejs_compat'] });
+  try {
+    expect((await worker.dispatchFetch('https://cache.test/api/root', { headers:{ cookie:'session=a' } })).status).toBe(200);
+    const scoped = await worker.dispatchFetch('https://cache.test/api/layout', { headers:{ cookie:'session=a', 'x-site-id':'one' } });
+    expect(await scoped.json()).toEqual({ scope:'one', site:'one' });
+    expect(await (await worker.dispatchFetch('https://cache.test/calls')).json()).toEqual([['/api/root', null], ['/api/layout', null], ['/api/layout', 'one']]);
+  } finally { await worker.dispose(); }
+});

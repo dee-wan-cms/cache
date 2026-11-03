@@ -29,6 +29,25 @@ it('discovers scope from an authorized seed and warms its targets with that scop
   expect(calls).toEqual([['/api/root', null, 'session=a'], ['/api/layout', null, 'session=a'], ['/api/detail', 'one', 'session=a']]);
 });
 
+it('warms a scoped bootstrap separately from the unscoped discovery response', async () => {
+  const calls: Array<[string, string | null]> = [];
+  const wrapped = wrapReadResponseLease(async (request) => {
+    const path = new URL(request.url).pathname;
+    const site = request.headers.get('x-site-id');
+    calls.push([path, site]);
+    limitReadResponseLeaseUntil(Date.now() + 5000);
+    return Response.json(path === '/api/layout' ? { scope:'one', site } : {});
+  }, { ...options, namespace:'bootstrap-scoped-lease', warmup:{
+    scopeHeader:'x-site-id', seeds:['/api/layout'], discoverScopeFrom:'/api/layout', concurrency:1,
+    discover:(url) => ({ ...(url.pathname === '/api/layout' ? { scope:'one' } : {}), targets:[] }),
+  } });
+  const ctx = context();
+  await wrapped(req('/api/root', 'session=a', null), {}, ctx); await ctx.drain();
+  expect(calls).toEqual([['/api/root', null], ['/api/layout', null], ['/api/layout', 'one']]);
+  expect(await (await wrapped(req('/api/layout', 'session=a', 'one'), {}, undefined)).json()).toEqual({ scope:'one', site:'one' });
+  expect(calls).toHaveLength(3);
+});
+
 it('bounds concurrency and unique targets and does not recurse or restart during cooldown', async () => {
   let active = 0, peak = 0;
   let release: (() => void) | undefined;
@@ -385,7 +404,7 @@ it('runs the scope seed before siblings when scope is missing', async () => {
   await wrapped(req('/api/root', 'session=a', null), {}, ctx); await bootstrapStarted;
   expect(calls).toEqual([['/api/root', null, 'session=a'], ['/api/layout', null, 'session=a']]);
   release?.(); await ctx.drain();
-  expect(calls).toEqual([['/api/root', null, 'session=a'], ['/api/layout', null, 'session=a'], ['/api/sibling', 'one', 'session=a']]);
+  expect(calls).toEqual([['/api/root', null, 'session=a'], ['/api/layout', null, 'session=a'], ['/api/sibling', 'one', 'session=a'], ['/api/layout', 'one', 'session=a']]);
   await wrapped(req('/api/scoped-root', 'session=b', null), {}, ctx); await ctx.drain();
   expect(calls).toContainEqual(['/api/sibling', 'one', 'session=b']);
   expect(calls).toContainEqual(['/api/layout', 'one', 'session=b']);

@@ -50,6 +50,11 @@ request flow. Fail to the database, never to stale cache.
 - Cooldown starts when a wave drains. Active waves keep exclusive ownership of their group.
 - Retry waves skip source calls still pending for the same generation, group, URL and scope.
   Other queued targets can proceed within the shared concurrency bound.
+- Scope discovery skips only the bootstrap variant actually loaded. A discovered scope can warm
+  the same URL under its own header key.
+- HTTP lease cold fills coalesce within one isolate and credential key, up to 1024 active keys.
+  Followers wait at most 5 seconds, then recheck cache and bookmark floors. No source response sharing.
+  Fresh reads and internal warm jobs bypass this wait. Failed fills fall back to source.
 - Warm URLs: same origin, max 8192 characters. Consumer portability rules can set a lower limit.
 - Scoped value reads default to a 5-second TTL cap. Explicit `maxTtlMs` can raise the cap to
   300000 ms; `ttlMs` must fit that cap. Consumer owns scope, validation and accepted staleness.

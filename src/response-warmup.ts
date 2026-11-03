@@ -155,7 +155,7 @@ export function createResponseWarmup<Env, Context>(run: (request: Request, env: 
       } else entries.sort((a, b) => b.count - a.count || b.time - a.time);
       if (stillCurrent()) await catalog.regionalWrite(key, ttl, Date.now(), entries.slice(0, maxEntries));
     };
-    const inspect = async (url: URL, value: Response, deferred?: ReadResponseWarmupTarget[], preload = false) => {
+    const inspect = async (url: URL, value: Response, deferred?: ReadResponseWarmupTarget[], preload = false, sourceScope = rootScope) => {
       let body: unknown;
       try {
         if (!discover) return;
@@ -176,7 +176,7 @@ export function createResponseWarmup<Env, Context>(run: (request: Request, env: 
       if (!found || !Array.isArray(found.targets)) return;
       if (!request.headers.has(scopeHeader) && !scope && validScope(found.scope)) {
         scope = found.scope;
-        if (bootstrap?.href === url.href) completedBootstrap = jobKey(url.href, scope);
+        if (bootstrap?.href === url.href) completedBootstrap = jobKey(url.href, sourceScope);
         if (!deferred) await load();
       }
       const batch = !deferred && discoveryPriority === 'next'
@@ -231,7 +231,7 @@ export function createResponseWarmup<Env, Context>(run: (request: Request, env: 
           if (typeof wait === 'function') Reflect.apply(wait, context, [completion]);
         } catch { /* Source cleanup remains best effort when the host declines it. */ }
         const result = await Promise.race([task, new Promise<never>((_, reject) => abort.signal.addEventListener('abort', () => reject(Error('warmup deadline')), { once:true }))]);
-        if (verified.has(warm) && result.status === 200 && stillCurrent() && Date.now() < end) await inspect(new URL(target.url), result);
+        if (verified.has(warm) && result.status === 200 && stillCurrent() && Date.now() < end) await inspect(new URL(target.url), result, undefined, false, target.scope);
         void result.body?.cancel().catch(() => undefined);
       } catch { /* Background warming is best effort. */ }
       finally {

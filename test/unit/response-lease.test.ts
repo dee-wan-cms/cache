@@ -23,6 +23,96 @@ it('reuses cache only for the same credentials, site, deployment and database', 
   const c = fixture({ ...policy, database:'db2' }); await c.wrapped(request(), {}, undefined);
   expect(b.handler).toHaveBeenCalledOnce(); expect(c.handler).toHaveBeenCalledOnce();
 });
+it('coalesces simultaneous eligible misses and rereads the filled lease', async () => {
+  let release: (() => void) | undefined;
+  let entered: (() => void) | undefined;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const ready = new Promise<void>((resolve) => { entered = resolve; });
+  const handler = vi.fn(async () => { entered?.(); await held; limitReadResponseLeaseUntil(Date.now() + 3000); return Response.json({ value:1 }); });
+  const wrapped = wrapReadResponseLease(handler, { ...policy, namespace:'cold-fill' });
+  const first = wrapped(request(), {}, undefined);
+  await ready;
+  const second = wrapped(request(), {}, undefined);
+  release?.();
+  const responses = await Promise.all([first, second]);
+  expect(await Promise.all(responses.map((response) => response.json()))).toEqual([{ value:1 }, { value:1 }]);
+  expect(handler).toHaveBeenCalledTimes(1);
+});
+
+it('keeps credentials and sites separate and falls back after an uncacheable source', async () => {
+  let release: (() => void) | undefined;
+  let entered: (() => void) | undefined;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const ready = new Promise<void>((resolve) => { entered = resolve; });
+  const handler = vi.fn(async () => { entered?.(); await held; return Response.json({ ok:true }); });
+  const wrapped = wrapReadResponseLease(handler, { ...policy, namespace:'cold-private' });
+  const first = wrapped(request(), {}, undefined);
+  await ready;
+  const second = wrapped(request(), {}, undefined);
+  const otherActor = wrapped(request('session=b'), {}, undefined);
+  const otherSite = wrapped(request('session=a', 'GET', { 'x-site-id':'two' }), {}, undefined);
+  release?.();
+  expect((await Promise.all([first, second, otherActor, otherSite])).map((response) => response.status)).toEqual([200, 200, 200, 200]);
+  expect(handler).toHaveBeenCalledTimes(4);
+});
+
+it('releases a failed cold source so another request may try', async () => {
+  const handler = vi.fn().mockRejectedValueOnce(new Error('source failed')).mockImplementation(async () => Response.json({ ok:true }));
+  const wrapped = wrapReadResponseLease(handler, { ...policy, namespace:'cold-throw' });
+  await expect(wrapped(request(), {}, undefined)).rejects.toThrow('source failed');
+  expect((await wrapped(request(), {}, undefined)).status).toBe(200);
+  expect(handler).toHaveBeenCalledTimes(2);
+});
+
+it('does not block explicit freshness behind a held cold source', async () => {
+  let release: (() => void) | undefined;
+  let entered: (() => void) | undefined;
+  let freshEntered: (() => void) | undefined;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const ready = new Promise<void>((resolve) => { entered = resolve; });
+  const freshReady = new Promise<void>((resolve) => { freshEntered = resolve; });
+  let calls = 0;
+  const handler = vi.fn(async () => {
+    const value = ++calls;
+    if (value === 1) { entered?.(); await held; } else freshEntered?.();
+    limitReadResponseLeaseUntil(Date.now() + 3000);
+    return Response.json({ value });
+  });
+  const wrapped = wrapReadResponseLease(handler, { ...policy, namespace:'cold-fresh' });
+  const first = wrapped(request(), {}, undefined);
+  await ready;
+  const fresh = wrapped(request('session=a', 'GET', { 'x-fresh':'1' }), {}, undefined);
+  await freshReady;
+  expect(await (await fresh).json()).toEqual({ value:2 });
+  release?.();
+  await first;
+  expect(await (await wrapped(request(), {}, undefined)).json()).toEqual({ value:2 });
+});
+
+it('does not let a pre-mutation cold fill populate the new generation', async () => {
+  let release: (() => void) | undefined;
+  let entered: (() => void) | undefined;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const ready = new Promise<void>((resolve) => { entered = resolve; });
+  let calls = 0;
+  const handler = vi.fn(async (input: Request) => {
+    if (input.method !== 'GET') return Response.json({ ok:true });
+    const value = ++calls;
+    if (value === 1) { entered?.(); await held; }
+    limitReadResponseLeaseUntil(Date.now() + 3000);
+    return Response.json({ value });
+  });
+  const wrapped = wrapReadResponseLease(handler, { ...policy, namespace:'cold-mutation' });
+  const first = wrapped(request(), {}, undefined);
+  await ready;
+  const mutation = await wrapped(request('session=a', 'POST'), {}, undefined);
+  const generation = mutation.headers.get('set-cookie')?.split(';')[0];
+  expect(generation).toMatch(/^fresh=/);
+  release?.();
+  await first;
+  expect(await (await wrapped(request(`session=a; ${generation}`), {}, undefined)).json()).toEqual({ value:2 });
+});
+
 it('honors the authorization deadline and never fills without proof', async () => {
   vi.useFakeTimers(); vi.setSystemTime(10_000);
   const f = fixture(); await f.wrapped(request(), {}, undefined);

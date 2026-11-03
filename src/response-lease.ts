@@ -179,9 +179,10 @@ type LeaseConfig = (NonNullable<D1CacheProfile['readResponseLease']> | ReadRespo
 interface ResolvedLease { config: LeaseConfig; seconds: number; identity: () => unknown[] | null }
 export function createReadResponseLease<Env, Context>(handler: (request: Request, env: Env, context: Context) => Promise<Response>, resolve: (env: Env) => ResolvedLease | null): (request: Request, env: Env, context: Context) => Promise<Response> {
   const pending = new Map<string, { valid: boolean; task: Promise<void> }>();
+  const cold = new Map<string, { valid: boolean; done: Promise<void> }>();
   let foreground = 0;
   const warming = createResponseWarmup<Env, Context>((request, env, context) => runIsolatedD1Session(request, () => wrapped(request, env, context)), () => foreground === 0);
-  const wrapped = async (request: Request, env: Env, context: Context): Promise<Response> => {
+  const wrapped = async (request: Request, env: Env, context: Context, independent = false): Promise<Response> => {
     const requestStarted = Date.now();
     const requestGeneration = warming.snapshot();
     const serve = async (input: Request): Promise<Response> => {
@@ -319,27 +320,53 @@ export function createReadResponseLease<Env, Context>(handler: (request: Request
       }
       return conditionalHit(request, cached.response);
     }
+    const previousCold = cold.get(key);
+    if (previousCold && !forceSource && !independent && !warming.isInternal(request)) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([previousCold.done, new Promise<void>((resolve) => { timer = setTimeout(resolve, Math.min(ttl, 5000)); })]);
+      } finally { if (timer !== undefined) clearTimeout(timer); }
+      if (request.signal.aborted) throw request.signal.reason;
+      return wrapped(request, env, context, true);
+    }
+    if (previousCold && forceSource) previousCold.valid = false;
     const priorRefresh = pending.get(key);
     if (priorRefresh) priorRefresh.valid = false;
+    let finish: (() => void) | undefined;
+    const owner = !previousCold && !forceSource && !independent && !warming.isInternal(request) && cold.size < 1024
+      ? { valid:true, done:new Promise<void>((resolve) => { finish = resolve; }) } : undefined;
+    if (owner) cold.set(key, owner);
+    const release = () => {
+      if (!owner) return;
+      if (cold.get(key) === owner) cold.delete(key);
+      finish?.();
+    };
     const lease: LeaseScope = {};
     const source = noCache(request);
     if (config.freshnessHeader !== undefined) source.headers.set(config.freshnessHeader, '1');
-    const sourceResult = await trackD1SessionSource(() => runPrimaryD1SessionSource(() => scope.run(lease, () => serve(source))));
-    let response = sourceResult.value;
-    const sourceBookmarks = responseD1SessionBookmarks(response.headers, sourceResult.bookmarks);
-    if (sourceBookmarks) {
-      const headers = new Headers(response.headers);
-      varyD1Bookmarks(headers);
-      const encoded = serializeD1Bookmarks(sourceBookmarks);
-      if (encoded) headers.set(D1_BOOKMARK_HEADER, encoded);
-      response = new Response(response.body, { status:response.status, statusText:response.statusText, headers });
-    }
-    const fill = fillResponse(response, lease, requestStarted, () => true, priorRefresh?.task);
+    let sourceResult: Awaited<ReturnType<typeof trackD1SessionSource<Response>>>;
+    try { sourceResult = await trackD1SessionSource(() => runPrimaryD1SessionSource(() => scope.run(lease, () => serve(source)))); }
+    catch (error) { release(); throw error; }
     try {
-      if (!warming.isInternal(request) && typeof waitUntil === 'function') { Reflect.apply(waitUntil, context, [fill]); return response; }
-    } catch { /* Await the fill if the request context is unavailable. */ }
-    await fill;
-    return response;
+      let response = sourceResult.value;
+      const sourceBookmarks = responseD1SessionBookmarks(response.headers, sourceResult.bookmarks);
+      if (sourceBookmarks) {
+        const headers = new Headers(response.headers);
+        varyD1Bookmarks(headers);
+        const encoded = serializeD1Bookmarks(sourceBookmarks);
+        if (encoded) headers.set(D1_BOOKMARK_HEADER, encoded);
+        response = new Response(response.body, { status:response.status, statusText:response.statusText, headers });
+      }
+      const fill = fillResponse(response, lease, requestStarted, () => owner ? owner.valid : !previousCold || forceSource, priorRefresh?.task).finally(release);
+      try {
+        if (!warming.isInternal(request) && typeof waitUntil === 'function') { Reflect.apply(waitUntil, context, [fill]); return response; }
+      } catch { /* Await the fill if the request context is unavailable. */ }
+      await fill;
+      return response;
+    } catch (error) {
+      release();
+      throw error;
+    }
   };
   return wrapped;
 }
