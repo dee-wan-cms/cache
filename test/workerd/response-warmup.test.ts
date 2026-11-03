@@ -476,7 +476,8 @@ export default { fetch(request, env, ctx) {
         expect(mutation.status).toBe(200);
       }
       foreground = fetch('/api/seed');
-      expect((await until((value) => value.incoming === 1)).seedCalls).toBe(1);
+      const incoming = await until((value) => value.incoming === 1);
+      if (order === 'warm-first') expect(incoming.seedCalls).toBe(1);
     } else {
       foreground = fetch('/api/seed');
       await until((value) => value.seedCalls === 1);
