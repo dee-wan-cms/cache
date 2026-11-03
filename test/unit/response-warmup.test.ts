@@ -1115,24 +1115,44 @@ it('lets foreground read after an aborted warm owner', async () => {
 });
 
 it('releases an aborted warm owner even if its source ignores cancellation', async () => {
-  vi.useFakeTimers({ toFake:['setTimeout', 'clearTimeout', 'Date'] });
   let release: (() => void) | undefined;
+  let entered: (() => void) | undefined;
+  let abortObserved: (() => void) | undefined;
   const held = new Promise<void>((resolve) => { release = resolve; });
+  const ready = new Promise<void>((resolve) => { entered = resolve; });
+  const aborted = new Promise<void>((resolve) => { abortObserved = resolve; });
   let seedCalls = 0;
   const wrapped = wrapReadResponseLease(async (request) => {
     const path = new URL(request.url).pathname;
-    if (path === '/api/seed' && ++seedCalls === 1) await held;
+    const value = path === '/api/seed' ? ++seedCalls : seedCalls;
+    if (path === '/api/seed' && value === 1) {
+      if (request.signal.aborted) abortObserved?.();
+      else request.signal.addEventListener('abort', () => abortObserved?.(), { once:true });
+      entered?.();
+      await held;
+    }
     limitReadResponseLeaseUntil(Date.now() + 5000);
-    return Response.json({ path, seedCalls });
+    return Response.json({ path, seedCalls:value });
   }, { ...options, namespace:'ignored-abort-warm-owner', warmup:{ scopeHeader:'x-site-id', seeds:['/api/seed'], concurrency:1 } });
   const ctx = context();
-  await wrapped(req('/api/root'), {}, ctx);
-  await driveUntil(() => seedCalls === 1);
-  await wrapped(new Request('https://example.test/api/root', { method:'POST', headers:{ cookie:'session=a', 'x-site-id':'one' } }), {}, ctx);
-  await vi.advanceTimersByTimeAsync(25);
-  const foreground = await wrapped(req('/api/seed'), {}, undefined);
-  expect(await foreground.json()).toEqual({ path:'/api/seed', seedCalls:2 });
-  expect(seedCalls).toBe(2);
-  release?.();
-  await ctx.drain();
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await wrapped(req('/api/root'), {}, ctx);
+    await ready;
+    await wrapped(new Request('https://example.test/api/root', { method:'POST', headers:{ cookie:'session=a', 'x-site-id':'one' } }), {}, ctx);
+    await aborted;
+    timer = setTimeout(() => controller.abort(), 1000);
+    const foreground = await wrapped(new Request(req('/api/seed'), { signal:controller.signal }), {}, undefined);
+    expect(await foreground.json()).toEqual({ path:'/api/seed', seedCalls:2 });
+    expect(seedCalls).toBe(2);
+    release?.();
+    await ctx.drain();
+    expect(await (await wrapped(req('/api/seed'), {}, undefined)).json()).toEqual({ path:'/api/seed', seedCalls:2 });
+    expect(seedCalls).toBe(2);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    release?.();
+    await ctx.drain();
+  }
 });
