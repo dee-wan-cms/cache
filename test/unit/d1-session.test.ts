@@ -55,7 +55,10 @@ describe('D1 session facade', () => {
     const otherPolicy = sessionD1Env(once, { ...options, primaryBindings:[] });
     expect(otherPolicy.DB).not.toBe(once.DB);
     expect(sessionD1Env(otherPolicy, options).DB).toBe(once.DB);
-    const alias = { ...once.DB, prepare:vi.fn(once.DB.prepare) };
+    const alias: D1Database = {
+      prepare:vi.fn(once.DB.prepare), batch:once.DB.batch, exec:once.DB.exec,
+      withSession:once.DB.withSession, dump:once.DB.dump,
+    };
     registerD1SessionAlias(alias, once.DB);
     expect(sessionD1Env({ ...env, DB:alias }, options).DB).toBe(alias);
     expect(() => sessionD1Env({ ...env, DB:alias }, { ...options, primaryBindings:[] })).toThrow();
