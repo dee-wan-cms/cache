@@ -1,3 +1,10 @@
+## [2.0.2](https://github.com/dee-wan-cms/cache/compare/v2.0.1...v2.0.2) (2026-11-03)
+
+
+### Bug Fixes
+
+* **warmup:** prioritize newly discovered batches ([7b099aa](https://github.com/dee-wan-cms/cache/commit/7b099aa3f0ffe30fffb1099d37994b359b798b33))
+
 ## [2.0.1](https://github.com/dee-wan-cms/cache/compare/v2.0.0...v2.0.1) (2026-11-03)
 
 
