@@ -224,7 +224,7 @@ it('starts cooldown at completion while keeping an active batch exclusive', asyn
     if (calls.length === 1) await held;
     return Response.json({});
   });
-  const start = () => warm.start({ scopeHeader:'x-site-id', seeds:['/api/seed'], maxMilliseconds:1000, cooldownMs:100 }, req('/api/root'), Response.json({}), ['completion-cooldown'], 'completion-cooldown', () => true, {}, undefined);
+  const start = () => warm.start({ scopeHeader:'x-site-id', seeds:['/api/seed'], maxMilliseconds:1000, cooldownMs:100 }, req('/api/root', 'session=a', null), Response.json({}), ['completion-cooldown'], 'completion-cooldown', () => true, {}, undefined);
   const first = start();
   await driveUntil(() => calls.length === 1);
   await start();
@@ -251,7 +251,7 @@ it('skips a still-pending source after deadline while retrying other targets', a
     if (path === '/api/first' && calls.filter((value) => value === path).length === 1) await held;
     return Response.json({});
   });
-  const start = (seeds: string[]) => warm.start({ scopeHeader:'x-site-id', seeds, concurrency:2, maxMilliseconds:100, cooldownMs:30_000 }, req('/api/root'), Response.json({}), ['pending-retry'], 'pending-retry', () => true, {}, undefined);
+  const start = (seeds: string[]) => warm.start({ scopeHeader:'x-site-id', seeds, concurrency:2, maxMilliseconds:100, cooldownMs:30_000 }, req('/api/root', 'session=a', null), Response.json({}), ['pending-retry'], 'pending-retry', () => true, {}, undefined);
   const first = start(['/api/first']);
   await driveUntil(() => calls.length === 1);
   await vi.advanceTimersByTimeAsync(101);
@@ -280,7 +280,7 @@ it('skips a known pending source before waiting for the only slot', async () => 
     if (path === '/api/first') await held;
     return Response.json({});
   });
-  const start = (seeds: string[]) => warm.start({ scopeHeader:'x-site-id', seeds, concurrency:1, maxMilliseconds:100, cooldownMs:30_000 }, req('/api/root'), Response.json({}), ['serial-pending'], 'serial-pending', () => true, {}, undefined);
+  const start = (seeds: string[]) => warm.start({ scopeHeader:'x-site-id', seeds, concurrency:1, maxMilliseconds:100, cooldownMs:30_000 }, req('/api/root', 'session=a', null), Response.json({}), ['serial-pending'], 'serial-pending', () => true, {}, undefined);
   const first = start(['/api/first']);
   await driveUntil(() => calls.length === 1);
   await vi.advanceTimersByTimeAsync(101);
