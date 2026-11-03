@@ -96,6 +96,36 @@ it('keeps errors and invalid warmup configuration away from the foreground lease
   expect(await (await invalid(req('/api/root'), {}, ctx)).json()).toEqual({ ok:true });
 });
 
+it('accepts warm URLs through 8192 characters and rejects longer or external targets', async () => {
+  const calls: string[] = [];
+  const warm = createResponseWarmup(async (request: Request) => {
+    calls.push(request.url);
+    return Response.json({});
+  });
+  const prefix = 'https://example.test/api/data?q=';
+  const boundary = prefix + 'a'.repeat(8192 - prefix.length);
+  const oversized = boundary + 'a';
+  await warm.start({ scopeHeader:'x-site-id', seeds:[boundary, oversized, 'https://other.test/api/data'] }, req('/api/root'), Response.json({}), ['url-boundary'], 'url-boundary', () => true, {}, undefined);
+  expect(calls).toEqual([boundary]);
+  await warm.start({ scopeHeader:'x-site-id', seeds:[], portable:() => true }, new Request(oversized, { headers:{ 'x-site-id':'one' } }), Response.json({}), ['oversized-foreground'], 'oversized-foreground', () => true, {}, undefined);
+  expect(entries.size).toBe(0);
+});
+
+it('learns and replays a canonical selected-media URL longer than 2048 characters', async () => {
+  const ids = Array.from({ length:60 }, (_, index) => `media_${index.toString(16).padStart(32, '0')}`);
+  const selected = '/api/media/selected?' + new URLSearchParams({ ids:ids.join(','), lang:'en' });
+  expect(new URL(selected, 'https://example.test').href.length).toBeGreaterThan(2048);
+  const calls: Array<[string, string | null, string | null]> = [];
+  const warm = createResponseWarmup(async (request: Request) => {
+    calls.push([request.url, request.headers.get('cookie'), request.headers.get('x-site-id')]);
+    return Response.json({});
+  });
+  const policy = { scopeHeader:'x-site-id', seeds:[], portable:(url: URL) => url.pathname === '/api/media/selected' };
+  await warm.start(policy, req(selected), Response.json({}), ['long-selected'], 'learn-long-selected', () => true, {}, undefined);
+  await warm.start(policy, req('/api/root'), Response.json({}), ['long-selected'], 'replay-long-selected', () => true, {}, undefined);
+  expect(calls).toEqual([[new URL(selected, 'https://example.test').href, 'session=a', 'one']]);
+});
+
 it('isolates warm leases by scope and freshness generation', async () => {
   const calls: string[] = [];
   const wrapped = wrapReadResponseLease(async (request) => {

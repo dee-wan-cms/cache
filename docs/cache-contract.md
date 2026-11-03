@@ -47,6 +47,7 @@ request flow. Fail to the database, never to stale cache.
   query URLs. Max 24 targets, concurrency 2, deadline 10 s, cooldown 30 s. No recursive warm waves.
 - Host `waitUntil` retains started source cleanup after wave abort or deadline. Release Prisma
   admission before source lifetime ends. Canceled waves cannot promote stale results.
+- Warm URLs: same origin, max 8192 characters. Consumer portability rules can set a lower limit.
 - No cold-read, write or auth latency guarantee. Sub-200 ms is a measured warm-read acceptance target.
 
 ## Fences

@@ -310,3 +310,53 @@ it('replays credential-private scoped targets through the native Cache API', asy
     expect(calls).not.toContainEqual(['/api/hot', 'session=b', 'two']);
   } finally { await worker.dispose(); }
 });
+
+const selectedMediaSource = `
+import { wrapReadResponseLease, limitReadResponseLeaseUntil } from './response-lease';
+let now = Date.now();
+Date.now = () => now;
+const calls = [];
+const prefix = 'https://cache.test/api/oversized?q=';
+const wrapped = wrapReadResponseLease(async request => {
+  const url = new URL(request.url);
+  const actor = request.headers.get('cookie'), site = request.headers.get('x-site-id');
+  calls.push([url.href, actor, site]);
+  limitReadResponseLeaseUntil(Date.now() + 10000);
+  return Response.json({ path:url.pathname, actor, site });
+}, { namespace:'selected-native', deployment:'v1', database:'db', seconds:5, paths:['/api/**'], credentialHeaders:['cookie'], cookieNames:['session', 'fresh'], varyHeaders:['x-site-id'], freshnessCookie:'fresh', freshnessCookieMode:'generation', warmup:{ scopeHeader:'x-site-id', catalogScope:'credential', seeds:[prefix + 'a'.repeat(8193 - prefix.length), 'https://other.test/api/forbidden'], portable:url => url.pathname === '/api/media/selected', cooldownMs:0, concurrency:1 } });
+export default { async fetch(request, env) {
+  const path = new URL(request.url).pathname;
+  if (path === '/calls') return Response.json(calls);
+  if (path === '/advance') { now += 30000; return new Response('ok'); }
+  const jobs = [];
+  const response = await wrapped(request, env, { waitUntil(task) { jobs.push(task); } });
+  while (jobs.length) await Promise.all(jobs.splice(0));
+  return response;
+} };`;
+
+it('learns and replays a long selected-media URL in the native credential and site scope', async () => {
+  const bundle = await build({ stdin:{ contents:selectedMediaSource, resolveDir:resolve(__dirname, '../../src'), loader:'ts' }, bundle:true, format:'esm', platform:'neutral', target:'es2022', external:['cloudflare:workers', 'node:async_hooks'], write:false });
+  const output = bundle.outputFiles[0];
+  if (!output) throw Error('bundle missing');
+  const worker = new Miniflare({ modules:true, script:output.text, compatibilityDate:'2026-01-01', compatibilityFlags:['nodejs_compat'] });
+  try {
+    const ids = Array.from({ length:60 }, (_, index) => `media_${index.toString(16).padStart(32, '0')}`);
+    const path = '/api/media/selected?' + new URLSearchParams({ ids:ids.join(','), lang:'en' });
+    const selected = new URL(path, 'https://cache.test').href;
+    expect(selected.length).toBeGreaterThan(2048);
+    const fetch = (target: string, actor: string, site: string) => worker.dispatchFetch(`https://cache.test${target}`, { headers:{ cookie:`session=${actor}`, 'x-site-id':site } });
+    expect((await fetch(path, 'a', 'one')).status).toBe(200);
+    await worker.dispatchFetch('https://cache.test/advance');
+    expect((await fetch('/api/root', 'b', 'one')).status).toBe(200);
+    expect((await fetch('/api/root', 'a', 'one')).status).toBe(200);
+    const expected = [
+      [selected, 'session=a', 'one'],
+      ['https://cache.test/api/root', 'session=b', 'one'],
+      ['https://cache.test/api/root', 'session=a', 'one'],
+      [selected, 'session=a', 'one'],
+    ];
+    expect(await (await worker.dispatchFetch('https://cache.test/calls')).json()).toEqual(expected);
+    expect(await (await fetch(path, 'a', 'one')).json()).toEqual({ path:'/api/media/selected', actor:'session=a', site:'one' });
+    expect(await (await worker.dispatchFetch('https://cache.test/calls')).json()).toEqual(expected);
+  } finally { await worker.dispose(); }
+});

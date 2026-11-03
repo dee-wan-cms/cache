@@ -79,7 +79,7 @@ export function createResponseWarmup<Env, Context>(run: (request: Request, env: 
     const urlFor = (target: string): URL | null => {
       try {
         const url = new URL(target, base);
-        if (url.origin !== base.origin || url.username || url.password || url.hash || url.href.length > 2048 || !eligible(url)) return null;
+        if (url.origin !== base.origin || url.username || url.password || url.hash || url.href.length > 8192 || !eligible(url)) return null;
         return url;
       } catch { return null; }
     };
@@ -138,7 +138,7 @@ export function createResponseWarmup<Env, Context>(run: (request: Request, env: 
     };
     const record = async (url: URL) => {
       const effectiveScope = rootScope ?? scope;
-      if ((catalogScope !== 'credential' && !effectiveScope) || !portable?.(url)) return;
+      if ((catalogScope !== 'credential' && !effectiveScope) || !urlFor(url.href) || !portable?.(url)) return;
       const key = await keyFor(effectiveScope), result = await catalog.regionalRead(key, ttl);
       const entries: Entry[] = Array.isArray(result?.value) ? result.value.filter((v): v is Entry => !!v && typeof v.url === 'string' && typeof v.count === 'number' && Number.isFinite(v.count) && typeof v.time === 'number' && Date.now() - v.time < ttl && !!urlFor(v.url) && (catalogScope !== 'credential' || v.scope === null || validScope(v.scope))).slice(0, maxEntries) : [];
       const existing = entries.find((item) => item.url === url.href && (catalogScope !== 'credential' || item.scope === effectiveScope));
