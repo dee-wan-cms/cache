@@ -1,3 +1,10 @@
+## [2.0.1](https://github.com/dee-wan-cms/cache/compare/v2.0.0...v2.0.1) (2026-11-03)
+
+
+### Bug Fixes
+
+* retain warm sources and D1 ownership ([79cc795](https://github.com/dee-wan-cms/cache/commit/79cc795979f758ee9db85b820074d00ef0d07840))
+
 # [2.0.0](https://github.com/dee-wan-cms/cache/compare/v1.1.0...v2.0.0) (2026-11-02)
 
 
