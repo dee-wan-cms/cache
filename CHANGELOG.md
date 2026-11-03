@@ -1,3 +1,10 @@
+# [2.1.0](https://github.com/dee-wan-cms/cache/compare/v2.0.6...v2.1.0) (2026-11-03)
+
+
+### Features
+
+* refresh scoped reads before expiry ([269067f](https://github.com/dee-wan-cms/cache/commit/269067f099cb975d7488c9e603179cbbfe90f92a))
+
 ## [2.0.6](https://github.com/dee-wan-cms/cache/compare/v2.0.5...v2.0.6) (2026-11-03)
 
 
