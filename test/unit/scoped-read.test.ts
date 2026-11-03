@@ -107,3 +107,109 @@ it('bypasses caching for invalid maximums and TTLs', async () => {
     expect(cache.put).not.toHaveBeenCalled();
   }
 });
+
+it('returns a hit immediately, deduplicates refresh and renews from refresh start', async () => {
+  const { options, setTime } = setup();
+  let release: (() => void) | undefined;
+  let started: (() => void) | undefined;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const ready = new Promise<void>((resolve) => { started = resolve; });
+  const jobs: Promise<void>[] = [];
+  const refreshLoad = vi.fn(async () => { started?.(); await held; return 2; });
+  const refresh = { aheadMs:1000, waitUntil:(task: Promise<void>) => { jobs.push(task); }, load:refreshLoad };
+  await cacheReadValue(options, async () => 1);
+  setTime(104_001);
+  expect(await cacheReadValue({ ...options, refresh }, async () => 9)).toBe(1);
+  await ready;
+  expect(await cacheReadValue({ ...options, refresh }, async () => 9)).toBe(1);
+  expect(refreshLoad).toHaveBeenCalledOnce();
+  setTime(104_100);
+  release?.(); await Promise.all(jobs);
+  setTime(109_000);
+  expect(await cacheReadValue(options, async () => 9)).toBe(2);
+  setTime(109_001);
+  expect(await cacheReadValue(options, async () => 9)).toBe(9);
+});
+
+it('does not refresh when the host declines work or when refresh fails or returns invalid data', async () => {
+  for (const mode of ['declined', 'error', 'invalid', 'late'] as const) {
+    const { options, setTime } = setup();
+    const jobs: Promise<void>[] = [];
+    const load = vi.fn(async () => { if (mode === 'error') throw Error('source'); if (mode === 'late') setTime(110_000); return mode === 'invalid' ? NaN : 2; });
+    const validate = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
+    const refresh = { aheadMs:1000, waitUntil:(task: Promise<void>) => { if (mode === 'declined') throw Error('declined'); jobs.push(task); }, load };
+    await cacheReadValue({ ...options, validate }, async () => 1);
+    setTime(104_500);
+    expect(await cacheReadValue({ ...options, validate, refresh }, async () => 9)).toBe(1);
+    await Promise.all(jobs);
+    if (mode === 'declined') { await Promise.resolve(); expect(load).not.toHaveBeenCalled(); }
+    setTime(105_000);
+    expect(await cacheReadValue({ ...options, validate }, async () => 9)).toBe(9);
+  }
+});
+
+it('keeps refreshes isolated by key and cache instance', async () => {
+  const a = setup(), b = setup();
+  const jobs: Promise<void>[] = [];
+  const load = vi.fn(async () => 2);
+  const refresh = { aheadMs:1000, waitUntil:(task: Promise<void>) => { jobs.push(task); }, load };
+  await cacheReadValue(a.options, async () => 1);
+  await cacheReadValue({ ...a.options, key:'other' }, async () => 1);
+  await cacheReadValue(b.options, async () => 1);
+  a.setTime(104_500); b.setTime(104_500);
+  await cacheReadValue({ ...a.options, refresh }, async () => 9);
+  await cacheReadValue({ ...a.options, key:'other', refresh }, async () => 9);
+  await cacheReadValue({ ...b.options, refresh }, async () => 9);
+  await Promise.all(jobs);
+  expect(load).toHaveBeenCalledTimes(3);
+});
+
+it('does not let a held refresh replace a newer foreground miss', async () => {
+  const { options, setTime } = setup();
+  let release: (() => void) | undefined;
+  let started: (() => void) | undefined;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const ready = new Promise<void>((resolve) => { started = resolve; });
+  const jobs: Promise<void>[] = [];
+  const refresh = { aheadMs:1000, waitUntil:(task: Promise<void>) => { jobs.push(task); }, load:async () => { started?.(); await held; return 2; } };
+  await cacheReadValue(options, async () => 1);
+  setTime(104_500);
+  await cacheReadValue({ ...options, refresh }, async () => 9);
+  await ready;
+  setTime(105_000);
+  expect(await cacheReadValue(options, async () => 3)).toBe(3);
+  release?.(); await Promise.all(jobs);
+  expect(await cacheReadValue(options, async () => 9)).toBe(3);
+});
+
+it('orders a foreground fill after a refresh put already in progress', async () => {
+  const base = setup();
+  let release: (() => void) | undefined;
+  let started: (() => void) | undefined;
+  let foregroundRead: (() => void) | undefined;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const ready = new Promise<void>((resolve) => { started = resolve; });
+  const readReady = new Promise<void>((resolve) => { foregroundRead = resolve; });
+  let puts = 0, matches = 0;
+  const cache: Pick<Cache, 'match' | 'put'> = {
+    match:async (key) => { const response = await base.cache.match(key); if (++matches === 3) foregroundRead?.(); return response; },
+    put:async (key, response) => {
+      if (++puts === 2) { started?.(); await held; }
+      await base.cache.put(key, response);
+    },
+  };
+  const options = { ...base.options, cache };
+  const jobs: Promise<void>[] = [];
+  const refresh = { aheadMs:1000, waitUntil:(task: Promise<void>) => { jobs.push(task); }, load:async () => 2 };
+  await cacheReadValue(options, async () => 1);
+  base.setTime(104_500);
+  await cacheReadValue({ ...options, refresh }, async () => 9);
+  await ready;
+  base.setTime(105_000);
+  const foreground = cacheReadValue(options, async () => 3);
+  await readReady;
+  release?.();
+  expect(await foreground).toBe(3);
+  await Promise.all(jobs);
+  expect(await cacheReadValue(options, async () => 9)).toBe(3);
+});

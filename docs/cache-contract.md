@@ -59,6 +59,10 @@ request flow. Fail to the database, never to stale cache.
 - Warm URLs: same origin, max 8192 characters. Consumer portability rules can set a lower limit.
 - Scoped value reads default to a 5-second TTL cap. Explicit `maxTtlMs` can raise the cap to
   300000 ms; `ttlMs` must fit that cap. Consumer owns scope, validation and accepted staleness.
+- Optional scoped `refresh`: ahead window, host `waitUntil`, explicit fresh loader. Hits return
+  immediately. Refreshes dedupe per cache and key; source-start TTL stays bounded. Failed or late
+  refresh leaves old expiry unchanged. Foreground misses invalidate older refreshes; an already
+  started refresh put completes before the newer foreground put. Loader owns unused body cleanup.
 - No cold-read, write or auth latency guarantee. Sub-200 ms is a measured warm-read acceptance target.
 
 ## Fences

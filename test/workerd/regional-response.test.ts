@@ -77,3 +77,52 @@ export default { fetch(request, env, ctx) {
     expect(await other.json()).toEqual({ call:2 });
   } finally { await worker.dispose(); }
 });
+
+it('refreshes scoped values once across native requests and renews the cached value', async () => {
+  const workerSource = `
+import { cacheReadValue } from './scoped-read';
+let now = 100000, calls = 0, released = false;
+export default { async fetch(request, env, ctx) {
+  const url = new URL(request.url);
+  if (url.pathname === '/time') { now = Number(url.searchParams.get('value')); return new Response(null); }
+  if (url.pathname === '/release') { released = true; return new Response(null); }
+  if (url.pathname === '/state') return Response.json({ calls });
+  const value = await cacheReadValue({ namespace:'native-refresh', key:'key', ttlMs:5000, now:() => now,
+    validate:value => typeof value === 'number', refresh:{ aheadMs:1000, waitUntil:task => ctx.waitUntil(task), load:async () => {
+      calls++;
+      while (!released) await new Promise(resolve => setTimeout(resolve, 5));
+      return 2;
+    } } }, async () => { calls++; return 1; });
+  return Response.json({ value });
+} };`;
+  const bundle = await build({ stdin:{ contents:workerSource, resolveDir:resolve(__dirname, '../../src'), loader:'ts' }, bundle:true, format:'esm', platform:'neutral', target:'es2022', external:['cloudflare:workers', 'node:async_hooks'], write:false });
+  const output = bundle.outputFiles[0];
+  if (!output) throw Error('bundle missing');
+  const worker = new Miniflare({ modules:true, script:output.text, compatibilityDate:'2026-01-01', compatibilityFlags:['nodejs_compat'] });
+  try {
+    const get = (path: string) => worker.dispatchFetch(`https://cache.test${path}`);
+    expect(await (await get('/value')).json()).toEqual({ value:1 });
+    await get('/time?value=104500');
+    const hits = await Promise.all([get('/value'), get('/value')]);
+    expect(await Promise.all(hits.map((response) => response.json()))).toEqual([{ value:1 }, { value:1 }]);
+    const deadline = Date.now() + 5000;
+    let calls = 0;
+    while (Date.now() < deadline) {
+      const state: unknown = await (await get('/state')).json();
+      if (state && typeof state === 'object' && 'calls' in state && typeof state.calls === 'number') calls = state.calls;
+      if (calls === 2) break;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(calls).toBe(2);
+    await get('/release');
+    const end = Date.now() + 5000;
+    let value = 1;
+    while (Date.now() < end && value !== 2) {
+      const result: unknown = await (await get('/value')).json();
+      if (result && typeof result === 'object' && 'value' in result && typeof result.value === 'number') value = result.value;
+      if (value !== 2) await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(value).toBe(2);
+    expect(await (await get('/state')).json()).toEqual({ calls:2 });
+  } finally { await worker.dispose(); }
+});
