@@ -321,11 +321,20 @@ export function createReadResponseLease<Env, Context>(handler: (request: Request
       return conditionalHit(request, cached.response);
     }
     const previousCold = cold.get(key);
-    if (previousCold && !forceSource && !independent && !warming.isInternal(request)) {
+    if (previousCold && !forceSource && !independent) {
+      if (request.signal.aborted) throw request.signal.reason;
       let timer: ReturnType<typeof setTimeout> | undefined;
+      let onAbort: (() => void) | undefined;
       try {
-        await Promise.race([previousCold.done, new Promise<void>((resolve) => { timer = setTimeout(resolve, Math.min(ttl, 5000)); })]);
-      } finally { if (timer !== undefined) clearTimeout(timer); }
+        await Promise.race([
+          previousCold.done,
+          new Promise<void>((resolve) => { timer = setTimeout(resolve, Math.min(ttl, 5000)); }),
+          new Promise<void>((resolve) => { onAbort = () => resolve(); request.signal.addEventListener('abort', onAbort, { once:true }); }),
+        ]);
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+        if (onAbort) request.signal.removeEventListener('abort', onAbort);
+      }
       if (request.signal.aborted) throw request.signal.reason;
       return wrapped(request, env, context, true);
     }
@@ -333,14 +342,20 @@ export function createReadResponseLease<Env, Context>(handler: (request: Request
     const priorRefresh = pending.get(key);
     if (priorRefresh) priorRefresh.valid = false;
     let finish: (() => void) | undefined;
-    const owner = !previousCold && !forceSource && !independent && !warming.isInternal(request) && cold.size < 1024
+    const owner = !previousCold && !forceSource && !independent && cold.size < 1024
       ? { valid:true, done:new Promise<void>((resolve) => { finish = resolve; }) } : undefined;
     if (owner) cold.set(key, owner);
     const release = () => {
       if (!owner) return;
+      request.signal.removeEventListener('abort', onAbort);
       if (cold.get(key) === owner) cold.delete(key);
       finish?.();
     };
+    const onAbort = () => { if (owner) owner.valid = false; release(); };
+    if (owner) {
+      if (request.signal.aborted) onAbort();
+      else request.signal.addEventListener('abort', onAbort, { once:true });
+    }
     const lease: LeaseScope = {};
     const source = noCache(request);
     if (config.freshnessHeader !== undefined) source.headers.set(config.freshnessHeader, '1');

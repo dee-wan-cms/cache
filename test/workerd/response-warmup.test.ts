@@ -426,3 +426,65 @@ export default { async fetch(request, env) {
     expect(await (await worker.dispatchFetch('https://cache.test/calls')).json()).toEqual([['/api/root', null], ['/api/layout', null], ['/api/layout', 'one']]);
   } finally { await worker.dispose(); }
 });
+
+it.each(['warm-first', 'foreground-first', 'warm-cancel'] as const)('handles native cold lease overlap: %s', async (order) => {
+  const overlap = `
+import { wrapReadResponseLease, limitReadResponseLeaseUntil } from './response-lease';
+let seedCalls = 0, incoming = 0, released = false;
+const wrapped = wrapReadResponseLease(async request => {
+  const path = new URL(request.url).pathname;
+  if (path === '/api/seed') {
+    seedCalls++;
+    while (!released && !request.signal.aborted) await new Promise(resolve => setTimeout(resolve, 5));
+  }
+  limitReadResponseLeaseUntil(Date.now() + 5000);
+  return Response.json({ path });
+}, { namespace:'native-cold-warm-${order}', deployment:'v1', database:'db', seconds:5, paths:['/api/**'], credentialHeaders:['cookie'], cookieNames:['session','fresh'], varyHeaders:['x-site-id'], freshnessCookie:'fresh', freshnessCookieMode:'generation', warmup:{ scopeHeader:'x-site-id', seeds:['/api/seed'], concurrency:1 } });
+export default { fetch(request, env, ctx) {
+  const path = new URL(request.url).pathname;
+  if (path === '/state') return Response.json({ seedCalls, incoming });
+  if (path === '/release') { released = true; return new Response(null, { status:204 }); }
+  if (path === '/api/seed') incoming++;
+  return wrapped(request, env, ctx);
+} };`;
+  const bundle = await build({ stdin:{ contents:overlap, resolveDir:resolve(__dirname, '../../src'), loader:'ts' }, bundle:true, format:'esm', platform:'neutral', target:'es2022', external:['cloudflare:workers', 'node:async_hooks'], write:false });
+  const output = bundle.outputFiles[0];
+  if (!output) throw Error('bundle missing');
+  const worker = new Miniflare({ modules:true, script:output.text, compatibilityDate:'2026-01-01', compatibilityFlags:['nodejs_compat'] });
+  try {
+    const fetch = (path: string) => worker.dispatchFetch(`https://cache.test${path}`, { headers:{ cookie:'session=a', 'x-site-id':'one' } });
+    const state = async () => {
+      const value: unknown = await (await worker.dispatchFetch('https://cache.test/state')).json();
+      if (!value || typeof value !== 'object' || !('seedCalls' in value) || !('incoming' in value) || typeof value.seedCalls !== 'number' || typeof value.incoming !== 'number') throw Error('invalid state');
+      return { seedCalls:value.seedCalls, incoming:value.incoming };
+    };
+    const until = async (ready: (value: Awaited<ReturnType<typeof state>>) => boolean) => {
+      const deadline = Date.now() + 5000;
+      while (Date.now() < deadline) {
+        const value = await state();
+        if (ready(value)) return value;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      throw Error('worker readiness not reached');
+    };
+    let foreground: ReturnType<typeof fetch>;
+    if (order === 'warm-first' || order === 'warm-cancel') {
+      expect((await fetch('/api/root')).status).toBe(200);
+      await until((value) => value.seedCalls === 1);
+      if (order === 'warm-cancel') {
+        const mutation = await worker.dispatchFetch('https://cache.test/api/root', { method:'POST', headers:{ cookie:'session=a', 'x-site-id':'one' } });
+        expect(mutation.status).toBe(200);
+      }
+      foreground = fetch('/api/seed');
+      expect((await until((value) => value.incoming === 1)).seedCalls).toBe(1);
+    } else {
+      foreground = fetch('/api/seed');
+      await until((value) => value.seedCalls === 1);
+      expect((await fetch('/api/root')).status).toBe(200);
+    }
+    await worker.dispatchFetch('https://cache.test/release');
+    expect(await (await foreground).json()).toEqual({ path:'/api/seed' });
+    expect(await (await fetch('/api/seed')).json()).toEqual({ path:'/api/seed' });
+    expect((await state()).seedCalls).toBe(order === 'warm-cancel' ? 2 : 1);
+  } finally { await worker.dispose(); }
+});

@@ -54,7 +54,8 @@ request flow. Fail to the database, never to stale cache.
   the same URL under its own header key.
 - HTTP lease cold fills coalesce within one isolate and credential key, up to 1024 active keys.
   Followers wait at most 5 seconds, then recheck cache and bookmark floors. No source response sharing.
-  Fresh reads and internal warm jobs bypass this wait. Failed fills fall back to source.
+  Warm jobs and foreground reads share the fill. Fresh reads bypass the wait. Aborting an owner
+  releases its waiters and rejects its later fill. Failed fills fall back to source.
 - Warm URLs: same origin, max 8192 characters. Consumer portability rules can set a lower limit.
 - Scoped value reads default to a 5-second TTL cap. Explicit `maxTtlMs` can raise the cap to
   300000 ms; `ttlMs` must fit that cap. Consumer owns scope, validation and accepted staleness.

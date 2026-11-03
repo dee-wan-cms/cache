@@ -1056,3 +1056,83 @@ it('drops an expired queued lease warmup across actors', async () => {
   release?.();
   await ctx.drain();
 });
+
+it.each(['warm-first', 'foreground-first'] as const)('shares the same lease when %s overlaps', async (order) => {
+  let release: (() => void) | undefined;
+  let started: (() => void) | undefined;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const ready = new Promise<void>((resolve) => { started = resolve; });
+  const calls: string[] = [];
+  const wrapped = wrapReadResponseLease(async (request) => {
+    const path = new URL(request.url).pathname;
+    calls.push(path);
+    if (path === '/api/seed') { started?.(); await held; }
+    limitReadResponseLeaseUntil(Date.now() + 5000);
+    return Response.json({ path });
+  }, { ...options, namespace:`cold-warm-${order}`, warmup:{ scopeHeader:'x-site-id', seeds:['/api/seed'], concurrency:1 } });
+  const ctx = context();
+  if (order === 'warm-first') {
+    await wrapped(req('/api/root'), {}, ctx);
+    await ready;
+    const foreground = wrapped(req('/api/seed'), {}, undefined);
+    release?.();
+    expect(await (await foreground).json()).toEqual({ path:'/api/seed' });
+  } else {
+    const foreground = wrapped(req('/api/seed'), {}, ctx);
+    await ready;
+    await wrapped(req('/api/root'), {}, ctx);
+    release?.();
+    expect(await (await foreground).json()).toEqual({ path:'/api/seed' });
+  }
+  await ctx.drain();
+  expect(calls.filter((path) => path === '/api/seed')).toHaveLength(1);
+});
+
+it('lets foreground read after an aborted warm owner', async () => {
+  let started: (() => void) | undefined;
+  const ready = new Promise<void>((resolve) => { started = resolve; });
+  let seedCalls = 0;
+  const wrapped = wrapReadResponseLease(async (request) => {
+    const path = new URL(request.url).pathname;
+    if (path === '/api/seed' && ++seedCalls === 1) {
+      started?.();
+      await new Promise<void>((resolve) => {
+        if (request.signal.aborted) resolve();
+        else request.signal.addEventListener('abort', () => resolve(), { once:true });
+      });
+    }
+    limitReadResponseLeaseUntil(Date.now() + 5000);
+    return Response.json({ path, seedCalls });
+  }, { ...options, namespace:'aborted-warm-owner', warmup:{ scopeHeader:'x-site-id', seeds:['/api/seed'], concurrency:1 } });
+  const ctx = context();
+  await wrapped(req('/api/root'), {}, ctx);
+  await ready;
+  await wrapped(new Request('https://example.test/api/root', { method:'POST', headers:{ cookie:'session=a', 'x-site-id':'one' } }), {}, ctx);
+  const foreground = await wrapped(req('/api/seed'), {}, undefined);
+  expect(await foreground.json()).toEqual({ path:'/api/seed', seedCalls:2 });
+  await ctx.drain();
+  expect(seedCalls).toBe(2);
+});
+
+it('releases an aborted warm owner even if its source ignores cancellation', async () => {
+  vi.useFakeTimers({ toFake:['setTimeout', 'clearTimeout', 'Date'] });
+  let release: (() => void) | undefined;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let seedCalls = 0;
+  const wrapped = wrapReadResponseLease(async (request) => {
+    const path = new URL(request.url).pathname;
+    if (path === '/api/seed' && ++seedCalls === 1) await held;
+    limitReadResponseLeaseUntil(Date.now() + 5000);
+    return Response.json({ path, seedCalls });
+  }, { ...options, namespace:'ignored-abort-warm-owner', warmup:{ scopeHeader:'x-site-id', seeds:['/api/seed'], concurrency:1 } });
+  const ctx = context();
+  await wrapped(req('/api/root'), {}, ctx);
+  await driveUntil(() => seedCalls === 1);
+  await wrapped(new Request('https://example.test/api/root', { method:'POST', headers:{ cookie:'session=a', 'x-site-id':'one' } }), {}, ctx);
+  await vi.advanceTimersByTimeAsync(25);
+  const foreground = await wrapped(req('/api/seed'), {}, undefined);
+  expect(await foreground.json()).toEqual({ path:'/api/seed', seedCalls:2 });
+  expect(seedCalls).toBe(2);
+  release?.();
+  await ctx.drain();
+});
