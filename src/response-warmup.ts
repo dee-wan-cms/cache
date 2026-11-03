@@ -211,7 +211,11 @@ export function createResponseWarmup<Env, Context>(run: (request: Request, env: 
         internal.set(warm, { generation:current, isCurrent });
         const task = Promise.resolve().then(() => run(warm, env, context));
         started = true;
-        void task.then((response) => { if (abort.signal.aborted) void response.body?.cancel().catch(() => undefined); releaseSlot(); }, () => { releaseSlot(); });
+        const completion = task.then((response) => { if (abort.signal.aborted) void response.body?.cancel().catch(() => undefined); releaseSlot(); }, () => { releaseSlot(); });
+        try {
+          const wait = context && typeof context === 'object' ? Reflect.get(context, 'waitUntil') : undefined;
+          if (typeof wait === 'function') Reflect.apply(wait, context, [completion]);
+        } catch { /* Source cleanup remains best effort when the host declines it. */ }
         const result = await Promise.race([task, new Promise<never>((_, reject) => abort.signal.addEventListener('abort', () => reject(Error('warmup deadline')), { once:true }))]);
         if (verified.has(warm) && result.status === 200 && stillCurrent() && Date.now() < end) await inspect(new URL(target.url), result);
         void result.body?.cancel().catch(() => undefined);

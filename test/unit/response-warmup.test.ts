@@ -405,6 +405,8 @@ it('retires the lifecycle, cancels queued work and prevents late fills from star
   }, { ...options, namespace:'warm-lifecycle', warmup:{ scopeHeader:'x-site-id', seeds:['/api/seed'], concurrency:1, isCurrent:() => current } });
   const ctx = context();
   await wrapped(req('/api/root', 'session=a'), {}, ctx); await warmStarted;
+  const firstBatch = ctx.jobs[1];
+  if (!firstBatch) throw new Error('warm batch was not registered');
   const beforeSecond = ctx.jobs.length;
   await wrapped(req('/api/root', 'session=b'), {}, ctx); await ctx.jobs[beforeSecond];
   const late = wrapped(req('/api/late', 'session=c'), {}, ctx);
@@ -413,7 +415,7 @@ it('retires the lifecycle, cancels queued work and prevents late fills from star
   expect(aborted).toBe(true);
   releaseLate?.();
   expect(await (await late).json()).toEqual({ path:'/api/late' });
-  await ctx.drain();
+  await firstBatch;
   expect(calls.filter((call) => call.startsWith('/api/seed:'))).toEqual(['/api/seed:session=a']);
   releaseWarm?.();
   expect(await (await wrapped(req('/api/after', 'session=d'), {}, ctx)).json()).toEqual({ path:'/api/after' });
@@ -851,6 +853,8 @@ it('drops an expired queued lease warmup across actors', async () => {
   const ctx = context();
   await wrapped(req('/api/root', 'session=a'), {}, ctx);
   await firstStarted;
+  const firstBatch = ctx.jobs[1];
+  if (!firstBatch) throw new Error('first warm batch was not registered');
   now += 90;
   const nativeTimer = globalThis.setTimeout;
   vi.spyOn(globalThis, 'setTimeout').mockImplementation((callback, delay, ...args) => {
@@ -860,9 +864,12 @@ it('drops an expired queued lease warmup across actors', async () => {
   const nextJob = ctx.jobs.length;
   await wrapped(req('/api/root', 'session=b'), {}, ctx);
   await ctx.jobs[nextJob];
+  const secondBatch = ctx.jobs[nextJob + 1];
+  if (!secondBatch) throw new Error('second warm batch was not registered');
   await secondQueued;
   now += 101;
-  await ctx.drain();
+  await Promise.all([firstBatch, secondBatch]);
   expect(calls).toEqual(['session=a']);
   release?.();
+  await ctx.drain();
 });

@@ -45,6 +45,8 @@ request flow. Fail to the database, never to stale cache.
   Capacity overflow or reuse of a failed write token keeps the isolate disabled.
 - Generated warmup: authorized generated GETs only; same credentials; bounded seeds and recent exact
   query URLs. Max 24 targets, concurrency 2, deadline 10 s, cooldown 30 s. No recursive warm waves.
+- Host `waitUntil` retains started source cleanup after wave abort or deadline. Release Prisma
+  admission before source lifetime ends. Canceled waves cannot promote stale results.
 - No cold-read, write or auth latency guarantee. Sub-200 ms is a measured warm-read acceptance target.
 
 ## Fences

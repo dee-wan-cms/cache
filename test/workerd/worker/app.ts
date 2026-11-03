@@ -5,6 +5,7 @@ import type { CacheShape, CacheStore, CacheTestHooks, InvalidationTarget } from 
 
 import { createDurableObjectStore } from "../../../dist/cloudflare/index.js";
 import { createCacheExtension } from "../../../dist/index.js";
+import { limitReadResponseLeaseUntil, wrapReadResponseLease } from "../../../dist/response-lease.js";
 import { createD1CacheRuntime, fenceD1Writes, withD1PrismaCache, wrapD1ReadSessionHandler, prismaD1SessionDatabase, runD1SessionOperation } from "../../../dist/d1/index.js";
 import { cacheConfig } from "../generated/cache/cache-config";
 import { Prisma, PrismaClient } from "../generated/prisma";
@@ -264,9 +265,10 @@ async function run(request: RunRequest, env: Env, ctx: ExecutionContext): Promis
 const sessionOptions = { bindingNames:['DB'], bindingPrefixes:['SITE_'], databaseIdsEnv:'SESSION_IDS' };
 let sessionClientCount = 0;
 let sessionCacheHits = 0;
-function createSessionClient(database: D1Database, env: Env) {
+function createSessionClient(database: D1Database, env: Env, beforeRead?: () => Promise<void>, onAdmission?: (operation: string) => void) {
   const underlying = createDurableObjectStore(env.COORDINATOR, { name:'session-prisma-cache' });
   const store: CacheStore = { ...underlying, async read(input) {
+    if (beforeRead) await beforeRead();
     const result = await underlying.read(input);
     if (result.kind === 'hit') sessionCacheHits++;
     return result;
@@ -274,7 +276,7 @@ function createSessionClient(database: D1Database, env: Env) {
   const profile = { envPrefix:'SESSION', bindingNames:['DB'], bindingPrefixes:[], coordinatorNamePrefix:'session:', coordinatorClass:'CacheCoordinator', readModels:['User'], unfencedWriteTables:[] };
   const fenced = createD1CacheRuntime(database, { store, databaseId:'00000000-0000-0000-0000-000000000001', generation:'1', profile });
   const base = new PrismaClient({ adapter:new PrismaD1(prismaD1SessionDatabase(fenced)) });
-  const admitted = base.$extends({ query:{ $allOperations({ args, query }) { return runD1SessionOperation(fenced, async () => query(args)); } } });
+  const admitted = base.$extends({ query:{ $allOperations({ args, query, operation }) { onAdmission?.(operation); return runD1SessionOperation(fenced, async () => query(args)); } } });
   return withD1PrismaCache(admitted, fenced, cacheConfig, { scope:'session-test' }, Prisma.Decimal);
 }
 const sessionClients = new WeakMap<D1Database, ReturnType<typeof createSessionClient>>();
@@ -288,17 +290,196 @@ const sessionHandler = wrapD1ReadSessionHandler(async (request: Request, env: En
   const url = new URL(request.url);
   const name = url.searchParams.get('name') ?? '';
   if (request.method === 'POST') await client.user.create({ data:{ email:`${name}@example.test`, name } });
+  if (url.searchParams.has('unique')) {
+    const scopedClient = client;
+    const getUnique = () => scopedClient.user.findUnique({ where:{ email:`${name}@example.test` } });
+    const getFirst = () => scopedClient.user.findFirst({ where:{ name } });
+    const [unique, first] = url.searchParams.has('sequential')
+      ? [await getUnique(), await getFirst()]
+      : await Promise.all([getUnique(), getFirst()]);
+    return Response.json({ unique, first, clientCount:sessionClientCount, cacheHits:sessionCacheHits });
+  }
   const rows = await client.user.findMany({ where:{ name } });
   const batch = url.searchParams.has('batch') ? await client.$transaction([client.user.findMany({ where:{ name } }), client.user.count({ where:{ name } })]) : null;
   const alias = await env.SITE_alias.prepare('SELECT COUNT(*) AS total FROM User WHERE name = ?').bind(name).first();
   return Response.json({ rows, batch, alias, clientCount:sessionClientCount, cacheHits:sessionCacheHits });
 }, sessionOptions);
 
+async function sessionPendingWriteRace(env: Env, ctx: ExecutionContext): Promise<Response> {
+  let entered!: () => void;
+  let release!: () => void;
+  let writerStarted!: () => void;
+  let fenceReady!: () => void;
+  let startWriter!: () => void;
+  const readEntered = new Promise<void>((resolve) => { entered = resolve; });
+  const proceed = new Promise<void>((resolve) => { release = resolve; });
+  const writerEntered = new Promise<void>((resolve) => { writerStarted = resolve; });
+  const fenced = new Promise<void>((resolve) => { fenceReady = resolve; });
+  const writerGo = new Promise<void>((resolve) => { startWriter = resolve; });
+  const ids = JSON.stringify({ DB:'00000000-0000-0000-0000-000000000001' });
+  const coordinator = createDurableObjectStore(env.COORDINATOR, { name:'session-prisma-cache' });
+  let client: ReturnType<typeof createSessionClient> | undefined;
+  let held = false;
+  const handler = wrapD1ReadSessionHandler(async (request: Request, scoped: Env & { SESSION_IDS:string }) => {
+    client ??= createSessionClient(scoped.DB, scoped, async () => {
+      if (held) return;
+      held = true;
+      entered();
+      await proceed;
+    }, (operation) => { if (operation === 'create') writerStarted(); });
+    if (request.method === 'POST') {
+      await client.user.create({ data:{ email:'race-writer@example.test', name:'race-writer' } });
+      return Response.json({ written:true });
+    }
+    const rows = await client.user.findMany({ where:{ name:'race-reader' } });
+    return Response.json({ rows });
+  }, sessionOptions);
+  const scoped = { ...env, SESSION_IDS:ids };
+  const write = (async () => {
+    await coordinator.beginWrite({ fences:['g'], generation:'1', leaseMs:60_000, token:'session-race' });
+    try {
+      fenceReady();
+      await writerGo;
+      return await handler(new Request('https://fixture.test/write', { method:'POST' }), scoped, ctx);
+    } finally { await coordinator.endWrite({ fences:['g'], token:'session-race' }); }
+  })();
+  try {
+    await fenced;
+    const read = handler(new Request('https://fixture.test/read'), scoped, ctx);
+    await readEntered;
+    startWriter();
+    await writerEntered;
+    release();
+    const [readResponse, writeResponse] = await Promise.all([read, write]);
+    return Response.json({ read:await readResponse.json(), write:await writeResponse.json(), readBookmark:readResponse.headers.get('X-Dee-Wan-D1-Bookmarks'), writeBookmark:writeResponse.headers.get('X-Dee-Wan-D1-Bookmarks') });
+  } finally {
+    release();
+    startWriter();
+  }
+}
+
+async function sessionWarmWriteRace(env: Env, ctx: ExecutionContext): Promise<Response> {
+  let entered!: () => void;
+  let release!: () => void;
+  let writerStarted!: () => void;
+  const warmEntered = new Promise<void>((resolve) => { entered = resolve; });
+  const proceed = new Promise<void>((resolve) => { release = resolve; });
+  const writerEntered = new Promise<void>((resolve) => { writerStarted = resolve; });
+  const ids = JSON.stringify({ DB:'00000000-0000-0000-0000-000000000001' });
+  let client: ReturnType<typeof createSessionClient> | undefined;
+  let held = false;
+  const origin = wrapD1ReadSessionHandler(async (request: Request, scoped: Env & { SESSION_IDS:string }) => {
+    const path = new URL(request.url).pathname;
+    if (path === '/trigger') { limitReadResponseLeaseUntil(Date.now() + 5000); return Response.json({ ok:true }); }
+    client ??= createSessionClient(scoped.DB, scoped, async () => {
+      if (held) return;
+      held = true;
+      entered();
+      await proceed;
+    }, (operation) => { if (operation === 'create') writerStarted(); });
+    if (request.method === 'POST') {
+      await client.user.create({ data:{ email:'warm-writer@example.test', name:'warm-writer' } });
+      return Response.json({ written:true });
+    }
+    const rows = await client.user.findMany({ where:{ name:'race-reader' } });
+    limitReadResponseLeaseUntil(Date.now() + 5000);
+    return Response.json({ rows });
+  }, sessionOptions);
+  const wrapped = wrapReadResponseLease(origin, {
+    namespace:'session-warm-race', deployment:'test', database:'db', seconds:5,
+    paths:['/trigger', '/warm-a', '/warm-b'], credentialHeaders:['cookie'], varyHeaders:['x-site-id'], freshnessCookie:'fresh',
+    warmup:{ scopeHeader:'x-site-id', seeds:['/warm-a', '/warm-b'], maxTargets:3, concurrency:2, maxMilliseconds:10_000 },
+  });
+  const gateway = wrapD1ReadSessionHandler(wrapped, sessionOptions);
+  const tasks: Promise<unknown>[] = [];
+  const execution = { waitUntil(task: Promise<unknown>) { tasks.push(task); }, passThroughOnException:() => ctx.passThroughOnException(), props:ctx.props };
+  const scoped = { ...env, SESSION_IDS:ids };
+  const headers = { cookie:'session=actor', 'x-site-id':'site-a' };
+  try {
+    const trigger = await gateway(new Request('https://fixture.test/trigger', { headers }), scoped, execution);
+    await trigger.json();
+    const drained = (async () => { while (tasks.length) await Promise.all(tasks.splice(0)); })();
+    const warmStarted = await Promise.race([warmEntered.then(() => true), drained.then(() => false)]);
+    if (!warmStarted) throw new Error('warmup completed before the Prisma read started');
+    const write = gateway(new Request('https://fixture.test/write', { method:'POST', headers }), scoped, execution);
+    const writerReachedAdmission = await Promise.race([writerEntered.then(() => true), write.then(() => false)]);
+    if (!writerReachedAdmission) throw new Error('writer completed before Prisma admission');
+    release();
+    const result = await write;
+    await drained;
+    return Response.json({ status:result.status, body:await result.json(), bookmark:result.headers.get('X-Dee-Wan-D1-Bookmarks') });
+  } finally { release(); }
+}
+
+type AbortedWarmFixture = {
+  entered: boolean;
+  settled: Set<number>;
+  release: () => void;
+  fetch: (request: Request, context: ExecutionContext) => Promise<Response>;
+};
+let abortedWarmFixture: AbortedWarmFixture | undefined;
+
+function createAbortedWarmFixture(env: Env): AbortedWarmFixture {
+  let release!: () => void;
+  const proceed = new Promise<void>((resolve) => { release = resolve; });
+  const state: AbortedWarmFixture = { entered:false, settled:new Set(), release, fetch:async () => new Response(null, { status:500 }) };
+  const scoped = { ...env, SESSION_IDS:JSON.stringify({ DB:'00000000-0000-0000-0000-000000000001' }) };
+  let client: ReturnType<typeof createSessionClient> | undefined;
+  let held = false;
+  const origin = wrapD1ReadSessionHandler(async (request: Request, value: Env & { SESSION_IDS:string }) => {
+    const path = new URL(request.url).pathname;
+    if (path === '/warm-abort/trigger' || path === '/warm-abort/cancel') {
+      limitReadResponseLeaseUntil(Date.now() + 5000);
+      return Response.json({ ok:true });
+    }
+    client ??= createSessionClient(value.DB, value, async () => {
+      if (held) return;
+      held = true;
+      state.entered = true;
+      await proceed;
+    });
+    if (request.method === 'POST') {
+      await client.user.create({ data:{ email:'abort-writer@example.test', name:'abort-writer' } });
+      return Response.json({ written:true });
+    }
+    const rows = await client.user.findMany({ where:{ name:'race-reader' } });
+    limitReadResponseLeaseUntil(Date.now() + 5000);
+    return Response.json({ rows });
+  }, sessionOptions);
+  const lease = wrapReadResponseLease(origin, {
+    namespace:'session-warm-abort', deployment:'test', database:'db', seconds:5,
+    paths:['/warm-abort/*'], credentialHeaders:['cookie'], varyHeaders:['x-site-id'], freshnessCookie:'fresh',
+    warmup:{ scopeHeader:'x-site-id', seeds:['/warm-abort/read'], maxTargets:2, concurrency:1, maxMilliseconds:10_000 },
+  });
+  const gateway = wrapD1ReadSessionHandler(lease, sessionOptions);
+  let index = 0;
+  state.fetch = (request, context) => {
+    const execution = {
+      waitUntil(task: Promise<unknown>) {
+        const position = index++;
+        context.waitUntil(task.finally(() => { state.settled.add(position); }));
+      },
+      passThroughOnException:() => context.passThroughOnException(), props:context.props,
+    };
+    return gateway(request, scoped, execution);
+  };
+  return state;
+}
+
 export async function handle(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   if (env.SMOKE_TOKEN !== undefined && request.headers.get("x-smoke-token") !== env.SMOKE_TOKEN) {
     return new Response("forbidden", { status: 403 });
   }
   const url = new URL(request.url);
+  if (url.pathname === '/warm-abort/status') return Response.json({ entered:abortedWarmFixture?.entered ?? false, batchDone:abortedWarmFixture?.settled.has(1) ?? false });
+  if (url.pathname === '/warm-abort/release') { abortedWarmFixture?.release(); return Response.json({ ok:true }); }
+  if (url.pathname === '/warm-abort/trigger') abortedWarmFixture = createAbortedWarmFixture(env);
+  if (url.pathname.startsWith('/warm-abort/')) {
+    if (!abortedWarmFixture) return new Response(null, { status:400 });
+    return abortedWarmFixture.fetch(request, ctx);
+  }
+  if (url.pathname === '/session-pending-write-race') return sessionPendingWriteRace(env, ctx);
+  if (url.pathname === '/session-warm-write-race') return sessionWarmWriteRace(env, ctx);
   if (url.pathname === '/session') return sessionHandler(request, { ...env, SITE_alias:env.DB, SESSION_IDS:JSON.stringify({ DB:'00000000-0000-0000-0000-000000000001', SITE_alias:'00000000-0000-0000-0000-000000000001' }) }, ctx);
   if (url.pathname === "/isolate") {
     isolateId ??= crypto.randomUUID();

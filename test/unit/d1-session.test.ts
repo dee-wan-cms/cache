@@ -5,7 +5,7 @@ import { cacheRegionalResponse } from '../../src/d1/regional-response';
 import { createCacheExtension } from '../../src/core/extension';
 import { CONFIG_FORMAT } from '../../src/core/limits';
 import type { CacheStore, GeneratedCacheConfig } from '../../src/core/types';
-import { prismaD1SessionDatabase, runD1SessionOperation, runD1PrismaScope, d1SessionCacheHooks, sessionD1Env, wrapD1ReadSessionHandler } from '../../src/d1/session';
+import { prismaD1SessionDatabase, registerD1SessionAlias, runD1SessionOperation, runD1PrismaScope, d1SessionCacheHooks, sessionD1Env, wrapD1ReadSessionHandler } from '../../src/d1/session';
 import { D1_BOOKMARK_HEADER } from '../../src/d1/bookmarks';
 
 const id = '00000000-0000-0000-0000-000000000001';
@@ -46,6 +46,44 @@ function mockDatabase() {
 }
 
 describe('D1 session facade', () => {
+  it('reuses an existing session facade without stripping registered wrappers', async () => {
+    const { db, anchors } = mockDatabase();
+    const env = { DB:db, IDS:JSON.stringify({ DB:id }) };
+    const once = sessionD1Env(env, options);
+    const twice = sessionD1Env(once, options);
+    expect(twice.DB).toBe(once.DB);
+    const otherPolicy = sessionD1Env(once, { ...options, primaryBindings:[] });
+    expect(otherPolicy.DB).not.toBe(once.DB);
+    expect(sessionD1Env(otherPolicy, options).DB).toBe(once.DB);
+    const alias: D1Database = {
+      prepare:vi.fn(once.DB.prepare), batch:once.DB.batch, exec:once.DB.exec,
+      withSession:once.DB.withSession, dump:once.DB.dump,
+    };
+    registerD1SessionAlias(alias, once.DB);
+    expect(sessionD1Env({ ...env, DB:alias }, options).DB).toBe(alias);
+    expect(() => sessionD1Env({ ...env, DB:alias }, { ...options, primaryBindings:[] })).toThrow();
+    const prisma = prismaD1SessionDatabase(once.DB);
+    expect(sessionD1Env({ ...env, DB:prisma }, options).DB).toBe(prisma);
+    expect(() => sessionD1Env({ ...once, IDS:JSON.stringify({ DB:'00000000-0000-0000-0000-000000000002' }) }, options)).toThrow();
+    const inner = wrapD1ReadSessionHandler(async (_request, scoped: typeof env) => {
+      await scoped.DB.prepare('SELECT 1').first();
+      return new Response('ok');
+    }, options);
+    const outer = wrapD1ReadSessionHandler((request, scoped: typeof env) => inner(request, scoped, null), options);
+    const response = await outer(new Request('https://example.test/'), env, null);
+    expect(response.status).toBe(200);
+    expect(anchors).toEqual(['first-primary']);
+    expect(JSON.parse(response.headers.get(D1_BOOKMARK_HEADER) ?? '{}')).toEqual({ [id]:'00000001' });
+    const aliasResponse = await inner(new Request('https://example.test/'), { ...env, DB:alias }, null);
+    expect(aliasResponse.status).toBe(200);
+    expect(alias.prepare).toHaveBeenCalled();
+    const prismaHandler = wrapD1ReadSessionHandler(async (_request, scoped: typeof env) => {
+      await runD1SessionOperation(scoped.DB, () => scoped.DB.prepare('SELECT 1').first());
+      return new Response('ok');
+    }, options);
+    const prismaResponse = await prismaHandler(new Request('https://example.test/'), { ...env, DB:prisma }, null);
+    expect(JSON.parse(prismaResponse.headers.get(D1_BOOKMARK_HEADER) ?? '{}')).toEqual({ [id]:'00000003' });
+  });
   it('preserves absent configuration and shares one physical session across aliases', async () => {
     const { db, anchors } = mockDatabase();
     const absent = { DB:db };
@@ -172,6 +210,121 @@ it('times out queued Prisma admission without disturbing its active owner', asyn
     await owner;
     await next;
     expect(nextStarted).toBe(true);
+  } finally { vi.useRealTimers(); }
+});
+
+it('admits a nested operation while preserving queued request order and bookmarks', async () => {
+  vi.useFakeTimers();
+  try {
+    const { db } = mockDatabase();
+    const env = { DB:db, IDS:JSON.stringify({ DB:id }) };
+    const facade = sessionD1Env(env, options).DB;
+    const prisma = prismaD1SessionDatabase(facade);
+    const events: string[] = [];
+    let entered!: () => void;
+    let continueOwner!: () => void;
+    const inside = new Promise<void>((resolve) => { entered = resolve; });
+    const proceed = new Promise<void>((resolve) => { continueOwner = resolve; });
+    const handler = wrapD1ReadSessionHandler(async (request) => {
+      const name = new URL(request.url).pathname.slice(1);
+      await runD1SessionOperation(facade, async () => {
+        events.push(`${name}:start`);
+        if (name === 'owner') {
+          entered();
+          await proceed;
+          await runD1SessionOperation(facade, async () => {
+            events.push('nested:start');
+            await prisma.prepare('SELECT 1').first();
+            events.push('nested:end');
+          });
+        } else {
+          await prisma.prepare('SELECT 1').first();
+        }
+        events.push(`${name}:end`);
+      });
+      return new Response('ok');
+    }, options);
+    const owner = handler(new Request('https://example.test/owner'), env, null);
+    const ownerResult = owner.then((response) => response, (error: Error) => error);
+    await inside;
+    const first = handler(new Request('https://example.test/first'), env, null);
+    const second = handler(new Request('https://example.test/second'), env, null);
+    const results = Promise.all([first, second]).then((responses) => responses, (error: Error) => error);
+    continueOwner();
+    await vi.advanceTimersByTimeAsync(30_000);
+    const response = await ownerResult;
+    expect(response).toBeInstanceOf(Response);
+    if (!(response instanceof Response)) throw response;
+    const others = await results;
+    if (!Array.isArray(others)) throw others;
+    expect(events).toEqual(['owner:start', 'nested:start', 'nested:end', 'owner:end', 'first:start', 'first:end', 'second:start', 'second:end']);
+    expect(JSON.parse(response.headers.get(D1_BOOKMARK_HEADER) ?? '{}')).toEqual({ [id]:'00000001' });
+    expect(others.map((item) => JSON.parse(item.headers.get(D1_BOOKMARK_HEADER) ?? '{}'))).toEqual([{ [id]:'00000002' }, { [id]:'00000003' }]);
+  } finally { vi.useRealTimers(); }
+});
+
+it('admits a nested operation without a request session while another operation waits', async () => {
+  vi.useFakeTimers();
+  try {
+    const { db } = mockDatabase();
+    const facade = sessionD1Env({ DB:db, IDS:JSON.stringify({ DB:id }) }, options).DB;
+    const events: string[] = [];
+    let entered!: () => void;
+    let resume!: () => void;
+    const inside = new Promise<void>((resolve) => { entered = resolve; });
+    const proceed = new Promise<void>((resolve) => { resume = resolve; });
+    const owner = runD1SessionOperation(facade, async () => {
+      events.push('owner');
+      entered();
+      await proceed;
+      await runD1SessionOperation(facade, async () => { events.push('nested'); });
+    });
+    const outcome = owner.then(() => null, (error: Error) => error);
+    await inside;
+    const waiting = runD1SessionOperation(facade, async () => { events.push('waiting'); });
+    const queued = waiting.then(() => null, (error: Error) => error);
+    resume();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(await outcome).toBeNull();
+    expect(await queued).toBeNull();
+    expect(events).toEqual(['owner', 'nested', 'waiting']);
+  } finally { vi.useRealTimers(); }
+});
+
+it('admits sibling operations from the active request ahead of another queued request', async () => {
+  vi.useFakeTimers();
+  try {
+    const { db } = mockDatabase();
+    const env = { DB:db, IDS:JSON.stringify({ DB:id }) };
+    const facade = sessionD1Env(env, options).DB;
+    const events: string[] = [];
+    let firstEntered!: () => void;
+    let nextSibling!: () => void;
+    let bothEntered!: () => void;
+    const firstReady = new Promise<void>((resolve) => { firstEntered = resolve; });
+    const proceed = new Promise<void>((resolve) => { nextSibling = resolve; });
+    const bothReady = new Promise<void>((resolve) => { bothEntered = resolve; });
+    const handler = wrapD1ReadSessionHandler(async (request) => {
+      if (new URL(request.url).pathname === '/owner') {
+        const first = runD1SessionOperation(facade, async () => {
+          events.push('first');
+          firstEntered();
+          await bothReady;
+        });
+        await proceed;
+        const second = runD1SessionOperation(facade, async () => { events.push('second'); bothEntered(); });
+        await Promise.all([first, second]);
+      } else await runD1SessionOperation(facade, async () => { events.push('other'); });
+      return new Response('ok');
+    }, options);
+    const owner = handler(new Request('https://example.test/owner'), env, null).then(() => null, (error: Error) => error);
+    await firstReady;
+    const other = handler(new Request('https://example.test/other'), env, null).then(() => null, (error: Error) => error);
+    nextSibling();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(await owner).toBeNull();
+    expect(await other).toBeNull();
+    expect(events).toEqual(['first', 'second', 'other']);
   } finally { vi.useRealTimers(); }
 });
 
