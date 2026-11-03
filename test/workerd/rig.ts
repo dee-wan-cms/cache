@@ -31,6 +31,10 @@ export interface Rig {
   isolateId(worker: WorkerName): Promise<string>;
   release(name: string): Promise<void>;
   sessionBatch(name: string): Promise<FixtureResponse>;
+  sessionUnique(name: string, sequential?: boolean): Promise<FixtureResponse>;
+  sessionPendingWriteRace(): Promise<FixtureResponse>;
+  sessionWarmWriteRace(): Promise<FixtureResponse>;
+  warmAbort(path: string, method?: string): Promise<FixtureResponse>;
   session(name: string, init?: { method?: string; headers?: Record<string, string> }): Promise<FixtureResponse>;
   statusWithoutToken(): Promise<number>;
   reset(): Promise<void>;
@@ -94,6 +98,22 @@ export async function startRig(): Promise<Rig> {
     sessionBatch: async (name) => {
       const fetcher = await mf.getWorker('cache-test-a');
       return fetcher.fetch(`http://rig/session?name=${encodeURIComponent(name)}&batch=1`, { headers:{ 'x-smoke-token':SMOKE_TOKEN } });
+    },
+    sessionUnique: async (name, sequential) => {
+      const fetcher = await mf.getWorker('cache-test-a');
+      return fetcher.fetch(`http://rig/session?name=${encodeURIComponent(name)}&unique=1${sequential ? '&sequential=1' : ''}`, { headers:{ 'x-smoke-token':SMOKE_TOKEN } });
+    },
+    sessionPendingWriteRace: async () => {
+      const fetcher = await mf.getWorker('cache-test-a');
+      return fetcher.fetch('http://rig/session-pending-write-race', { headers:{ 'x-smoke-token':SMOKE_TOKEN } });
+    },
+    sessionWarmWriteRace: async () => {
+      const fetcher = await mf.getWorker('cache-test-a');
+      return fetcher.fetch('http://rig/session-warm-write-race', { headers:{ 'x-smoke-token':SMOKE_TOKEN } });
+    },
+    warmAbort: async (path, method = 'GET') => {
+      const fetcher = await mf.getWorker('cache-test-a');
+      return fetcher.fetch(`http://rig/warm-abort/${path}`, { method, headers:{ 'x-smoke-token':SMOKE_TOKEN, cookie:'session=actor', 'x-site-id':'site-a' } });
     },
     session: async (name, init) => {
       const fetcher = await mf.getWorker('cache-test-a');

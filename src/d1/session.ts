@@ -18,6 +18,7 @@ const prismaScope = new AsyncLocalStorage<object>();
 const trackerGroups = new WeakMap<D1Bookmarks, AdmissionGroup>();
 const ambiguousTrackers = new WeakSet<D1Bookmarks>();
 const infos = new WeakMap<object, DatabaseInfo>();
+const sessionFacades = new WeakMap<object, { info: DatabaseInfo; alias: boolean }>();
 const facades = new WeakMap<object, Map<string, D1Database>>();
 const queues = new Map<string, AdmissionGate>();
 const admitted = new Map<string, AdmissionGroup>();
@@ -33,6 +34,8 @@ export interface D1ReadSessionOptions extends Pick<D1CacheProfile, 'bindingNames
 export function registerD1SessionAlias(alias: object, original: object): void {
   const info = infos.get(original);
   if (info) infos.set(alias, info);
+  const session = sessionFacades.get(original);
+  if (session) sessionFacades.set(alias, { info:session.info, alias:true });
 }
 
 export function runPrimaryD1SessionSource<T>(operation: () => Promise<T>): Promise<T> {
@@ -67,7 +70,8 @@ export async function runD1SessionOperation<T>(database: object, operation: () =
   const scope = gate;
   const active = scope.active;
   const tail = scope.waiting.at(-1);
-  const group: AdmissionGroup = token && tail?.token === token ? tail : token && !tail && active?.token === token ? active : { token, context, pending:0, waiting:[], tracker:{}, trackers:new Map(), ambiguous:false };
+  const reentrant = active && active.pending > 0 && active.token === token && admissionScope.getStore()?.group === active;
+  const group: AdmissionGroup = active && (reentrant || (token && active.token === token)) ? active : token && tail?.token === token ? tail : { token, context, pending:0, waiting:[], tracker:{}, trackers:new Map(), ambiguous:false };
   const startGroup = (next: AdmissionGroup) => {
     scope.active = next;
     admitted.set(info.id, next);
@@ -162,6 +166,8 @@ export function prismaD1SessionDatabase(database: D1Database): D1Database {
     dump: () => invoke(() => database.dump()),
   };
   infos.set(wrapped, info);
+  const session = sessionFacades.get(database);
+  if (session) sessionFacades.set(wrapped, { info:session.info, alias:true });
   prismaFacades.set(database, wrapped);
   return wrapped;
 }
@@ -411,6 +417,7 @@ function facade(info: DatabaseInfo): D1Database {
     },
   };
   infos.set(database, info);
+  sessionFacades.set(database, { info, alias:false });
   return database;
 }
 
@@ -433,11 +440,16 @@ export function sessionD1Env<Env extends object>(env: Env, options: D1ReadSessio
       const id: string | undefined = ids[name];
       if (!id || !db || typeof db !== 'object' || typeof Reflect.get(db, 'withSession') !== 'function') throw new Error(`Missing D1 identity or binding: ${name}`);
       const primary = primaryIds.has(id);
-      let variants = facades.get(db);
-      if (!variants) { variants = new Map(); facades.set(db, variants); }
+      const existing = sessionFacades.get(db);
+      if (existing && existing.info.id !== id) throw new Error(`Conflicting D1 identity: ${name}`);
+      if (existing && existing.info.primary === primary) { Reflect.set(scoped, name, db); continue; }
+      if (existing?.alias) throw new Error(`Conflicting D1 session policy: ${name}`);
+      const source = existing?.info.db ?? db;
+      let variants = facades.get(source);
+      if (!variants) { variants = new Map(); facades.set(source, variants); }
       const key = `${id}:${primary}`;
       let wrapped = variants.get(key);
-      if (!wrapped) { wrapped = facade({ id, db: db as D1Database, primary }); variants.set(key, wrapped); }
+      if (!wrapped) { wrapped = facade({ id, db: source as D1Database, primary }); variants.set(key, wrapped); }
       Reflect.set(scoped, name, wrapped);
     }
     return scoped;
