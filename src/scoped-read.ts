@@ -6,15 +6,17 @@ export interface ScopedReadOptions<T> {
   key: unknown;
   validate: (value: unknown) => value is T;
   ttlMs?: number;
+  maxTtlMs?: number;
   maxBytes?: number;
   cache?: Pick<Cache, 'match' | 'put'>;
   now?: () => number;
 }
 
 export async function cacheReadValue<T>(options: ScopedReadOptions<T>, load: () => Promise<T>): Promise<T> {
-  const { namespace, key, validate, ttlMs = 5000, maxBytes = MAX_VALUE_BYTES, cache, now = () => Date.now() } = options;
+  const { namespace, key, validate, ttlMs = 5000, maxTtlMs = 5000, maxBytes = MAX_VALUE_BYTES, cache, now = () => Date.now() } = options;
+  if (!Number.isSafeInteger(maxTtlMs) || maxTtlMs < 1 || maxTtlMs > 300_000 || !Number.isSafeInteger(ttlMs) || ttlMs < 1 || ttlMs > maxTtlMs) return load();
   if (typeof namespace !== 'string' || !namespace.trim() || !Number.isSafeInteger(maxBytes) || maxBytes <= 0 || maxBytes > MAX_VALUE_BYTES) return load();
-  const regional = createRegionalCache(5000, maxBytes, { cache: cache ? () => cache : undefined, now });
+  const regional = createRegionalCache(maxTtlMs, maxBytes, { cache: cache ? () => cache : undefined, now });
   const cacheKey = await regional.regionalKey(ttlMs, ['scoped-read-value-v1', namespace, key]);
   const cached = await regional.regionalRead(cacheKey, ttlMs);
   try {

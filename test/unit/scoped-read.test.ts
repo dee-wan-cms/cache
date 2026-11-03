@@ -78,3 +78,32 @@ it('does not fill with an invalid source clock', async () => {
     expect(cache.put).not.toHaveBeenCalled();
   }
 });
+
+
+it('permits a longer lease only with an explicit bounded maximum', async () => {
+  const { options, setTime } = setup();
+  const load = vi.fn(async () => 1);
+  await cacheReadValue({ ...options, ttlMs:300_000 }, load);
+  await cacheReadValue({ ...options, ttlMs:300_000 }, load);
+  expect(load).toHaveBeenCalledTimes(2);
+  const extended = { ...options, ttlMs:300_000, maxTtlMs:300_000 };
+  await cacheReadValue(extended, load);
+  setTime(399_999);
+  await cacheReadValue(extended, load);
+  expect(load).toHaveBeenCalledTimes(3);
+  setTime(400_000);
+  await cacheReadValue(extended, load);
+  expect(load).toHaveBeenCalledTimes(4);
+});
+
+it('bypasses caching for invalid maximums and TTLs', async () => {
+  for (const [maxTtlMs, ttlMs] of [[0, 1], [300_001, 1], [1.5, 1], [100, 101], [100, 0], [100, 1.5]]) {
+    const { options, cache } = setup();
+    const load = vi.fn(async () => 1);
+    await cacheReadValue({ ...options, maxTtlMs, ttlMs }, load);
+    await cacheReadValue({ ...options, maxTtlMs, ttlMs }, load);
+    expect(load).toHaveBeenCalledTimes(2);
+    expect(cache.match).not.toHaveBeenCalled();
+    expect(cache.put).not.toHaveBeenCalled();
+  }
+});

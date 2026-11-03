@@ -30,6 +30,7 @@ export function createResponseWarmup<Env, Context>(run: (request: Request, env: 
   let generation = 0;
   const internal = new WeakMap<Request, { generation: number; isCurrent?: () => boolean }>();
   const active = new Map<string, { until: number }>();
+  const pending = new Set<string>();
   const verified = new WeakSet<Request>();
   let running = 0, waiting = 0;
   const currentValue = (check?: () => boolean) => { try { return check === undefined || check() === true; } catch { return false; } };
@@ -64,10 +65,10 @@ export function createResponseWarmup<Env, Context>(run: (request: Request, env: 
     const stillCurrent = () => current === generation && currentValue(isCurrent);
     const prior = active.get(group);
     const cooling = prior !== undefined && prior.until > Date.now();
-    const marker = { until: end + cooldown };
+    const marker = { until: end };
     if (!cooling) active.set(group, marker);
     if (active.size > 1024) for (const [key, value] of active) { if (value.until <= Date.now()) active.delete(key); }
-    if (active.size > 1024) active.delete(active.keys().next().value ?? '');
+    if (active.size > 1024 && !cooling) { active.delete(group); return; }
     const base = new URL(request.url);
     let scope = request.headers.get(scopeHeader);
     if (!validScope(scope)) scope = null;
@@ -84,7 +85,10 @@ export function createResponseWarmup<Env, Context>(run: (request: Request, env: 
       } catch { return null; }
     };
     const bootstrap = discoverScopeFrom === undefined ? null : urlFor(discoverScopeFrom);
-    if (discoverScopeFrom !== undefined && (!bootstrap || !seeds.some((seed) => typeof seed === 'string' && urlFor(seed)?.href === bootstrap.href))) return;
+    if (discoverScopeFrom !== undefined && (!bootstrap || !seeds.some((seed) => typeof seed === 'string' && urlFor(seed)?.href === bootstrap.href))) {
+      if (!cooling && active.get(group) === marker) active.delete(group);
+      return;
+    }
     const enqueue = (target: ReadResponseWarmupTarget, priority = 2, batch?: { index: number }) => {
       if (typeof target !== 'string' && (!target || typeof target !== 'object' || typeof target.url !== 'string' || !(target.scope === null || validScope(target.scope)))) return;
       const explicit = typeof target !== 'string';
@@ -188,6 +192,8 @@ export function createResponseWarmup<Env, Context>(run: (request: Request, env: 
     const runOne = async (target: WarmJob) => {
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
       if (!stillCurrent() || Date.now() >= end) { abandoned = true; return; }
+      const pendingKey = JSON.stringify([current, group, target.url, target.scope]);
+      if (pending.has(pendingKey)) return;
       let release: (() => void) | null = null;
       while (stillCurrent() && Date.now() < end) {
         release = await acquire(concurrency, current, end, isCurrent);
@@ -198,6 +204,8 @@ export function createResponseWarmup<Env, Context>(run: (request: Request, env: 
       if (!release) { abandoned = true; return; }
       if (!stillCurrent() || Date.now() >= end) { abandoned = true; release(); return; }
       const releaseSlot = release;
+      if (pending.has(pendingKey)) { releaseSlot(); return; }
+      pending.add(pendingKey);
       let controller: AbortController | undefined;
       let timer: ReturnType<typeof setTimeout> | undefined;
       let started = false;
@@ -217,7 +225,7 @@ export function createResponseWarmup<Env, Context>(run: (request: Request, env: 
         internal.set(warm, { generation:current, isCurrent });
         const task = Promise.resolve().then(() => run(warm, env, context));
         started = true;
-        const completion = task.then((response) => { if (abort.signal.aborted) void response.body?.cancel().catch(() => undefined); releaseSlot(); }, () => { releaseSlot(); });
+        const completion = task.then((response) => { if (abort.signal.aborted) void response.body?.cancel().catch(() => undefined); pending.delete(pendingKey); releaseSlot(); }, () => { pending.delete(pendingKey); releaseSlot(); });
         try {
           const wait = context && typeof context === 'object' ? Reflect.get(context, 'waitUntil') : undefined;
           if (typeof wait === 'function') Reflect.apply(wait, context, [completion]);
@@ -229,7 +237,7 @@ export function createResponseWarmup<Env, Context>(run: (request: Request, env: 
       finally {
         if (controller?.signal.aborted) abandoned = true;
         if (timer !== undefined) clearTimeout(timer);
-        if (!started) releaseSlot();
+        if (!started) { pending.delete(pendingKey); releaseSlot(); }
       }
     };
     try {
@@ -262,7 +270,10 @@ export function createResponseWarmup<Env, Context>(run: (request: Request, env: 
       await Promise.all(Array.from({ length:concurrency }, worker));
     } catch { /* Background warming is best effort. */ }
     finally {
-      if (!cooling && (abandoned || queue.length > 0) && active.get(group) === marker) active.delete(group);
+      if (!cooling && active.get(group) === marker) {
+        if (abandoned || queue.length > 0) active.delete(group);
+        else marker.until = Date.now() + cooldown;
+      }
     }
     } finally { void response.body?.cancel().catch(() => undefined); }
   }

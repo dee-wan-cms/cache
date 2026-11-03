@@ -214,6 +214,88 @@ it('does not let an abandoned older batch clear a newer batch cooldown', async (
   expect(calls).not.toContain('/api/new-again');
 });
 
+it('starts cooldown at completion while keeping an active batch exclusive', async () => {
+  vi.useFakeTimers();
+  let release = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const calls: string[] = [];
+  const warm = createResponseWarmup(async (request: Request) => {
+    calls.push(new URL(request.url).pathname);
+    if (calls.length === 1) await held;
+    return Response.json({});
+  });
+  const start = () => warm.start({ scopeHeader:'x-site-id', seeds:['/api/seed'], maxMilliseconds:1000, cooldownMs:100 }, req('/api/root'), Response.json({}), ['completion-cooldown'], 'completion-cooldown', () => true, {}, undefined);
+  const first = start();
+  await driveUntil(() => calls.length === 1);
+  await start();
+  expect(calls).toHaveLength(1);
+  release();
+  await first;
+  await vi.advanceTimersByTimeAsync(99);
+  await start();
+  expect(calls).toHaveLength(1);
+  await vi.advanceTimersByTimeAsync(1);
+  const next = start();
+  await driveUntil(() => calls.length === 2);
+  await next;
+});
+
+it('skips a still-pending source after deadline while retrying other targets', async () => {
+  vi.useFakeTimers();
+  let release = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const calls: string[] = [];
+  const warm = createResponseWarmup(async (request: Request) => {
+    const path = new URL(request.url).pathname;
+    calls.push(path);
+    if (path === '/api/first' && calls.filter((value) => value === path).length === 1) await held;
+    return Response.json({});
+  });
+  const start = (seeds: string[]) => warm.start({ scopeHeader:'x-site-id', seeds, concurrency:2, maxMilliseconds:100, cooldownMs:30_000 }, req('/api/root'), Response.json({}), ['pending-retry'], 'pending-retry', () => true, {}, undefined);
+  const first = start(['/api/first']);
+  await driveUntil(() => calls.length === 1);
+  await vi.advanceTimersByTimeAsync(101);
+  await first;
+  const retry = start(['/api/first', '/api/second']);
+  await driveUntil(() => calls.includes('/api/second'));
+  await retry;
+  expect(calls).toEqual(['/api/first', '/api/second']);
+  warm.invalidate();
+  const next = start(['/api/first']);
+  await driveUntil(() => calls.length === 3);
+  await next;
+  expect(calls).toEqual(['/api/first', '/api/second', '/api/first']);
+  release();
+  await Promise.resolve();
+});
+
+it('skips a known pending source before waiting for the only slot', async () => {
+  vi.useFakeTimers();
+  let release = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const calls: string[] = [];
+  const warm = createResponseWarmup(async (request: Request) => {
+    const path = new URL(request.url).pathname;
+    calls.push(path);
+    if (path === '/api/first') await held;
+    return Response.json({});
+  });
+  const start = (seeds: string[]) => warm.start({ scopeHeader:'x-site-id', seeds, concurrency:1, maxMilliseconds:100, cooldownMs:30_000 }, req('/api/root'), Response.json({}), ['serial-pending'], 'serial-pending', () => true, {}, undefined);
+  const first = start(['/api/first']);
+  await driveUntil(() => calls.length === 1);
+  await vi.advanceTimersByTimeAsync(101);
+  await first;
+  const retry = start(['/api/first', '/api/second']);
+  await driveUntil(() => vi.getTimerCount() > 0);
+  await vi.advanceTimersToNextTimerAsync();
+  await vi.advanceTimersToNextTimerAsync();
+  expect(calls).toEqual(['/api/first']);
+  release();
+  await driveUntil(() => calls.includes('/api/second'));
+  await retry;
+  expect(calls).toEqual(['/api/first', '/api/second']);
+});
+
 it('strips freshness and conditional headers while preserving credentials and negotiation', async () => {
   let warmHeaders: Headers | undefined;
   const wrapped = wrapReadResponseLease(async (request) => {

@@ -1,4 +1,4 @@
-import { expect, it } from 'vitest';
+import { expect, it, vi } from 'vitest';
 import { build } from 'esbuild';
 import { Miniflare } from 'miniflare';
 import { resolve } from 'node:path';
@@ -263,9 +263,18 @@ it('lets real HTTP foreground requests run before a fast warm batch completes', 
 
 const multiScopeSource = `
 import { wrapReadResponseLease, limitReadResponseLeaseUntil } from './response-lease';
+import { createResponseWarmup } from './response-warmup';
 let now = Date.now();
 Date.now = () => now;
 const calls = [];
+const schedulerCalls = [];
+let holdingScheduler = true, schedulerDone = false, sourceDone = false;
+const scheduler = createResponseWarmup(async request => {
+  const path = new URL(request.url).pathname;
+  schedulerCalls.push(path);
+  if (path === '/api/held') { while (holdingScheduler) await new Promise(resolve => setTimeout(resolve, 10)); sourceDone = true; }
+  return Response.json({});
+});
 const wrapped = wrapReadResponseLease(async request => {
   const path = new URL(request.url).pathname;
   const actor = request.headers.get('cookie'), scope = request.headers.get('x-site-id');
@@ -273,10 +282,20 @@ const wrapped = wrapReadResponseLease(async request => {
   limitReadResponseLeaseUntil(Date.now() + 10000);
   return Response.json({ path, actor, scope });
 }, { namespace:'multi-scope-native', deployment:'v1', database:'db', seconds:5, paths:['/api/**'], credentialHeaders:['cookie'], cookieNames:['session', 'fresh'], varyHeaders:['x-site-id'], freshnessCookie:'fresh', freshnessCookieMode:'generation', warmup:{ scopeHeader:'x-site-id', catalogScope:'credential', seeds:[], portable:url => url.pathname === '/api/hot', discover:url => url.pathname === '/api/root' ? { targets:[{ url:'/api/shared', scope:'one' }, { url:'/api/shared', scope:'two' }] } : { targets:[] } } });
-export default { async fetch(request, env) {
+export default { async fetch(request, env, execution) {
   const path = new URL(request.url).pathname;
   if (path === '/calls') return Response.json(calls);
   if (path === '/advance') { now += 6000; return new Response('ok'); }
+  if (path === '/scheduler/state') return Response.json({ calls:schedulerCalls, done:schedulerDone, sourceDone });
+  if (path === '/scheduler/advance') { now += Number(new URL(request.url).searchParams.get('ms')); return new Response('ok'); }
+  if (path === '/scheduler/release') { holdingScheduler = false; return new Response('ok'); }
+  if (path === '/scheduler/start') {
+    schedulerDone = false;
+    const seeds = new URL(request.url).searchParams.get('retry') === '1' ? ['/api/held', '/api/other'] : ['/api/held'];
+    const task = scheduler.start({ scopeHeader:'x-site-id', seeds, concurrency:2, maxMilliseconds:100, cooldownMs:100 }, new Request('https://cache.test/api/root', { headers:{ cookie:'session=a', 'x-site-id':'one' } }), Response.json({}), ['native-scheduler'], 'native-scheduler', () => true, env, execution).then(() => { schedulerDone = true; });
+    execution.waitUntil(task);
+    return new Response('ok');
+  }
   const jobs = [];
   const context = { waitUntil(task) { jobs.push(task); } };
   const response = await wrapped(request, env, context);
@@ -308,6 +327,24 @@ it('replays credential-private scoped targets through the native Cache API', asy
     expect(calls.filter((call) => Array.isArray(call) && call[0] === '/api/shared' && call[1] === 'session=b')).toHaveLength(2);
     expect(calls.filter((call) => Array.isArray(call) && call[0] === '/api/hot' && call[1] === 'session=a')).toHaveLength(2);
     expect(calls).not.toContainEqual(['/api/hot', 'session=b', 'two']);
+    const schedulerState = async () => await (await worker.dispatchFetch('https://cache.test/scheduler/state')).json() as { calls:string[]; done:boolean; sourceDone:boolean };
+    await worker.dispatchFetch('https://cache.test/scheduler/start');
+    await vi.waitFor(async () => expect((await schedulerState()).calls).toEqual(['/api/held']));
+    await worker.dispatchFetch('https://cache.test/scheduler/advance?ms=101');
+    await vi.waitFor(async () => expect((await schedulerState()).done).toBe(true));
+    await worker.dispatchFetch('https://cache.test/scheduler/start?retry=1');
+    await vi.waitFor(async () => expect((await schedulerState()).done).toBe(true));
+    expect((await schedulerState()).calls).toEqual(['/api/held', '/api/other']);
+    await worker.dispatchFetch('https://cache.test/scheduler/advance?ms=99');
+    await worker.dispatchFetch('https://cache.test/scheduler/start?retry=1');
+    await vi.waitFor(async () => expect((await schedulerState()).done).toBe(true));
+    expect((await schedulerState()).calls).toEqual(['/api/held', '/api/other']);
+    await worker.dispatchFetch('https://cache.test/scheduler/release');
+    await vi.waitFor(async () => expect((await schedulerState()).sourceDone).toBe(true));
+    await worker.dispatchFetch('https://cache.test/scheduler/advance?ms=1');
+    await worker.dispatchFetch('https://cache.test/scheduler/start?retry=1');
+    await vi.waitFor(async () => expect((await schedulerState()).done).toBe(true));
+    expect((await schedulerState()).calls).toEqual(['/api/held', '/api/other', '/api/held', '/api/other']);
   } finally { await worker.dispose(); }
 });
 
