@@ -1,3 +1,10 @@
+## [2.0.3](https://github.com/dee-wan-cms/cache/compare/v2.0.2...v2.0.3) (2026-11-03)
+
+
+### Bug Fixes
+
+* **warmup:** support full media batch URLs ([7b68406](https://github.com/dee-wan-cms/cache/commit/7b68406b67966fa00a43a6d9b8965a75abb09834))
+
 ## [2.0.2](https://github.com/dee-wan-cms/cache/compare/v2.0.1...v2.0.2) (2026-11-03)
 
 
