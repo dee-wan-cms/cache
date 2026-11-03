@@ -1,3 +1,10 @@
+## [2.0.4](https://github.com/dee-wan-cms/cache/compare/v2.0.3...v2.0.4) (2026-11-03)
+
+
+### Bug Fixes
+
+* **cache:** bound warmup retries and read TTLs ([95b53f1](https://github.com/dee-wan-cms/cache/commit/95b53f185d8dfbcb0cffb4652e80ac9127672fb9))
+
 ## [2.0.3](https://github.com/dee-wan-cms/cache/compare/v2.0.2...v2.0.3) (2026-11-03)
 
 
