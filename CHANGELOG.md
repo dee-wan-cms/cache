@@ -1,3 +1,10 @@
+## [2.0.6](https://github.com/dee-wan-cms/cache/compare/v2.0.5...v2.0.6) (2026-11-03)
+
+
+### Bug Fixes
+
+* share cold fills with active warmup ([e080368](https://github.com/dee-wan-cms/cache/commit/e080368e014ff4e843bf4fa3c53472a007a18c9a))
+
 ## [2.0.5](https://github.com/dee-wan-cms/cache/compare/v2.0.4...v2.0.5) (2026-11-03)
 
 
