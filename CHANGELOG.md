@@ -1,3 +1,10 @@
+## [2.0.5](https://github.com/dee-wan-cms/cache/compare/v2.0.4...v2.0.5) (2026-11-03)
+
+
+### Bug Fixes
+
+* coalesce cold fills and warm scoped bootstrap ([4917aec](https://github.com/dee-wan-cms/cache/commit/4917aec547b46f5a7a6b07e871b624119a5a728d))
+
 ## [2.0.4](https://github.com/dee-wan-cms/cache/compare/v2.0.3...v2.0.4) (2026-11-03)
 
 
