@@ -290,3 +290,10 @@ Begin failure refuses the write before the query. A late begin is ended after it
 late read locks are released. End failure preserves the database result and leaves the
 lease active until cleanup or expiry. This applies to scoped and unscoped Prisma clients,
 raw D1 writes, and explicit invalidation. Multiple RPCs can exceed 2 seconds in total.
+
+`discoveryPriority: 'next'`:
+
+- New batch: after learned/unscoped targets, before older discoveries. Keep batch order.
+- Full budget: replace older queued discoveries or ordinary seeds only. Protect running,
+  completed, learned and unscoped targets.
+- Equal-priority duplicate: keep its queue position.

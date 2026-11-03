@@ -85,7 +85,7 @@ export function createResponseWarmup<Env, Context>(run: (request: Request, env: 
     };
     const bootstrap = discoverScopeFrom === undefined ? null : urlFor(discoverScopeFrom);
     if (discoverScopeFrom !== undefined && (!bootstrap || !seeds.some((seed) => typeof seed === 'string' && urlFor(seed)?.href === bootstrap.href))) return;
-    const enqueue = (target: ReadResponseWarmupTarget, priority = 2) => {
+    const enqueue = (target: ReadResponseWarmupTarget, priority = 2, batch?: { index: number }) => {
       if (typeof target !== 'string' && (!target || typeof target !== 'object' || typeof target.url !== 'string' || !(target.scope === null || validScope(target.scope)))) return;
       const explicit = typeof target !== 'string';
       const url = urlFor(explicit ? target.url : target);
@@ -97,21 +97,23 @@ export function createResponseWarmup<Env, Context>(run: (request: Request, env: 
         const queued = existing >= 0 ? queue[existing] : undefined;
         if (queued && queued.priority > priority) {
           queue.splice(existing, 1); queued.priority = priority;
-          const index = queue.findIndex((item) => item.priority > priority);
+          const index = batch?.index ?? queue.findIndex((item) => item.priority > priority);
           if (index === -1) queue.push(queued); else queue.splice(index, 0, queued);
+          if (batch) batch.index++;
         }
         return;
       }
       if (seen.size > maxTargets && priority < 2) {
         let index = queue.length - 1;
-        while (index >= 0 && queue[index]?.priority !== 2) index--;
-        if (index >= 0) { const removed = queue.splice(index, 1)[0]; if (removed) seen.delete(jobKey(removed.url, removed.scope)); }
+        while (index >= 0 && (queue[index]?.priority ?? -1) < (priority === 1 ? 1 : 2)) index--;
+        if (index >= (batch?.index ?? 0)) { const removed = queue.splice(index, 1)[0]; if (removed) seen.delete(jobKey(removed.url, removed.scope)); }
       }
       if (seen.size > maxTargets) return;
       seen.add(key);
       const job = { url:url.href, scope:targetScope, override:explicit || (!request.headers.has(scopeHeader) && targetScope !== null), priority };
-      const index = queue.findIndex((item) => item.priority > priority);
+      const index = batch?.index ?? queue.findIndex((item) => item.priority > priority);
       if (index === -1) queue.push(job); else queue.splice(index, 0, job);
+      if (batch) batch.index++;
     };
     const keyFor = async (value: string | null) => catalog.regionalKey(ttl, catalogScope === 'credential' ? ['response-warmup-credential-v1', identity, credentialGroup] : ['response-warmup-v1', identity, value]);
     let loadedScope: string | null | undefined;
@@ -173,10 +175,14 @@ export function createResponseWarmup<Env, Context>(run: (request: Request, env: 
         if (bootstrap?.href === url.href) completedBootstrap = jobKey(url.href, scope);
         if (!deferred) await load();
       }
+      const batch = !deferred && discoveryPriority === 'next'
+        ? { index: queue.findIndex((job) => job.priority >= 1) }
+        : undefined;
+      if (batch && batch.index === -1) batch.index = queue.length;
       for (const target of found.targets.slice(0, maxTargets)) {
         if (typeof target !== 'string' && (!target || typeof target !== 'object' || typeof target.url !== 'string' || !(target.scope === null || validScope(target.scope)))) continue;
         if (deferred) deferred.push(target);
-        else enqueue(target, discoveryPriority === 'next' ? 1 : 2);
+        else enqueue(target, discoveryPriority === 'next' ? 1 : 2, batch);
       }
     };
     const runOne = async (target: WarmJob) => {

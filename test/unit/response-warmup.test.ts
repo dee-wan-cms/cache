@@ -814,6 +814,58 @@ it('promotes an already queued cold seed when discovery selects it', async () =>
   expect(calls).toEqual(['/api/root', '/api/first', '/api/child', '/api/cold']);
 });
 
+it('runs each newly discovered batch before older siblings without reversing it', async () => {
+  const calls: string[] = [];
+  const wrapped = wrapReadResponseLease(async (request) => {
+    calls.push(new URL(request.url).pathname);
+    limitReadResponseLeaseUntil(Date.now() + 5000);
+    return Response.json({});
+  }, { ...options, namespace:'discovered-batch-order', warmup:{
+    scopeHeader:'x-site-id', discoveryPriority:'next', seeds:['/api/seed'], concurrency:1, maxTargets:8,
+    discover:(url) => ({ targets:url.pathname === '/api/root' ? ['/api/first', '/api/older'] : url.pathname === '/api/first' ? ['/api/a', '/api/b', '/api/older'] : [] }),
+  } });
+  const ctx = context();
+  await wrapped(req('/api/root'), {}, ctx); await ctx.drain();
+  expect(calls).toEqual(['/api/root', '/api/first', '/api/a', '/api/b', '/api/older', '/api/seed']);
+});
+
+it('replaces only older queued discoveries at a full budget and preserves the new batch order', async () => {
+  const calls: string[] = [];
+  const wrapped = wrapReadResponseLease(async (request) => {
+    calls.push(new URL(request.url).pathname);
+    limitReadResponseLeaseUntil(Date.now() + 5000);
+    return Response.json({});
+  }, { ...options, namespace:'discovered-batch-capacity', warmup:{
+    scopeHeader:'x-site-id', discoveryPriority:'next', seeds:[{ url:'/api/unscoped', scope:null }], concurrency:1, maxTargets:5,
+    discover:(url) => ({ targets:url.pathname === '/api/root' ? ['/api/first', '/api/older-a', '/api/older-b', '/api/older-c'] : url.pathname === '/api/first' ? ['/api/new-a', '/api/new-b'] : [] }),
+  } });
+  const ctx = context();
+  await wrapped(req('/api/root'), {}, ctx); await ctx.drain();
+  expect(calls).toEqual(['/api/root', '/api/unscoped', '/api/first', '/api/new-a', '/api/new-b', '/api/older-a']);
+});
+
+it('protects queued learned targets when a discovery replaces an older target at capacity', async () => {
+  let now = 100_000;
+  vi.spyOn(Date, 'now').mockImplementation(() => now);
+  const calls: string[] = [];
+  const wrapped = wrapReadResponseLease(async (request) => {
+    calls.push(new URL(request.url).pathname);
+    limitReadResponseLeaseUntil(Date.now() + 5000);
+    return Response.json({});
+  }, { ...options, namespace:'discovered-batch-protect-learned', warmup:{
+    scopeHeader:'x-site-id', catalogScope:'credential', discoveryPriority:'next', seeds:[], concurrency:1, maxTargets:3,
+    portable:(url) => url.pathname.startsWith('/api/hot-'),
+    discover:(url) => ({ targets:url.pathname === '/api/root' ? ['/api/older'] : url.pathname === '/api/hot-first' ? ['/api/new'] : [] }),
+  } });
+  const ctx = context();
+  await wrapped(req('/api/hot-second'), {}, ctx); await ctx.drain();
+  now++;
+  await wrapped(req('/api/hot-first'), {}, ctx); await ctx.drain();
+  now += 60_001; calls.length = 0;
+  await wrapped(req('/api/root'), {}, ctx); await ctx.drain();
+  expect(calls).toEqual(['/api/root', '/api/hot-first', '/api/hot-second', '/api/new']);
+});
+
 it('keeps the triggering scope in discovery context for a scope-free child', async () => {
   const calls: Array<[string, string | null]> = [];
   const contexts: Array<string | null> = [];
