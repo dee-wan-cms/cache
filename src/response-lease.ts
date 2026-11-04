@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { cacheMatch } from './cache-match';
 import { createResponseWarmup, type ReadResponseWarmupOptions } from './response-warmup';
 export type { ReadResponseWarmupOptions, ReadResponseWarmupTarget, ReadResponseWarmupContext } from './response-warmup';
 import { registerRegionalDeadlineReporter } from './d1/regional-deadline';
@@ -113,7 +114,7 @@ async function readLease(key: string, ttl: number, permittedVary: Set<string>): 
   let cached: Response | undefined;
   let transferred = false;
   try {
-    cached = await caches.default.match(key);
+    cached = await cacheMatch(() => caches.default.match(key));
     if (!cached || cached.status !== 200 || !eligibleHeaders(cached.headers, permittedVary)) return null;
     const metadata = cached.headers.get(metadataHeader);
     if (!metadata) return null;
@@ -139,9 +140,9 @@ function eligibleHeaders(headers: Headers, permittedVary: Set<string>): boolean 
   return !vary || vary.split(',').every((name) => permittedVary.has(name.trim().toLowerCase()));
 }
 
-async function responseEntry(response: Response, permittedVary: Set<string>): Promise<Uint8Array | null> {
+async function responseEntry(response: Response, permittedVary: Set<string>, consume = false): Promise<Uint8Array | null> {
   if (response.status !== 200 || response.headers.has(metadataHeader) || !eligibleHeaders(response.headers, permittedVary)) return null;
-  const reader = response.clone().body?.getReader();
+  const reader = (consume ? response : response.clone()).body?.getReader();
   if (!reader) return null;
   const chunks: Uint8Array[] = [];
   let size = 0;
@@ -167,6 +168,13 @@ async function responseEntry(response: Response, permittedVary: Set<string>): Pr
   finally { if (timer !== undefined) clearTimeout(timer); void reader.cancel().catch(() => undefined); }
 }
 
+async function captureOwnedResponse(response: Response, lease: LeaseScope, permittedVary: Set<string>): Promise<{ response: Response; entry: Uint8Array } | undefined> {
+  if (lease.deadline === undefined || !Number.isFinite(lease.deadline) || response.status !== 200 || response.headers.has(metadataHeader) || !eligibleHeaders(response.headers, permittedVary)) return undefined;
+  const entry = await responseEntry(response, permittedVary, true);
+  if (!entry) throw Error('Background response body is invalid');
+  return { response:new Response(entry, { status:response.status, statusText:response.statusText, headers:response.headers }), entry };
+}
+
 export type ReadResponseLeasePolicy = Omit<NonNullable<D1CacheProfile['readResponseLease']>, 'databaseBinding' | 'deploymentEnv'>;
 export interface ReadResponseLeaseOptions extends ReadResponseLeasePolicy {
   namespace: string;
@@ -179,10 +187,11 @@ type LeaseConfig = (NonNullable<D1CacheProfile['readResponseLease']> | ReadRespo
 interface ResolvedLease { config: LeaseConfig; seconds: number; identity: () => unknown[] | null }
 export function createReadResponseLease<Env, Context>(handler: (request: Request, env: Env, context: Context) => Promise<Response>, resolve: (env: Env) => ResolvedLease | null): (request: Request, env: Env, context: Context) => Promise<Response> {
   const pending = new Map<string, { valid: boolean; task: Promise<void> }>();
-  const cold = new Map<string, { valid: boolean; done: Promise<void> }>();
+  type ColdOwner = { valid: boolean; background: boolean; done: Promise<void>; barrier?: Promise<void>; put?: Promise<void> };
+  const cold = new Map<string, ColdOwner>();
   let foreground = 0;
   const warming = createResponseWarmup<Env, Context>((request, env, context) => runIsolatedD1Session(request, () => wrapped(request, env, context)), () => foreground === 0);
-  const wrapped = async (request: Request, env: Env, context: Context, independent = false): Promise<Response> => {
+  const wrapped = async (request: Request, env: Env, context: Context, independent = false, expiredOwner?: ColdOwner): Promise<Response> => {
     const requestStarted = Date.now();
     const requestGeneration = warming.snapshot();
     const serve = async (input: Request): Promise<Response> => {
@@ -256,7 +265,7 @@ export function createReadResponseLease<Env, Context>(handler: (request: Request
       } catch { /* Warming is optional. */ }
       finally { if (!transferred) void response.body?.cancel().catch(() => undefined); }
     };
-    const fillResponse = async (response: Response, lease: LeaseScope, started: number, allowed: () => boolean, beforePut?: Promise<void>) => {
+    const fillResponse = async (response: Response, lease: LeaseScope, started: number, allowed: () => boolean, beforePut?: Promise<void>, trackPut?: (put: Promise<void>) => void, captured?: Uint8Array) => {
       if (lease.deadline === undefined || !Number.isFinite(lease.deadline)) return;
       let warmResponse: Response | undefined;
       if (warmOptions && warmGroup && !warming.isInternal(request) && typeof waitUntil === 'function') {
@@ -264,7 +273,7 @@ export function createReadResponseLease<Env, Context>(handler: (request: Request
       }
       const expires = Math.floor(Math.min(started + ttl, lease.deadline, lease.dataDeadline ?? Infinity));
       try {
-        const entry = await responseEntry(response, permittedVary);
+        const entry = captured ?? await responseEntry(response, permittedVary);
         if (entry && beforePut) await beforePut;
         if (entry && Number.isSafeInteger(expires) && expires > Date.now() && allowed() && warming.current(requestGeneration) && warming.allowed(request)) {
           warming.verify(request);
@@ -272,7 +281,9 @@ export function createReadResponseLease<Env, Context>(handler: (request: Request
           const headers = new Headers(response.headers);
           headers.set(metadataHeader, JSON.stringify([Math.floor(started), expires, headers.get('cache-control')]));
           headers.set('cache-control', 'public, max-age=300');
-          await caches.default.put(key, new Response(entry, { status:response.status, statusText:response.statusText, headers }));
+          const put = caches.default.put(key, new Response(entry, { status:response.status, statusText:response.statusText, headers }));
+          trackPut?.(put);
+          await put;
         }
       } catch { /* Cache filling must not affect the source response. */ }
       finally { if (warmResponse) void warmResponse.body?.cancel().catch(() => undefined); }
@@ -310,7 +321,11 @@ export function createReadResponseLease<Env, Context>(handler: (request: Request
                 varyD1Bookmarks(headers);
                 response = new Response(response.body, { status:response.status, statusText:response.statusText, headers });
               }
-              try { await fillResponse(response, lease, started, () => refresh.valid); }
+              try {
+                const captured = await captureOwnedResponse(response, lease, permittedVary);
+                if (captured) response = captured.response;
+                await fillResponse(response, lease, started, () => refresh.valid, undefined, undefined, captured?.entry);
+              }
               finally { void response.body?.cancel().catch(() => undefined); }
             });
           } catch { /* Refresh failures leave the old lease untouched. */ }
@@ -321,14 +336,16 @@ export function createReadResponseLease<Env, Context>(handler: (request: Request
       return conditionalHit(request, cached.response);
     }
     const previousCold = cold.get(key);
-    if (previousCold && !forceSource && !independent) {
+    const replace = !!previousCold && (!previousCold.valid || forceSource || (!warming.isInternal(request) && ((previousCold.background && !independent) || previousCold === expiredOwner)));
+    if (previousCold && !replace && !independent) {
       if (request.signal.aborted) throw request.signal.reason;
       let timer: ReturnType<typeof setTimeout> | undefined;
       let onAbort: (() => void) | undefined;
+      let timedOut = false;
       try {
         await Promise.race([
           previousCold.done,
-          new Promise<void>((resolve) => { timer = setTimeout(resolve, Math.min(ttl, 5000)); }),
+          new Promise<void>((resolve) => { timer = setTimeout(() => { timedOut = true; resolve(); }, Math.min(ttl, warming.isInternal(request) ? 5000 : 100)); }),
           new Promise<void>((resolve) => { onAbort = () => resolve(); request.signal.addEventListener('abort', onAbort, { once:true }); }),
         ]);
       } finally {
@@ -336,19 +353,24 @@ export function createReadResponseLease<Env, Context>(handler: (request: Request
         if (onAbort) request.signal.removeEventListener('abort', onAbort);
       }
       if (request.signal.aborted) throw request.signal.reason;
-      return wrapped(request, env, context, true);
+      return wrapped(request, env, context, true, timedOut ? previousCold : undefined);
     }
-    if (previousCold && forceSource) previousCold.valid = false;
+    if (previousCold && replace) previousCold.valid = false;
     const priorRefresh = pending.get(key);
     if (priorRefresh) priorRefresh.valid = false;
     let finish: (() => void) | undefined;
-    const owner = !previousCold && !forceSource && !independent && cold.size < 1024
-      ? { valid:true, done:new Promise<void>((resolve) => { finish = resolve; }) } : undefined;
+    const barrier = replace ? (previousCold?.put ?? previousCold?.barrier)?.catch(() => undefined) : undefined;
+    const owner: ColdOwner | undefined =
+      (!previousCold || replace) && (!independent || replace) && (replace || cold.size < 1024)
+      ? { valid:true, background:warming.isInternal(request), barrier, done:new Promise<void>((resolve) => { finish = resolve; }) } : undefined;
     if (owner) cold.set(key, owner);
     const release = () => {
       if (!owner) return;
       request.signal.removeEventListener('abort', onAbort);
-      if (cold.get(key) === owner) cold.delete(key);
+      const cleanup = () => { if (cold.get(key) === owner) cold.delete(key); };
+      const outstanding = owner.put ?? owner.barrier;
+      if (outstanding) void outstanding.then(cleanup, cleanup);
+      else cleanup();
       finish?.();
     };
     const onAbort = () => { if (owner) owner.valid = false; release(); };
@@ -372,7 +394,11 @@ export function createReadResponseLease<Env, Context>(handler: (request: Request
         if (encoded) headers.set(D1_BOOKMARK_HEADER, encoded);
         response = new Response(response.body, { status:response.status, statusText:response.statusText, headers });
       }
-      const fill = fillResponse(response, lease, requestStarted, () => owner ? owner.valid : !previousCold || forceSource, priorRefresh?.task).finally(release);
+      const captured = warming.isInternal(request) ? await captureOwnedResponse(response, lease, permittedVary) : undefined;
+      if (captured) response = captured.response;
+      const beforePut = [priorRefresh?.task, barrier].filter((task): task is Promise<void> => task !== undefined);
+      const fill = fillResponse(response, lease, requestStarted, () => owner ? owner.valid : !previousCold || forceSource,
+        beforePut.length ? Promise.all(beforePut).then(() => undefined) : undefined, owner ? (put) => { owner.put = put; } : undefined, captured?.entry).finally(release);
       try {
         if (!warming.isInternal(request) && typeof waitUntil === 'function') { Reflect.apply(waitUntil, context, [fill]); return response; }
       } catch { /* Await the fill if the request context is unavailable. */ }

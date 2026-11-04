@@ -1,4 +1,5 @@
 import { decode, encode, sha256Hex, stableStringify } from '../core/codec';
+import { cacheMatch } from '../cache-match';
 import { boundedValue } from '../core/bounded-value';
 import type { DecimalConstructor } from '../core/types';
 
@@ -34,7 +35,7 @@ export function createRegionalCache(maxMs: number, maxValueBytes = MAX_VALUE_BYT
   async function regionalRead(key: string | null, ttl = maxMs, decimal?: DecimalConstructor): Promise<{ value: unknown; expires: number } | null> {
     if (!key) return null;
     try {
-      const response = await cache().match(key);
+      const response = await cacheMatch(() => cache().match(key));
       if (!response || response.status !== 200 || response.headers.has('set-cookie')) return null;
       const reader = response.body?.getReader();
       if (!reader) return null;

@@ -39,6 +39,21 @@ it('rejects bad limits, corrupt data and cache failures', async () => {
   expect(cache.put).toHaveBeenCalledTimes(1);
 });
 
+it('bounds a stalled regional lookup and cancels a response that arrives late', async () => {
+  vi.useFakeTimers();
+  let finishMatch: (response: Response) => void = () => {};
+  const late = new Promise<Response>((resolve) => { finishMatch = resolve; });
+  const cancelled = vi.fn();
+  cache.match.mockImplementationOnce(() => late);
+  const reading = regionalRead('https://cache.test/stalled');
+  await vi.advanceTimersByTimeAsync(100);
+  expect(await reading).toBeNull();
+  finishMatch(new Response(new ReadableStream({ cancel:cancelled })));
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(cancelled).toHaveBeenCalledOnce();
+});
+
 it('does not admit null, nonserializable, or an expired overtaken fill', async () => {
   vi.useFakeTimers();
   vi.setSystemTime(100_000);

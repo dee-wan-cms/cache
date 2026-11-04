@@ -23,6 +23,29 @@ it('reuses cache only for the same credentials, site, deployment and database', 
   const c = fixture({ ...policy, database:'db2' }); await c.wrapped(request(), {}, undefined);
   expect(b.handler).toHaveBeenCalledOnce(); expect(c.handler).toHaveBeenCalledOnce();
 });
+
+it('falls back after a stalled lease lookup and cancels a late response', async () => {
+  vi.useFakeTimers();
+  let finishMatch: (response: Response) => void = () => {};
+  let matchStarted = () => {};
+  const late = new Promise<Response>((resolve) => { finishMatch = resolve; });
+  const started = new Promise<void>((resolve) => { matchStarted = resolve; });
+  const match = vi.spyOn(caches.default, 'match').mockImplementationOnce(() => { matchStarted(); return late; });
+  const cancelled = vi.fn();
+  try {
+    const f = fixture({ ...policy, namespace:'lookup-timeout' });
+    const first = f.wrapped(request(), {}, undefined);
+    await started;
+    await vi.advanceTimersByTimeAsync(100);
+    expect(await (await first).json()).toEqual({ count:1 });
+    expect(await (await f.wrapped(request(), {}, undefined)).json()).toEqual({ count:1 });
+    expect(f.handler).toHaveBeenCalledOnce();
+    finishMatch(new Response(new ReadableStream({ cancel:cancelled })));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(cancelled).toHaveBeenCalledOnce();
+  } finally { match.mockRestore(); }
+});
 it('coalesces simultaneous eligible misses and rereads the filled lease', async () => {
   let release: (() => void) | undefined;
   let entered: (() => void) | undefined;
@@ -38,6 +61,226 @@ it('coalesces simultaneous eligible misses and rereads the filled lease', async 
   expect(await Promise.all(responses.map((response) => response.json()))).toEqual([{ value:1 }, { value:1 }]);
   expect(handler).toHaveBeenCalledTimes(1);
 });
+
+it('lets a timed-out foreground waiter replace a stalled owner and fill the lease', async () => {
+  vi.useFakeTimers();
+  let release = () => {};
+  let entered = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const ready = new Promise<void>((resolve) => { entered = resolve; });
+  let calls = 0;
+  const handler = vi.fn(async () => {
+    const value = ++calls;
+    if (value === 1) { entered(); await held; }
+    limitReadResponseLeaseUntil(Date.now() + 5000);
+    return Response.json({ value });
+  });
+  const wrapped = wrapReadResponseLease(handler, { ...policy, namespace:'cold-timeout-replacement' });
+  try {
+    const first = wrapped(request(), {}, undefined);
+    await ready;
+    const second = wrapped(request(), {}, undefined);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls).toBe(1);
+    await vi.advanceTimersByTimeAsync(99);
+    expect(calls).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await (await second).json()).toEqual({ value:2 });
+    expect(await (await wrapped(request(), {}, undefined)).json()).toEqual({ value:2 });
+    release();
+    expect(await (await first).json()).toEqual({ value:1 });
+    expect(await (await wrapped(request(), {}, undefined)).json()).toEqual({ value:2 });
+    expect(calls).toBe(2);
+  } finally { release(); }
+});
+
+it('lets a foreground miss replace a background cold owner and rejects its late fill', async () => {
+  let releaseWarm = () => {};
+  let warmStarted = () => {};
+  const heldWarm = new Promise<void>((resolve) => { releaseWarm = resolve; });
+  const warmReady = new Promise<void>((resolve) => { warmStarted = resolve; });
+  let targetCalls = 0;
+  const handler = vi.fn(async (input: Request) => {
+    if (new URL(input.url).pathname === '/root') {
+      limitReadResponseLeaseUntil(Date.now() + 5000);
+      return Response.json({ root:true });
+    }
+    const value = ++targetCalls;
+    if (value === 1) { warmStarted(); await heldWarm; }
+    limitReadResponseLeaseUntil(Date.now() + 5000);
+    return Response.json({ value });
+  });
+  const wrapped = wrapReadResponseLease(handler, { ...policy, namespace:'warm-takeover', paths:['/root', '/items'], warmup:{ scopeHeader:'x-site-id', seeds:['/items'] } });
+  const jobs: Promise<unknown>[] = [];
+  const ctx = { waitUntil(task: Promise<unknown>) { jobs.push(task); } };
+  const root = new Request('https://example.test/root', { headers:{ cookie:'session=a', 'x-site-id':'one' } });
+  await wrapped(root, {}, ctx);
+  await warmReady;
+  expect(await (await wrapped(request(), {}, undefined)).json()).toEqual({ value:2 });
+  releaseWarm();
+  while (jobs.length) await Promise.all(jobs.splice(0));
+  expect(await (await wrapped(request(), {}, undefined)).json()).toEqual({ value:2 });
+  expect(targetCalls).toBe(2);
+});
+
+it('captures an internal warm stream once and replays it for discovery and cache', async () => {
+  const paths: string[] = [];
+  const clone = vi.fn((): Response => { throw Error('original stream must not be cloned'); });
+  const handler = vi.fn(async (input: Request) => {
+    const path = new URL(input.url).pathname;
+    paths.push(path);
+    limitReadResponseLeaseUntil(Date.now() + 5000);
+    if (path !== '/seed') return Response.json({ path });
+    const response = new Response(new ReadableStream({
+      start(controller) { controller.enqueue(new TextEncoder().encode('{"next":"/child"}')); controller.close(); },
+    }), { headers:{ 'content-type':'application/json' } });
+    Object.defineProperty(response, 'clone', { value:clone });
+    return response;
+  });
+  const wrapped = wrapReadResponseLease(handler, {
+    ...policy, namespace:'warm-stream-capture', paths:['/root', '/seed', '/child'],
+    warmup:{ scopeHeader:'x-site-id', seeds:['/seed'], discover:(url, body) => ({ targets:url.pathname === '/seed' && body && typeof body === 'object' && 'next' in body && body.next === '/child' ? ['/child'] : [] }) },
+  });
+  const jobs: Promise<unknown>[] = [];
+  const ctx = { waitUntil(task: Promise<unknown>) { jobs.push(task); } };
+  const req = (path: string) => new Request(`https://example.test${path}`, { headers:{ cookie:'session=a', 'x-site-id':'one' } });
+  await wrapped(req('/root'), {}, ctx);
+  while (jobs.length) await Promise.all(jobs.splice(0));
+  expect(paths).toContain('/child');
+  expect(clone).not.toHaveBeenCalled();
+  expect(await (await wrapped(req('/seed'), {}, undefined)).json()).toEqual({ next:'/child' });
+  expect(paths.filter((path) => path === '/seed')).toHaveLength(1);
+});
+
+it('releases the cold owner after an invalid internal warm body', async () => {
+  let seedReads = 0;
+  const handler = vi.fn(async (input: Request) => {
+    limitReadResponseLeaseUntil(Date.now() + 5000);
+    if (new URL(input.url).pathname !== '/seed') return Response.json({ root:true });
+    seedReads++;
+    return seedReads === 1 ? new Response('{', { headers:{ 'content-type':'application/json' } }) : Response.json({ value:2 });
+  });
+  const wrapped = wrapReadResponseLease(handler, { ...policy, namespace:'warm-invalid-capture', paths:['/root', '/seed'], warmup:{ scopeHeader:'x-site-id', seeds:['/seed'] } });
+  const jobs: Promise<unknown>[] = [];
+  const ctx = { waitUntil(task: Promise<unknown>) { jobs.push(task); } };
+  const req = (path: string) => new Request(`https://example.test${path}`, { headers:{ cookie:'session=a', 'x-site-id':'one' } });
+  await wrapped(req('/root'), {}, ctx);
+  while (jobs.length) await Promise.all(jobs.splice(0));
+  expect(await (await wrapped(req('/seed'), {}, undefined)).json()).toEqual({ value:2 });
+  expect(await (await wrapped(req('/seed'), {}, undefined)).json()).toEqual({ value:2 });
+  expect(seedReads).toBe(2);
+});
+
+it('keeps the replacement owner when the displaced warm request finishes', async () => {
+  let releaseWarm = () => {};
+  let warmStarted = () => {};
+  let releaseForeground = () => {};
+  let foregroundStarted = () => {};
+  const heldWarm = new Promise<void>((resolve) => { releaseWarm = resolve; });
+  const warmReady = new Promise<void>((resolve) => { warmStarted = resolve; });
+  const heldForeground = new Promise<void>((resolve) => { releaseForeground = resolve; });
+  const foregroundReady = new Promise<void>((resolve) => { foregroundStarted = resolve; });
+  let targetCalls = 0;
+  const handler = vi.fn(async (input: Request) => {
+    if (new URL(input.url).pathname === '/root') {
+      limitReadResponseLeaseUntil(Date.now() + 5000);
+      return Response.json({ root:true });
+    }
+    const value = ++targetCalls;
+    if (value === 1) { warmStarted(); await heldWarm; }
+    if (value === 2) { foregroundStarted(); await heldForeground; }
+    limitReadResponseLeaseUntil(Date.now() + 5000);
+    return Response.json({ value });
+  });
+  const wrapped = wrapReadResponseLease(handler, { ...policy, namespace:'warm-takeover-owner', paths:['/root', '/items'], warmup:{ scopeHeader:'x-site-id', seeds:['/items'] } });
+  const jobs: Promise<unknown>[] = [];
+  const ctx = { waitUntil(task: Promise<unknown>) { jobs.push(task); } };
+  const root = new Request('https://example.test/root', { headers:{ cookie:'session=a', 'x-site-id':'one' } });
+  await wrapped(root, {}, ctx);
+  await warmReady;
+  const first = wrapped(request(), {}, undefined);
+  await foregroundReady;
+  releaseWarm();
+  while (jobs.length) await Promise.all(jobs.splice(0));
+  const second = wrapped(request(), {}, undefined);
+  releaseForeground();
+  expect(await Promise.all([first, second].map(async (result) => (await result).json()))).toEqual([{ value:2 }, { value:2 }]);
+  expect(targetCalls).toBe(2);
+});
+
+it('orders a displaced cache write before the foreground replacement', async () => {
+  let releasePut = () => {};
+  let putStarted = () => {};
+  const heldPut = new Promise<void>((resolve) => { releasePut = resolve; });
+  const putReady = new Promise<void>((resolve) => { putStarted = resolve; });
+  const put = vi.spyOn(caches.default, 'put').mockImplementation(async (key, response) => {
+    const body = await response.clone().json();
+    if (body.value === 1) { putStarted(); await heldPut; }
+    entries.set(String(key), response.clone());
+  });
+  try {
+    let targetCalls = 0;
+    const handler = vi.fn(async (input: Request) => {
+      limitReadResponseLeaseUntil(Date.now() + 5000);
+      return Response.json(new URL(input.url).pathname === '/root' ? { root:true } : { value:++targetCalls });
+    });
+    const wrapped = wrapReadResponseLease(handler, { ...policy, namespace:'warm-takeover-put', paths:['/root', '/items'], warmup:{ scopeHeader:'x-site-id', seeds:['/items'] } });
+    const jobs: Promise<unknown>[] = [];
+    const ctx = { waitUntil(task: Promise<unknown>) { jobs.push(task); } };
+    const root = new Request('https://example.test/root', { headers:{ cookie:'session=a', 'x-site-id':'one' } });
+    await wrapped(root, {}, ctx);
+    await putReady;
+    const foreground = wrapped(request(), {}, ctx);
+    expect(await (await foreground).json()).toEqual({ value:2 });
+    releasePut();
+    while (jobs.length) await Promise.all(jobs.splice(0));
+    expect(await (await wrapped(request(), {}, undefined)).json()).toEqual({ value:2 });
+    expect(targetCalls).toBe(2);
+  } finally {
+    releasePut();
+    put.mockRestore();
+  }
+});
+
+for (const mode of ['fresh', 'abort'] as const) {
+  it(`orders a started cache write before an ${mode} replacement`, async () => {
+    let releasePut = () => {};
+    let putStarted = () => {};
+    const heldPut = new Promise<void>((resolve) => { releasePut = resolve; });
+    const putReady = new Promise<void>((resolve) => { putStarted = resolve; });
+    const put = vi.spyOn(caches.default, 'put').mockImplementation(async (key, response) => {
+      const body = await response.clone().json();
+      if (body.value === 1) { putStarted(); await heldPut; }
+      entries.set(String(key), response.clone());
+    });
+    try {
+      let calls = 0;
+      const handler = vi.fn(async () => {
+        limitReadResponseLeaseUntil(Date.now() + 5000);
+        return Response.json({ value:++calls });
+      });
+      const wrapped = wrapReadResponseLease(handler, { ...policy, namespace:`cold-put-${mode}` });
+      const jobs: Promise<unknown>[] = [];
+      const ctx = { waitUntil(task: Promise<unknown>) { jobs.push(task); } };
+      const controller = new AbortController();
+      await wrapped(new Request(request(), { signal:controller.signal }), {}, ctx);
+      await putReady;
+      if (mode === 'abort') controller.abort();
+      const replacement = mode === 'fresh' ? request('session=a', 'GET', { 'x-fresh':'1' }) : request();
+      expect(await (await wrapped(replacement, {}, ctx)).json()).toEqual({ value:2 });
+      if (mode === 'fresh') {
+        expect(await (await wrapped(request('session=a', 'GET', { 'x-fresh':'1' }), {}, ctx)).json()).toEqual({ value:3 });
+      }
+      releasePut();
+      while (jobs.length) await Promise.all(jobs.splice(0));
+      expect(await (await wrapped(request(), {}, undefined)).json()).toEqual({ value:mode === 'fresh' ? 3 : 2 });
+      expect(calls).toBe(mode === 'fresh' ? 3 : 2);
+    } finally {
+      releasePut();
+      put.mockRestore();
+    }
+  });
+}
 
 it('keeps credentials and sites separate and falls back after an uncacheable source', async () => {
   let release: (() => void) | undefined;
@@ -144,6 +387,41 @@ it('refreshes ahead in the background and reuses the renewed response', async ()
   vi.setSystemTime(13_001);
   expect(await (await f.wrapped(request(), {}, undefined)).json()).toHaveProperty('count', 2);
   expect(f.handler).toHaveBeenCalledTimes(2);
+});
+
+it('returns the cached hit while capturing a refresh stream once', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(10_000);
+  let finishStream = () => {};
+  let refreshStarted = () => {};
+  const ready = new Promise<void>((resolve) => { refreshStarted = resolve; });
+  const clone = vi.fn((): Response => { throw Error('original stream must not be cloned'); });
+  let calls = 0;
+  const handler = vi.fn(async () => {
+    const value = ++calls;
+    limitReadResponseLeaseUntil(Date.now() + 5000);
+    if (value === 1) return Response.json({ value });
+    const response = new Response(new ReadableStream({
+      start(controller) {
+        finishStream = () => { controller.enqueue(new TextEncoder().encode('{"value":2}')); controller.close(); };
+        refreshStarted();
+      },
+    }), { headers:{ 'content-type':'application/json' } });
+    Object.defineProperty(response, 'clone', { value:clone });
+    return response;
+  });
+  const wrapped = wrapReadResponseLease(handler, { ...policy, namespace:'refresh-stream-capture', refreshAheadSeconds:2 });
+  const jobs: Promise<unknown>[] = [];
+  const ctx = { waitUntil(task: Promise<unknown>) { jobs.push(task); } };
+  await wrapped(request(), {}, ctx);
+  while (jobs.length) await Promise.all(jobs.splice(0));
+  vi.setSystemTime(13_001);
+  expect(await (await wrapped(request(), {}, ctx)).json()).toEqual({ value:1 });
+  await ready;
+  finishStream();
+  while (jobs.length) await Promise.all(jobs.splice(0));
+  expect(clone).not.toHaveBeenCalled();
+  expect(await (await wrapped(request(), {}, undefined)).json()).toEqual({ value:2 });
+  expect(calls).toBe(2);
 });
 
 it('caps a standalone response lease at a scoped value hit deadline', async () => {
