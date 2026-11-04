@@ -1,3 +1,10 @@
+## [2.1.1](https://github.com/dee-wan-cms/cache/compare/v2.1.0...v2.1.1) (2026-11-04)
+
+
+### Bug Fixes
+
+* **cache:** unblock warming and background refresh ([87824d5](https://github.com/dee-wan-cms/cache/commit/87824d5c1dc5c5d8c2e29047620fe35cfedee092))
+
 # [2.1.0](https://github.com/dee-wan-cms/cache/compare/v2.0.6...v2.1.0) (2026-11-03)
 
 
