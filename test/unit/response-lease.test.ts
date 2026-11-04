@@ -215,7 +215,7 @@ it('orders a displaced cache write before the foreground replacement', async () 
   const putReady = new Promise<void>((resolve) => { putStarted = resolve; });
   const put = vi.spyOn(caches.default, 'put').mockImplementation(async (key, response) => {
     const body = await response.clone().json();
-    if (body.value === 1) { putStarted(); await heldPut; }
+    if (body !== null && typeof body === 'object' && 'value' in body && body.value === 1) { putStarted(); await heldPut; }
     entries.set(String(key), response.clone());
   });
   try {
@@ -250,7 +250,7 @@ for (const mode of ['fresh', 'abort'] as const) {
     const putReady = new Promise<void>((resolve) => { putStarted = resolve; });
     const put = vi.spyOn(caches.default, 'put').mockImplementation(async (key, response) => {
       const body = await response.clone().json();
-      if (body.value === 1) { putStarted(); await heldPut; }
+      if (body !== null && typeof body === 'object' && 'value' in body && body.value === 1) { putStarted(); await heldPut; }
       entries.set(String(key), response.clone());
     });
     try {
