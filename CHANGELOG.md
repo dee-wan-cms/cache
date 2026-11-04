@@ -1,3 +1,15 @@
+# [2.2.0](https://github.com/dee-wan-cms/cache/compare/v2.1.1...v2.2.0) (2026-11-04)
+
+
+### Bug Fixes
+
+* **warmup:** keep discovered navigation FIFO ([94342ba](https://github.com/dee-wan-cms/cache/commit/94342baf4924a1e9ef768d8d1418c7c90f76d0b6))
+
+
+### Features
+
+* **client:** allow bounded-stale bookmark reads ([cf4575a](https://github.com/dee-wan-cms/cache/commit/cf4575a164b18a1af6e24998425ff489ab04dd4d))
+
 ## [2.1.1](https://github.com/dee-wan-cms/cache/compare/v2.1.0...v2.1.1) (2026-11-04)
 
 
