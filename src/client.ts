@@ -1,5 +1,5 @@
 import type { D1CacheProfile } from './d1/profile';
-import { needsFreshness } from './d1/read-freshness-policy';
+import { matchesPath, needsFreshness } from './d1/read-freshness-policy';
 
 export function createSingleFlight<Key, Value>() {
   const pending = new Map<Key, Promise<Value>>();
@@ -207,7 +207,12 @@ export interface D1BookmarkStorage {
   setItem(key: string, value: string): void;
 }
 
-export function createD1BookmarkFetch(fetcher: typeof fetch = fetch, options: { storage?: D1BookmarkStorage } = {}): typeof fetch {
+export type D1BookmarkFetchOptions = { storage?: D1BookmarkStorage } & (
+  | { advanceOn?: 'all' }
+  | { advanceOn: 'mutations-and-fresh-reads'; freshnessHeader: string; excludedPaths?: readonly string[] }
+);
+
+export function createD1BookmarkFetch(fetcher: typeof fetch = fetch, options: D1BookmarkFetchOptions = {}): typeof fetch {
   const origins = new Map<string, Record<string, string>>();
   return async (input, init) => {
     const request = new Request(input, init);
@@ -224,18 +229,31 @@ export function createD1BookmarkFetch(fetcher: typeof fetch = fetch, options: { 
     };
     mergeStored();
     const headers = new Headers(request.headers);
+    const supplied = parseD1Bookmarks(headers.get(D1_BOOKMARK_HEADER));
     const outgoing = { ...bookmarks };
-    if (!mergeD1Bookmarks(outgoing, parseD1Bookmarks(headers.get(D1_BOOKMARK_HEADER)))) throw new RangeError('D1 bookmark capacity exceeded');
+    if (!mergeD1Bookmarks(outgoing, supplied)) throw new RangeError('D1 bookmark capacity exceeded');
+    const persist = () => {
+      try {
+        const value = serializeD1Bookmarks(bookmarks);
+        if (value && value !== '{}') options.storage?.setItem(key, value);
+      } catch { /* Storage is optional. */ }
+    };
+    if (options.advanceOn === 'mutations-and-fresh-reads') {
+      if (!mergeD1Bookmarks(bookmarks, supplied)) throw new RangeError('D1 bookmark capacity exceeded');
+      persist();
+    }
     const encoded = serializeD1Bookmarks(outgoing);
     if (encoded && encoded !== '{}') headers.set(D1_BOOKMARK_HEADER, encoded);
     else headers.delete(D1_BOOKMARK_HEADER);
     const response = await fetcher(new Request(request, { headers }));
     mergeStored();
-    if (!mergeD1Bookmarks(bookmarks, parseD1Bookmarks(response.headers.get(D1_BOOKMARK_HEADER)))) throw new RangeError('D1 bookmark capacity exceeded');
-    try {
-      const value = serializeD1Bookmarks(bookmarks);
-      if (value && value !== '{}') options.storage?.setItem(key, value);
-    } catch { /* Storage is optional. */ }
+    const method = request.method.toUpperCase();
+    const advance = options.advanceOn !== 'mutations-and-fresh-reads' ||
+      (!matchesPath(new URL(request.url).pathname, options.excludedPaths ?? []) &&
+        ((method === 'GET' && response.ok && headers.has(options.freshnessHeader)) ||
+         (!['GET', 'HEAD', 'OPTIONS'].includes(method) && response.ok)));
+    if (advance && !mergeD1Bookmarks(bookmarks, parseD1Bookmarks(response.headers.get(D1_BOOKMARK_HEADER)))) throw new RangeError('D1 bookmark capacity exceeded');
+    persist();
     return response;
   };
 }

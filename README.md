@@ -359,6 +359,14 @@ refresh; an already-started refresh put completes before the newer foreground pu
 
 ### D1 bookmark client transport
 
+Bounded-stale UIs can set `advanceOn: 'mutations-and-fresh-reads'`,
+`freshnessHeader` and optional `excludedPaths`. Ordinary GETs do not advance the
+stored floor. Successful mutation-method responses and explicit fresh GETs do.
+Non-GET/HEAD/OPTIONS methods count conservatively, including read-only POSTs.
+Excluded ephemeral paths do not advance it. Every request still sends stored and
+caller-supplied floors. Keep optimistic reconciliation and revision checks.
+Omit this option to retain advancement from every response.
+
 `createD1BookmarkFetch(fetch)` wraps a fetch implementation and remembers valid
 `X-Dee-Wan-D1-Bookmarks` response headers. Later requests include the greatest
 bookmark seen for each physical database. Create one wrapper per independent
