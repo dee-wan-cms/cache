@@ -63,6 +63,7 @@ it('coalesces simultaneous eligible misses and rereads the filled lease', async 
 });
 
 it('lets a timed-out foreground waiter replace a stalled owner and fill the lease', async () => {
+  const nextTurn = setImmediate;
   vi.useFakeTimers();
   let release = () => {};
   let entered = () => {};
@@ -79,8 +80,11 @@ it('lets a timed-out foreground waiter replace a stalled owner and fill the leas
   try {
     const first = wrapped(request(), {}, undefined);
     await ready;
-    const second = wrapped(request(), {}, undefined);
-    await vi.advanceTimersByTimeAsync(0);
+    const waitingRequest = request();
+    const listen = vi.spyOn(waitingRequest.signal, 'addEventListener');
+    const second = wrapped(waitingRequest, {}, undefined);
+    while (!listen.mock.calls.some(([event]) => event === 'abort')) await new Promise<void>((resolve) => nextTurn(resolve));
+    listen.mockRestore();
     expect(calls).toBe(1);
     await vi.advanceTimersByTimeAsync(99);
     expect(calls).toBe(1);
