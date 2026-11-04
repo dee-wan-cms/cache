@@ -945,7 +945,7 @@ it('promotes an already queued cold seed when discovery selects it', async () =>
   expect(calls).toEqual(['/api/root', '/api/first', '/api/child', '/api/cold']);
 });
 
-it('runs each newly discovered batch before older siblings without reversing it', async () => {
+it('runs discovered batches FIFO ahead of cold seeds without reversing them', async () => {
   const calls: string[] = [];
   const wrapped = wrapReadResponseLease(async (request) => {
     calls.push(new URL(request.url).pathname);
@@ -957,10 +957,10 @@ it('runs each newly discovered batch before older siblings without reversing it'
   } });
   const ctx = context();
   await wrapped(req('/api/root'), {}, ctx); await ctx.drain();
-  expect(calls).toEqual(['/api/root', '/api/first', '/api/a', '/api/b', '/api/older', '/api/seed']);
+  expect(calls).toEqual(['/api/root', '/api/first', '/api/older', '/api/a', '/api/b', '/api/seed']);
 });
 
-it('replaces only older queued discoveries at a full budget and preserves the new batch order', async () => {
+it('keeps earlier discoveries at a full budget and rejects later peers', async () => {
   const calls: string[] = [];
   const wrapped = wrapReadResponseLease(async (request) => {
     calls.push(new URL(request.url).pathname);
@@ -972,10 +972,10 @@ it('replaces only older queued discoveries at a full budget and preserves the ne
   } });
   const ctx = context();
   await wrapped(req('/api/root'), {}, ctx); await ctx.drain();
-  expect(calls).toEqual(['/api/root', '/api/unscoped', '/api/first', '/api/new-a', '/api/new-b', '/api/older-a']);
+  expect(calls).toEqual(['/api/root', '/api/unscoped', '/api/first', '/api/older-a', '/api/older-b', '/api/older-c']);
 });
 
-it('protects queued learned targets when a discovery replaces an older target at capacity', async () => {
+it('protects queued learned and discovered targets from later peers at capacity', async () => {
   let now = 100_000;
   vi.spyOn(Date, 'now').mockImplementation(() => now);
   const calls: string[] = [];
@@ -994,7 +994,25 @@ it('protects queued learned targets when a discovery replaces an older target at
   await wrapped(req('/api/hot-first'), {}, ctx); await ctx.drain();
   now += 60_001; calls.length = 0;
   await wrapped(req('/api/root'), {}, ctx); await ctx.drain();
-  expect(calls).toEqual(['/api/root', '/api/hot-first', '/api/hot-second', '/api/new']);
+  expect(calls).toEqual(['/api/root', '/api/hot-first', '/api/hot-second', '/api/older']);
+});
+
+it('keeps common navigation ahead of a deep discovery chain under the target budget', async () => {
+  const calls: string[] = [];
+  const wrapped = wrapReadResponseLease(async (request) => {
+    calls.push(new URL(request.url).pathname);
+    limitReadResponseLeaseUntil(Date.now() + 5000);
+    return Response.json({});
+  }, { ...options, namespace:'discovery-navigation-fifo', warmup:{
+    scopeHeader:'x-site-id', discoveryPriority:'next', seeds:['/api/cold-a', '/api/cold-b'], maxTargets:6, concurrency:1,
+    discover:(url) => ({ targets:url.pathname === '/api/root' ? ['/api/start', '/api/nav-a', '/api/nav-b', '/api/nav-c']
+      : url.pathname === '/api/start' ? ['/api/deep-1']
+      : url.pathname === '/api/deep-1' ? ['/api/deep-2']
+      : url.pathname === '/api/deep-2' ? ['/api/deep-3'] : [] }),
+  } });
+  const ctx = context();
+  await wrapped(req('/api/root'), {}, ctx); await ctx.drain();
+  expect(calls).toEqual(['/api/root', '/api/start', '/api/nav-a', '/api/nav-b', '/api/nav-c', '/api/deep-1', '/api/deep-2']);
 });
 
 it('keeps the triggering scope in discovery context for a scope-free child', async () => {

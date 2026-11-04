@@ -109,7 +109,7 @@ export function createResponseWarmup<Env, Context>(run: (request: Request, env: 
       }
       if (seen.size > maxTargets && priority < 2) {
         let index = queue.length - 1;
-        while (index >= 0 && (queue[index]?.priority ?? -1) < (priority === 1 ? 1 : 2)) index--;
+        while (index >= 0 && (queue[index]?.priority ?? -1) < 2) index--;
         if (index >= (batch?.index ?? 0)) { const removed = queue.splice(index, 1)[0]; if (removed) seen.delete(jobKey(removed.url, removed.scope)); }
       }
       if (seen.size > maxTargets) return;
@@ -180,7 +180,7 @@ export function createResponseWarmup<Env, Context>(run: (request: Request, env: 
         if (!deferred) await load();
       }
       const batch = !deferred && discoveryPriority === 'next'
-        ? { index: queue.findIndex((job) => job.priority >= 1) }
+        ? { index: queue.findIndex((job) => job.priority > 1) }
         : undefined;
       if (batch && batch.index === -1) batch.index = queue.length;
       for (const target of found.targets.slice(0, maxTargets)) {

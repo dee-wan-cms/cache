@@ -309,7 +309,8 @@ raw D1 writes, and explicit invalidation. Multiple RPCs can exceed 2 seconds in 
 
 `discoveryPriority: 'next'`:
 
-- New batch: after learned/unscoped targets, before older discoveries. Keep batch order.
-- Full budget: replace older queued discoveries or ordinary seeds only. Protect running,
-  completed, learned and unscoped targets.
+- New batch: after learned/unscoped targets and earlier discoveries, before cold seeds.
+  Keep batch order. Deep chains do not preempt queued navigation targets.
+- Full budget: replace queued cold seeds only. Protect running, completed, earlier
+  discovered, learned and unscoped targets.
 - Equal-priority duplicate: keep its queue position.
