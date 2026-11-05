@@ -18,7 +18,7 @@ export interface JsonResponseEntry {
   body: string;
 }
 
-function requestIdentity(request: Request): unknown | null {
+export function requestIdentity(request: Request): unknown | null {
   if (request.method !== 'GET') return null;
   for (const name of ['range', 'if-match', 'if-none-match', 'if-modified-since', 'if-unmodified-since', 'if-range', 'x-capability', 'x-capability-token', 'x-site-token', 'x-api-key', 'authorization']) if (request.headers.has(name)) return null;
   const url = new URL(request.url);
@@ -80,13 +80,17 @@ export async function cacheD1JsonRead(database: D1Database, options: D1JsonReadO
     try { return await responseEntry(original); } catch { return null; }
   });
   if (original) return original;
-  if (!entry || entry.status !== 200 || typeof entry.statusText !== 'string' || typeof entry.body !== 'string' || !Array.isArray(entry.headers) || !entry.headers.every((header) => Array.isArray(header) && header.length === 2 && typeof header[0] === 'string' && typeof header[1] === 'string' && !hopHeaders.has(header[0].toLowerCase()) && header[0].toLowerCase() !== 'set-cookie' && header[0].toLowerCase() !== 'content-disposition')) return load();
+  return responseFromEntry(entry) ?? load();
+}
+
+export function responseFromEntry(entry: JsonResponseEntry | null): Response | null {
+  if (!entry || entry.status !== 200 || typeof entry.statusText !== 'string' || typeof entry.body !== 'string' || !Array.isArray(entry.headers) || !entry.headers.every((header) => Array.isArray(header) && header.length === 2 && typeof header[0] === 'string' && typeof header[1] === 'string' && !hopHeaders.has(header[0].toLowerCase()) && header[0].toLowerCase() !== 'set-cookie' && header[0].toLowerCase() !== 'content-disposition')) return null;
   try {
     JSON.parse(entry.body);
     const headers = new Headers(entry.headers);
-    if (headers.has('content-encoding') || !/^application\/(?:[a-z0-9.+-]*\+)?json(?:\s*;|$)/i.test(headers.get('content-type') ?? '')) return load();
+    if (headers.has('content-encoding') || !/^application\/(?:[a-z0-9.+-]*\+)?json(?:\s*;|$)/i.test(headers.get('content-type') ?? '')) return null;
     const vary = headers.get('vary');
-    if (vary && vary.split(',').some((name) => name.trim() === '*' || sensitiveHeaders.has(name.trim().toLowerCase()) || ephemeralHeaders.has(name.trim().toLowerCase()))) return load();
+    if (vary && vary.split(',').some((name) => name.trim() === '*' || sensitiveHeaders.has(name.trim().toLowerCase()) || ephemeralHeaders.has(name.trim().toLowerCase()))) return null;
     return new Response(entry.body, { status: entry.status, statusText: entry.statusText, headers });
-  } catch { return load(); }
+  } catch { return null; }
 }

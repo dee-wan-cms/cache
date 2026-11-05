@@ -5,8 +5,8 @@ export { cacheD1Env, createD1CacheRuntime, d1PrismaCacheExtension, withD1PrismaC
 export type { D1PrismaCacheOptions } from './env';
 export { cacheD1Read, d1CacheEpoch, sameD1CacheDatabase } from './read';
 export type { D1ReadOptions } from './read';
-export { cacheD1JsonRead } from './json-read';
-export type { D1JsonReadOptions } from './json-read';
+export { cacheD1JsonRead, requestIdentity, responseEntry, responseFromEntry } from './json-read';
+export type { D1JsonReadOptions, JsonResponseEntry } from './json-read';
 export { cacheRegionalResponse } from './regional-response';
 export type { RegionalResponseOptions } from './regional-response';
 export { regionalD1MetadataTtl } from './request-freshness';

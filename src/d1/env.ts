@@ -83,6 +83,7 @@ export interface D1PrismaCacheOptions {
   scope: unknown;
   dependencies?: readonly D1Database[];
   keyArgs?: (args: unknown) => unknown;
+  validateQuery?: (model: string, operation: string, args: unknown) => void;
   regionalTtlMs?: number;
   regionalModels?: readonly string[];
 }
@@ -103,6 +104,7 @@ export function d1PrismaCacheExtension(database: object, config: GeneratedCacheC
   return {
     ...base,
     query: { $allModels: { async $allOperations(params: Parameters<typeof operation>[0]) {
+      if (params.model) options.validateQuery?.(params.model, params.operation, params.args);
       if (!params.model || !allowed.has(params.model) || !['findUnique', 'findUniqueOrThrow', 'findFirst', 'findFirstOrThrow', 'findMany', 'count', 'aggregate', 'groupBy'].includes(params.operation)) return operation(params);
       if (options.scope === null || options.scope === undefined || !boundedValue(options.scope, 32_768, true) || (options.dependencies?.length ?? 0) > 32) return params.query(params.args);
       const dependencies = dependencyRuntimes(database, options.dependencies ?? []);

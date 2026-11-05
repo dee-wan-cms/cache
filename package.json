@@ -31,6 +31,10 @@
       "import": "./dist/cloudflare/index.js",
       "default": "./dist/cloudflare/index.js"
     },
+    "./yandex": {
+      "types": "./dist/yandex/index.d.ts",
+      "import": "./dist/yandex/index.js"
+    },
     "./d1": {
       "types": "./dist/d1/index.d.ts",
       "import": "./dist/d1/index.js"

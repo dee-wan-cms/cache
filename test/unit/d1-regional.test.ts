@@ -156,6 +156,21 @@ it('expires slow fills and preserves a newer fill when an old fill finishes afte
   expect(await cacheD1Read(db, options, async () => 'unexpected')).toBe('new');
 });
 
+it('validates the Prisma query before returning a cached value', async () => {
+  const f = fixture();
+  const db = f.database();
+  let denied = false;
+  let queries = 0;
+  const extension = d1PrismaCacheExtension(db, config, { scope:'alice', regionalTtlMs:5000, regionalModels:['Meta'], validateQuery: () => { if (denied) throw new Error('denied'); } });
+  if (!extension) throw Error('extension missing');
+  const run = () => extension.query.$allModels.$allOperations({ model:'Meta', operation:'findMany', args:{ where:{ id:1 } }, query:async () => ++queries });
+  expect(await run()).toBe(1);
+  expect(await run()).toBe(1);
+  denied = true;
+  await expect(run()).rejects.toThrow('denied');
+  expect(queries).toBe(1);
+});
+
 it('uses normalized Prisma args and data path while excluding batches and unlisted relations', async () => {
   const f = fixture();
   const db = f.database();
