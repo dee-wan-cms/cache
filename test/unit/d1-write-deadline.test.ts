@@ -5,7 +5,7 @@ import { CacheUnavailableError } from '../../src/core/extension';
 import { createCoordinatorCore, migrate } from '../../src/cloudflare/coordinator-core';
 import { fenceD1Writes } from '../../src/d1/adapter';
 import { createD1CacheRuntime, d1PrismaCacheExtension } from '../../src/d1/env';
-import { d1CacheEpoch } from '../../src/d1/read';
+import { clearD1Cache, d1CacheEpoch } from '../../src/d1/read';
 import { memorySql } from './sqlite';
 
 function setup() {
@@ -111,6 +111,21 @@ it('captures a namespace only while the global fence is available and idle', asy
   const unavailableStore = { ...store, inspectFences: async () => { throw new Error('unavailable'); } };
   const unavailable = createD1CacheRuntime(db, { store: unavailableStore, generation: '1', databaseId: 'db', profile });
   expect(await d1CacheEpoch(unavailable)).toBeNull();
+});
+
+it('clears a wrapped database by advancing its global fence and refuses an unwrapped one', async () => {
+  const { core, store } = setup();
+  store.inspectFences = async (request) => core.inspectFences(request, Date.now());
+  store.invalidate = async (fences) => { core.invalidate(fences, Date.now()); };
+  const unused = (): never => { throw new Error('unused'); };
+  const db: D1Database = { exec: unused, prepare: unused, batch: unused, withSession: unused, dump: unused };
+  const wrapped = createD1CacheRuntime(db, { store, generation: '1', databaseId: 'db', profile });
+  const before = await d1CacheEpoch(wrapped);
+  expect(await clearD1Cache(db)).toBe(false);
+  expect(await clearD1Cache(wrapped)).toBe(true);
+  const after = await d1CacheEpoch(wrapped);
+  expect(after).not.toBeNull();
+  expect(after).not.toBe(before);
 });
 
 function prismaExtension(store: CacheStore, scoped: boolean) {

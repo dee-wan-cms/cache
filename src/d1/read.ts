@@ -37,6 +37,12 @@ export async function d1CacheEpoch(database: object): Promise<string | null> {
   if (!snapshot?.[0]) return null;
   return stableStringify([runtime.databaseId, runtime.generation, snapshot[0].epoch]);
 }
+export async function clearD1Cache(database: object): Promise<boolean> {
+  const runtime = d1CacheRuntime(database);
+  if (!runtime) return false;
+  await runtime.store.invalidate(FENCES);
+  return true;
+}
 export async function inspect(runtimes: readonly D1CacheRuntime[]): Promise<Snapshot[] | null> {
   if (runtimes.length === 0) return [];
   try {

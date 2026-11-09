@@ -11,7 +11,8 @@ type DatabaseInfo = { id: string; db: D1Database; primary: boolean };
 const storage = new AsyncLocalStorage<SessionContext | undefined>();
 const tracking = new AsyncLocalStorage<D1Bookmarks>();
 const primarySource = new AsyncLocalStorage<Set<string>>();
-type AdmissionGroup = { token: object | undefined; context: SessionContext | undefined; pending: number; waiting: Array<() => void>; tracker: D1Bookmarks; trackers: Map<D1Bookmarks, number>; primary?: Set<string>; ambiguous: boolean };
+type AdmissionLease = { at: number; dropped: boolean; onAbandon: (() => void) | undefined };
+type AdmissionGroup = { token: object | undefined; context: SessionContext | undefined; pending: number; waiting: Array<() => void>; tracker: D1Bookmarks; trackers: Map<D1Bookmarks, number>; primary?: Set<string>; ambiguous: boolean; unresumed: Set<AdmissionLease> };
 type AdmissionGate = { active?: AdmissionGroup; waiting: AdmissionGroup[] };
 const admissionScope = new AsyncLocalStorage<{ group: AdmissionGroup; tracker?: D1Bookmarks }>();
 const prismaScope = new AsyncLocalStorage<object>();
@@ -59,7 +60,39 @@ function removeTracker(group: AdmissionGroup, tracker: D1Bookmarks | undefined):
   else group.trackers.set(tracker, count - 1);
 }
 
-export async function runD1SessionOperation<T>(database: object, operation: () => Promise<T>): Promise<T> {
+// workerd never resumes a cancelled request. A slot handed to one would stay taken and stall every
+// later request in the isolate, so a live waiter drops a handoff that is not resumed in time.
+const ADMISSION_HANDOFF_MS = 2_000;
+const ADMISSION_WATCH_MS = 500;
+
+function startAdmissionGroup(scope: AdmissionGate, id: string, next: AdmissionGroup): void {
+  scope.active = next;
+  admitted.set(id, next);
+  trackerGroups.set(next.tracker, next);
+  for (const start of next.waiting.splice(0)) start();
+}
+
+function releaseAdmission(scope: AdmissionGate, id: string, group: AdmissionGroup): void {
+  group.pending--;
+  if (group.pending || scope.active !== group) return;
+  const next = scope.waiting.shift();
+  if (next) startAdmissionGroup(scope, id, next);
+  else { scope.active = undefined; admitted.delete(id); queues.delete(id); }
+}
+
+function dropUnresumedAdmissions(scope: AdmissionGate, id: string, now: number): void {
+  const active = scope.active;
+  if (!active) return;
+  for (const lease of [...active.unresumed]) {
+    if (now - lease.at < ADMISSION_HANDOFF_MS) continue;
+    lease.dropped = true;
+    active.unresumed.delete(lease);
+    releaseAdmission(scope, id, active);
+    lease.onAbandon?.();
+  }
+}
+
+export async function runD1SessionOperation<T>(database: object, operation: () => Promise<T>, onAbandon?: () => void): Promise<T> {
   const info = infos.get(database);
   const current = storage.getStore();
   const context = current && !current.closed ? current : undefined;
@@ -71,14 +104,10 @@ export async function runD1SessionOperation<T>(database: object, operation: () =
   const active = scope.active;
   const tail = scope.waiting.at(-1);
   const reentrant = active && active.pending > 0 && active.token === token && admissionScope.getStore()?.group === active;
-  const group: AdmissionGroup = active && (reentrant || (token && active.token === token)) ? active : token && tail?.token === token ? tail : { token, context, pending:0, waiting:[], tracker:{}, trackers:new Map(), ambiguous:false };
-  const startGroup = (next: AdmissionGroup) => {
-    scope.active = next;
-    admitted.set(info.id, next);
-    trackerGroups.set(next.tracker, next);
-    for (const start of next.waiting.splice(0)) start();
-  };
+  const group: AdmissionGroup = active && (reentrant || (token && active.token === token)) ? active : token && tail?.token === token ? tail : { token, context, pending:0, waiting:[], tracker:{}, trackers:new Map(), ambiguous:false, unresumed:new Set() };
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let watch: ReturnType<typeof setTimeout> | undefined;
+  let lease: AdmissionLease | undefined;
   try {
     await new Promise<void>((resolve, reject) => {
       let cancelled = false;
@@ -89,16 +118,25 @@ export async function runD1SessionOperation<T>(database: object, operation: () =
           for (const tracker of group.trackers.keys()) ambiguousTrackers.add(tracker);
         }
         group.pending++;
+        lease = { at:Date.now(), dropped:false, onAbandon };
+        group.unresumed.add(lease);
         resolve();
       };
       if (group === active) start();
       else {
         group.waiting.push(start);
         if (group !== tail) {
-          if (!active) startGroup(group);
+          if (!active) startAdmissionGroup(scope, info.id, group);
           else scope.waiting.push(group);
         }
       }
+      if (lease) return;
+      const check = () => {
+        if (lease || cancelled) return;
+        dropUnresumedAdmissions(scope, info.id, Date.now());
+        if (!lease) watch = setTimeout(check, ADMISSION_WATCH_MS);
+      };
+      watch = setTimeout(check, ADMISSION_WATCH_MS);
       if (!group.pending) timer = setTimeout(() => {
         cancelled = true;
         const index = group.waiting.indexOf(start);
@@ -110,7 +148,13 @@ export async function runD1SessionOperation<T>(database: object, operation: () =
         reject(new Error('D1 Prisma admission timed out'));
       }, 30_000);
     });
-  } finally { if (timer !== undefined) clearTimeout(timer); }
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    if (watch !== undefined) clearTimeout(watch);
+  }
+  const admittedLease = lease;
+  if (!admittedLease || admittedLease.dropped) throw new Error('D1 Prisma admission abandoned');
+  group.unresumed.delete(admittedLease);
   const tracker = tracking.getStore();
   const primary = primarySource.getStore();
   if (primary && !group.primary) group.primary = primary;
@@ -118,12 +162,7 @@ export async function runD1SessionOperation<T>(database: object, operation: () =
   try { return await admissionScope.run({ group, tracker }, operation); }
   finally {
     removeTracker(group, tracker);
-    group.pending--;
-    if (!group.pending) {
-      const next = scope.waiting.shift();
-      if (next) startGroup(next);
-      else { scope.active = undefined; admitted.delete(info.id); queues.delete(info.id); }
-    }
+    releaseAdmission(scope, info.id, group);
   }
 }
 
