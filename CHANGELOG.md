@@ -1,3 +1,16 @@
+# [2.3.0](https://github.com/dee-wan-cms/cache/compare/v2.2.0...v2.3.0) (2026-11-16)
+
+
+### Bug Fixes
+
+* **cache:** bound fills and preserve session floors ([e80cf98](https://github.com/dee-wan-cms/cache/commit/e80cf98df3cde8b019544a40ee0c323ab6b76f38))
+* **d1:** release admission on unresumed handoff and add clearD1Cache ([1bfa6e3](https://github.com/dee-wan-cms/cache/commit/1bfa6e3752e892cc9e99b9b5ecaca69f07ce6be6))
+
+
+### Features
+
+* add Yandex cache store and versioned cache store implementations ([0707384](https://github.com/dee-wan-cms/cache/commit/0707384badad80d17cf566cbfe41b3ad61ec89b7))
+
 # [2.2.0](https://github.com/dee-wan-cms/cache/compare/v2.1.1...v2.2.0) (2026-11-04)
 
 
