@@ -1,3 +1,4 @@
+export { CacheFillTimeoutError } from "./core/wait";
 export { CacheUnavailableError, createCacheExtension } from "./core/extension";
 export type {
   CacheExtensionOptions,

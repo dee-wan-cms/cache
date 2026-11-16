@@ -304,6 +304,27 @@ export function advanceD1SessionBookmarks(bookmarks: D1Bookmarks): void {
   }
 }
 
+export async function withD1SessionAnchor<T>(databases: readonly object[], operation: () => Promise<T>): Promise<{ value: T; bookmarks?: D1Bookmarks }> {
+  return runPrimaryD1SessionSource(async () => {
+    if (!d1SessionBookmarkFloor()) return { value:await operation() };
+    const unique = new Map<string, object>();
+    for (const database of databases) {
+      const info = infos.get(database);
+      if (!info) return { value:await operation() };
+      if (!unique.has(info.id)) unique.set(info.id, database);
+    }
+    const anchor = await trackD1SessionSource(async () => {
+      for (const database of unique.values()) {
+        if (!('prepare' in database) || typeof database.prepare !== 'function') throw new TypeError('D1 session database unavailable');
+        await database.prepare('SELECT 1').first();
+      }
+    });
+    const bookmarks = anchor.bookmarks ? { ...anchor.bookmarks } : undefined;
+    const valid = [...unique.keys()].every((id) => !!bookmarks?.[id]);
+    return { value:await operation(), ...(valid ? { bookmarks } : {}) };
+  });
+}
+
 export async function trackD1SessionSource<T>(operation: () => Promise<T>): Promise<{ value: T; bookmarks?: D1Bookmarks }> {
   const context = storage.getStore();
   if (!context || context.closed) return { value:await operation() };
@@ -369,10 +390,10 @@ export function d1SessionCacheHooks(database: object): CacheSessionHooks {
       return runIsolatedD1Session(request, operation);
     },
     async fill(load) {
-      const tracked = await trackD1SessionSource(() => runPrimaryD1SessionSource(load));
+      const tracked = await withD1SessionAnchor([database], load);
       const active = d1SessionBookmarkFloor();
-      const info = infos.get(database);
-      const cached = active && (!info || !tracked.bookmarks?.[info.id]) ? { d1SessionCache:0 } : wrapD1SessionCacheValue(tracked.value, tracked.bookmarks);
+      if (active && !tracked.bookmarks) return { value:tracked.value, cached:undefined, cacheable:false };
+      const cached = active ? { d1SessionCache:1, bookmarks:tracked.bookmarks, value:tracked.value } : tracked.value;
       return { value:tracked.value, cached };
     },
   };

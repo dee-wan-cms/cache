@@ -41,6 +41,16 @@ export default { async fetch(request, env) {
   const beforePrimaryPending = loads;
   await cacheD1Read(e.DB, options, load);
   const primaryPendingBypass = loads - beforePrimaryPending;
+  let pendingActive = 0, pendingMax = 0, pendingCalls = 0, enterPending, releasePending;
+  const pendingEntered = new Promise((resolve) => { enterPending = resolve; });
+  const pendingHold = new Promise((resolve) => { releasePending = resolve; });
+  const pendingLoad = async () => { pendingActive++; pendingCalls++; pendingMax = Math.max(pendingMax, pendingActive); try { if (pendingCalls === 1) { enterPending(); await pendingHold; } return pendingCalls; } finally { pendingActive--; } };
+  const pendingOptions = { key:'pending-serial', scope:'a' };
+  const pendingFirst = cacheD1Read(e.DB, pendingOptions, pendingLoad);
+  await pendingEntered;
+  const pendingSecond = cacheD1Read(e.DB, pendingOptions, pendingLoad);
+  releasePending();
+  const pendingResults = await Promise.all([pendingFirst, pendingSecond]);
   await primaryStore.endWrite({ fences:['g'], token:'primary-lease' });
   let release, reached;
   const paused = new Promise((resolve) => { release = resolve; });
@@ -78,6 +88,22 @@ export default { async fetch(request, env) {
   let outageLoads = 0;
   const outage = createD1CacheRuntime(env.OTHER, { store:{ ...otherStore, inspectFences:async () => { throw Error('offline'); } }, databaseId:ids.OTHER, generation:'1', profile });
   for (let i=0;i<2;i++) await cacheD1Read(e.DB, { key:'outage', scope:'a', dependencies:[outage] }, async () => ++outageLoads);
+  let outageActive = 0, outageMax = 0, concurrentLoads = 0, entered;
+  const enteredSource = new Promise((resolve) => { entered = resolve; });
+  let releaseOutage;
+  const holdOutage = new Promise((resolve) => { releaseOutage = resolve; });
+  const outageSource = async () => {
+    outageActive++; concurrentLoads++; outageMax = Math.max(outageMax, outageActive);
+    try { if (concurrentLoads === 1) { entered(); await holdOutage; throw Error('failed owner'); } return concurrentLoads; }
+    finally { outageActive--; }
+  };
+  const outageOptions = { key:'concurrent-outage', scope:'a', dependencies:[outage] };
+  const failedOwner = cacheD1Read(e.DB, outageOptions, outageSource).catch(() => 'failed');
+  await enteredSource;
+  const outageFollowers = Promise.all([cacheD1Read(e.DB, outageOptions, outageSource), cacheD1Read(e.DB, outageOptions, outageSource)]);
+  await Promise.resolve();
+  releaseOutage();
+  const outageResults = [await failedOwner, ...await outageFollowers];
   let oversizeValueLoads = 0;
   for (let i=0;i<2;i++) await cacheD1Read(e.DB, { key:'oversized-value', scope:'a' }, async () => { oversizeValueLoads++; return 'x'.repeat(1600000); });
   let retryLoads = 0;
@@ -121,7 +147,7 @@ export default { async fetch(request, env) {
     await cacheD1JsonRead(e.DB, { ...jsonOptions, key:'vary-cookie' }, () => badResponse({ 'content-type':'application/json', 'vary':'Cookie' }));
     await cacheD1JsonRead(e.DB, { ...jsonOptions, key:'oversize-json' }, async () => { jsonLoads++; return new Response('x'.repeat(1000001), { headers:{ 'content-type':'application/json' } }); });
   }
-  return Response.json({ first,warm,warmLoads,separated,afterOther,afterPrimary,pendingBypass,primaryPendingBypass,afterRace,current,noInspectLoads,primaryNoInspectLoads,primaryReads,primaryInspections,primaryLoads,disabledLoads,failedWriteLoads,failedValue,oversizedLoads,outageLoads,oversizeValueLoads,retryLoads,declinedLoads,invalidTtlLoads,nullLoads,typedLoads,typedResult,missingDependencyLoads,jsonLoads,beforeBypass,hitText,headers:{ cache:jsonHit.headers.get('cache-control'),vary:jsonHit.headers.get('vary'),result:jsonHit.headers.get('x-result') },firstStatus:jsonFirst.status });
+  return Response.json({ first,warm,warmLoads,separated,afterOther,afterPrimary,pendingBypass,primaryPendingBypass,pendingMax,pendingResults,afterRace,current,noInspectLoads,primaryNoInspectLoads,primaryReads,primaryInspections,primaryLoads,disabledLoads,failedWriteLoads,failedValue,oversizedLoads,outageLoads,outageMax,outageResults,concurrentLoads,oversizeValueLoads,retryLoads,declinedLoads,invalidTtlLoads,nullLoads,typedLoads,typedResult,missingDependencyLoads,jsonLoads,beforeBypass,hitText,headers:{ cache:jsonHit.headers.get('cache-control'),vary:jsonHit.headers.get('vary'),result:jsonHit.headers.get('x-result') },firstStatus:jsonFirst.status });
 } };`;
 
 it('caches authorized explicit reads across real D1 dependencies and bypasses unsafe JSON responses', async () => {
@@ -136,6 +162,6 @@ it('caches authorized explicit reads across real D1 dependencies and bypasses un
     }
     const response = await worker.dispatchFetch('http://cache.test/');
     expect(response.status, await response.clone().text()).toBe(200);
-    expect(await response.json()).toMatchObject({ first:{ a:'a1',b:'b1' }, warm:{ a:'a1',b:'b1' }, warmLoads:1, separated:5, afterOther:{ a:'a1',b:'b2' }, afterPrimary:{ a:'a2',b:'b2' }, pendingBypass:1, primaryPendingBypass:1, afterRace:{ a:'a2',b:'b3' }, current:{ a:'a2',b:'b3' }, noInspectLoads:2, primaryNoInspectLoads:1, primaryReads:2, primaryInspections:0, primaryLoads:1, disabledLoads:2, failedWriteLoads:1, failedValue:{ ok:true }, oversizedLoads:2, outageLoads:2, oversizeValueLoads:2, retryLoads:2, declinedLoads:2, invalidTtlLoads:2, nullLoads:2, typedLoads:1, typedResult:{ when:'2026-01-02T03:04:05.000Z', count:'123', bytes:[1,2], undefinedValue:true }, missingDependencyLoads:2, beforeBypass:2, jsonLoads:18, hitText:'{"hello":"world"}', headers:{ cache:'private, no-store', vary:'Origin', result:'ok' }, firstStatus:200 });
+    expect(await response.json()).toMatchObject({ first:{ a:'a1',b:'b1' }, warm:{ a:'a1',b:'b1' }, warmLoads:1, separated:5, afterOther:{ a:'a1',b:'b2' }, afterPrimary:{ a:'a2',b:'b2' }, pendingBypass:1, primaryPendingBypass:1, pendingMax:1, pendingResults:[1,2], afterRace:{ a:'a2',b:'b3' }, current:{ a:'a2',b:'b3' }, noInspectLoads:2, primaryNoInspectLoads:1, primaryReads:2, primaryInspections:0, primaryLoads:1, disabledLoads:2, failedWriteLoads:1, failedValue:{ ok:true }, oversizedLoads:2, outageLoads:2, outageMax:1, outageResults:['failed',2,3], concurrentLoads:3, oversizeValueLoads:2, retryLoads:2, declinedLoads:2, invalidTtlLoads:2, nullLoads:2, typedLoads:1, typedResult:{ when:'2026-01-02T03:04:05.000Z', count:'123', bytes:[1,2], undefinedValue:true }, missingDependencyLoads:2, beforeBypass:2, jsonLoads:18, hitText:'{"hello":"world"}', headers:{ cache:'private, no-store', vary:'Origin', result:'ok' }, firstStatus:200 });
   } finally { await worker.dispose(); }
 });

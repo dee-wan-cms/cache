@@ -22,10 +22,11 @@ export function versionedCacheStore(store: CacheStore, readVersions: () => Promi
   const miss = (epochs: Record<string, number>): ReadResponse => ({ kind: 'miss', epochs, pending: true, lockToken: null, lockHeldForMs: null });
   return {
     ...store,
+    coordinationIdentity: store.coordinationIdentity ?? store,
     async read(request) {
       const before = await versions();
       const key = `versioned:${await sha256Hex(stableStringify([request.key, before]))}`;
-      const result = await store.read({ ...request, key });
+      const result = await store.read({ ...request, key, ...(request.rejectValue === undefined ? {} : { rejectValue:JSON.stringify([request.key, before, request.rejectValue]) }) });
       const token = result.kind === 'hit' ? result.refreshToken : result.lockToken;
       const release = async () => { if (token) await store.release({ key, lockToken: token }); };
       if (before !== await versions()) { await release(); return miss(result.epochs); }

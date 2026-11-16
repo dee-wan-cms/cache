@@ -341,7 +341,7 @@ export function createCoordinatorCore(sql: SqlLike, newToken: () => string, tran
         if (entry && Number(entry.expires_at) > now) {
           const snapshot = parseSnapshot(String(entry.snapshot));
           const current = epochs([...request.fences, ...Object.keys(snapshot ?? {})]);
-          if (snapshot && matches(snapshot, current)) {
+          if (snapshot && matches(snapshot, current) && String(entry.value) !== request.rejectValue) {
             const refreshable =
               request.refresh === true && now >= Number(entry.soft_expires_at) && !lockLive && !pending(request.fences, now);
             return {
@@ -352,6 +352,9 @@ export function createCoordinatorCore(sql: SqlLike, newToken: () => string, tran
               value: String(entry.value),
             };
           }
+        }
+        if (entry && request.rejectValue === String(entry.value) && lockLive) {
+          return { kind: "miss", epochs: epochs(request.fences), lockHeldForMs: Math.max(0, now - Number(lock.acquired_at)), lockToken: null, pending: pending(request.fences, now) };
         }
         if (entry) deleteEntries([request.key]);
         const isPending = pending(request.fences, now);

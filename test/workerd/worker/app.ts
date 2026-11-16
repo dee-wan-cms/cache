@@ -6,7 +6,7 @@ import type { CacheShape, CacheStore, CacheTestHooks, InvalidationTarget } from 
 import { createDurableObjectStore } from "../../../dist/cloudflare/index.js";
 import { createCacheExtension } from "../../../dist/index.js";
 import { limitReadResponseLeaseUntil, wrapReadResponseLease } from "../../../dist/response-lease.js";
-import { createD1CacheRuntime, fenceD1Writes, withD1PrismaCache, wrapD1ReadSessionHandler, prismaD1SessionDatabase, runD1SessionOperation } from "../../../dist/d1/index.js";
+import { createD1CacheRuntime, fenceD1Writes, withD1PrismaCache, wrapD1ReadSessionHandler, prismaD1SessionDatabase, runD1SessionOperation, d1SessionCacheHooks } from "../../../dist/d1/index.js";
 import { cacheConfig } from "../generated/cache/cache-config";
 import { Prisma, PrismaClient } from "../generated/prisma";
 
@@ -42,9 +42,16 @@ interface RunRequest {
   dependencyScope?: string;
   primaryOnly?: boolean;
   barrierOnHit?: string;
+  outageProbe?: string;
+  outageInspect?: string;
+  outageBarrier?: string;
+  outageFail?: boolean;
+  brokenDependency?: boolean;
   innerProbe?: "inside" | "outside";
   tenantName?: string;
   leaseMs?: number;
+  lockMs?: number;
+  disableWaitUntil?: boolean;
   maxValueBytes?: number;
   scope?: string;
   shape?: CacheShape;
@@ -191,6 +198,31 @@ function innerProbe(counter: { inner: number }) {
   };
 }
 
+const outageStates = new Map<string, { active:number; max:number; calls:number }>();
+function outageDatabase(name: string, request: RunRequest, db: D1Database): D1Database {
+  let state = outageStates.get(name);
+  if (!state) { state = { active:0, max:0, calls:0 }; outageStates.set(name, state); }
+  const current = state;
+  const wrap = (statement: D1PreparedStatement): D1PreparedStatement => new Proxy(statement, { get(target, property) {
+    if (property === 'bind') return (...values: unknown[]) => wrap(target.bind(...values));
+    if (property === 'raw') return async (...args: unknown[]) => {
+      current.active++; current.calls++; current.max = Math.max(current.max, current.active);
+      try {
+        if (request.outageBarrier) await waitAtBarrier(db, request.outageBarrier);
+        if (request.outageFail) throw new Error('outage source failure');
+        return await Reflect.apply(target.raw, target, args);
+      } finally { current.active--; }
+    };
+    const member: unknown = Reflect.get(target, property, target);
+    return typeof member === 'function' ? member.bind(target) : member;
+  } });
+  return new Proxy(db, { get(target, property) {
+    if (property === 'prepare') return (sql:string) => wrap(target.prepare(sql));
+    const member: unknown = Reflect.get(target, property, target);
+    return typeof member === 'function' ? member.bind(target) : member;
+  } });
+}
+
 function tenantFilter(name: string) {
   return {
     name: "tenant-filter",
@@ -213,13 +245,17 @@ async function run(request: RunRequest, env: Env, ctx: ExecutionContext): Promis
         });
   const store: CacheStore = {
     ...underlyingStore,
+    coordinationIdentity: underlyingStore.coordinationIdentity ?? underlyingStore,
     read: async (input) => { counter.cacheReads++; const result = await underlyingStore.read(input); if (request.barrierOnHit && result.kind === 'hit') await waitAtBarrier(env.DB, request.barrierOnHit); return result; },
     inspectFences: async (input) => { counter.inspections++; if (!underlyingStore.inspectFences) throw new Error('inspection unavailable'); return underlyingStore.inspectFences(input); },
   };
   const errors: string[] = [];
   const profile = { envPrefix:'TEST_CACHE', bindingNames:['DB'], bindingPrefixes:[], coordinatorNamePrefix:'test:', coordinatorClass:'CacheCoordinator', readModels:['User'], unfencedWriteTables:[] };
-  const primary = request.dependencyScope ? createD1CacheRuntime(countingDb(env.DB, counter), { store, databaseId:'primary', generation:'1', profile }) : countingDb(env.DB, counter);
-  const controlStore = createDurableObjectStore(env.COORDINATOR, { name: (request.coordinatorName ?? 'test') + ':control' });
+  const counted = countingDb(env.DB, counter);
+  const source = request.outageProbe ? outageDatabase(request.outageProbe, request, counted) : counted;
+  const primary = request.dependencyScope ? createD1CacheRuntime(source, { store, databaseId:'primary', generation:'1', profile }) : source;
+  const healthyControlStore = createDurableObjectStore(env.COORDINATOR, { name: (request.coordinatorName ?? 'test') + ':control' });
+  const controlStore = request.brokenDependency ? { ...healthyControlStore, inspectFences:async () => { throw new Error('dependency unavailable'); } } : healthyControlStore;
   const rawControlStore: CacheStore = request.rawBarrier ? { ...controlStore, beginWrite: async (input) => { await controlStore.beginWrite(input); await waitAtBarrier(env.DB, request.rawBarrier!); } } : controlStore;
   const control = createD1CacheRuntime(env.OTHER, { store: rawControlStore, databaseId:'control', generation:'1', profile });
   const base = new PrismaClient({ adapter: new PrismaD1(primary) });
@@ -234,13 +270,14 @@ async function run(request: RunRequest, env: Env, ctx: ExecutionContext): Promis
       ...(request.generation ? { generation: request.generation } : {}),
       ...(request.coordinationGeneration ? { coordinationGeneration: request.coordinationGeneration } : {}),
       ...(request.leaseMs ? { leaseMs: request.leaseMs } : {}),
+      ...(request.lockMs ? { lockMs: request.lockMs } : {}),
       ...(request.maxValueBytes ? { maxValueBytes: request.maxValueBytes } : {}),
       onError: (error, context) => errors.push(`${context}: ${error instanceof Error ? error.message : String(error)}`),
       scope: request.scope ?? "",
       ...(request.shape ? { shape: { default: request.shape } } : {}),
       store,
       unsafeTestHooks: hooksFor(request, env.DB),
-      waitUntil: (promise) => ctx.waitUntil(promise),
+      ...(!request.disableWaitUntil ? { waitUntil: (promise: Promise<unknown>) => ctx.waitUntil(promise) } : {}),
     }),
   );
   const client = request.innerProbe === "outside" ? cached.$extends(innerProbe(counter)) : cached;
@@ -259,15 +296,17 @@ async function run(request: RunRequest, env: Env, ctx: ExecutionContext): Promis
     }
   }
   const elapsedMs = Date.now() - started;
-  return Response.json({ elapsedMs, errors, inner: counter.inner, results, statements: counter.statements, cacheReads: counter.cacheReads, inspections: counter.inspections }, { headers: { "cache-control": "no-store" } });
+  return Response.json({ elapsedMs, errors, inner: counter.inner, results, statements: counter.statements, cacheReads: counter.cacheReads, inspections: counter.inspections, outage: request.outageInspect || request.outageProbe ? outageStates.get(request.outageInspect ?? request.outageProbe ?? '') : undefined }, { headers: { "cache-control": "no-store" } });
 }
 
 const sessionOptions = { bindingNames:['DB'], bindingPrefixes:['SITE_'], databaseIdsEnv:'SESSION_IDS' };
 let sessionClientCount = 0;
 let sessionCacheHits = 0;
-function createSessionClient(database: D1Database, env: Env, beforeRead?: () => Promise<void>, onAdmission?: (operation: string) => void) {
+let sessionSourceReads = 0;
+let sessionCacheWrites = 0;
+function createSessionClient(database: D1Database, env: Env, beforeRead?: () => Promise<void>, onAdmission?: (operation: string) => void, hook = false) {
   const underlying = createDurableObjectStore(env.COORDINATOR, { name:'session-prisma-cache' });
-  const store: CacheStore = { ...underlying, async read(input) {
+  const store: CacheStore = { ...underlying, async write(input) { sessionCacheWrites++; return underlying.write(input); }, async read(input) {
     if (beforeRead) await beforeRead();
     const result = await underlying.read(input);
     if (result.kind === 'hit') sessionCacheHits++;
@@ -275,21 +314,40 @@ function createSessionClient(database: D1Database, env: Env, beforeRead?: () => 
   } };
   const profile = { envPrefix:'SESSION', bindingNames:['DB'], bindingPrefixes:[], coordinatorNamePrefix:'session:', coordinatorClass:'CacheCoordinator', readModels:['User'], unfencedWriteTables:[] };
   const fenced = createD1CacheRuntime(database, { store, databaseId:'00000000-0000-0000-0000-000000000001', generation:'1', profile });
-  const base = new PrismaClient({ adapter:new PrismaD1(prismaD1SessionDatabase(fenced)) });
+  const prismaDatabase = prismaD1SessionDatabase(fenced);
+  const instrumentStatement = (statement: D1PreparedStatement): D1PreparedStatement => new Proxy(statement, { get(target, property) {
+    if (property === 'bind') return (...values: unknown[]) => instrumentStatement(target.bind(...values));
+    if (property === 'raw') return (...args: unknown[]) => { sessionSourceReads++; return Reflect.apply(target.raw, target, args); };
+    const member: unknown = Reflect.get(target, property, target);
+    return typeof member === 'function' ? member.bind(target) : member;
+  } });
+  const countedDatabase = new Proxy(prismaDatabase, { get(target, property) {
+    if (property === 'prepare') return (sql: string) => instrumentStatement(target.prepare(sql));
+    const member: unknown = Reflect.get(target, property, target);
+    return typeof member === 'function' ? member.bind(target) : member;
+  } });
+  const base = new PrismaClient({ adapter:new PrismaD1(countedDatabase) });
   const admitted = base.$extends({ query:{ $allOperations({ args, query, operation }) { onAdmission?.(operation); return runD1SessionOperation(fenced, async () => query(args)); } } });
-  return withD1PrismaCache(admitted, fenced, cacheConfig, { scope:'session-test' }, Prisma.Decimal);
+  return hook ? admitted.$extends(createCacheExtension({ config:cacheConfig, store, generation:'1', scope:'session-hook', decimal:Prisma.Decimal, sessionCache:d1SessionCacheHooks(fenced) })) : withD1PrismaCache(admitted, fenced, cacheConfig, { scope:'session-test' }, Prisma.Decimal);
 }
 const sessionClients = new WeakMap<D1Database, ReturnType<typeof createSessionClient>>();
+const hookSessionClients = new WeakMap<D1Database, ReturnType<typeof createSessionClient>>();
 const sessionHandler = wrapD1ReadSessionHandler(async (request: Request, env: Env & { SITE_alias: D1Database; SESSION_IDS: string }) => {
-  let client = sessionClients.get(env.DB);
+  const hook = new URL(request.url).searchParams.has('hook');
+  const clients = hook ? hookSessionClients : sessionClients;
+  let client = clients.get(env.DB);
   if (!client) {
-    client = createSessionClient(env.DB, env);
-    sessionClients.set(env.DB, client);
+    client = createSessionClient(env.DB, env, undefined, undefined, hook);
+    clients.set(env.DB, client);
     sessionClientCount++;
   }
   const url = new URL(request.url);
   const name = url.searchParams.get('name') ?? '';
   if (request.method === 'POST') await client.user.create({ data:{ email:`${name}@example.test`, name } });
+  if (url.searchParams.has('page')) {
+    const [rows, count] = await Promise.all([client.user.findMany({ where:{ name } }), client.user.count({ where:{ name } })]);
+    return Response.json({ rows, count, sourceReads:sessionSourceReads, cacheHits:sessionCacheHits, cacheWrites:sessionCacheWrites });
+  }
   if (url.searchParams.has('unique')) {
     const scopedClient = client;
     const getUnique = () => scopedClient.user.findUnique({ where:{ email:`${name}@example.test` } });

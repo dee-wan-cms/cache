@@ -263,6 +263,98 @@ describe("concurrency", () => {
     expect(statements).toBe(cold.statements);
   });
 
+  it("keeps default-policy followers waiting past the old poll budget", async () => {
+    await seedUsers();
+    const query = op("user", "findMany", { orderBy:{ id:"asc" } });
+    const isolated = { coordinatorName:`${coordinatorName}-default-wait` };
+    const owner = one(query, { ...isolated, barrierAfterFill:"default-wait" });
+    await until(() => rig.barrierState("default-wait"), (state) => state === "waiting", "default filler at barrier");
+    const followers = Promise.all(Array.from({ length:3 }, () => one(query, isolated)));
+    try {
+      const unrelated = await one(findUser(1), isolated);
+      expect(unrelated.value).toMatchObject({ name:"Ada" });
+      await new Promise((resolve) => setTimeout(resolve, 1400));
+    } finally { await rig.release("default-wait"); }
+    const filled = await owner;
+    const results = await followers;
+    expect(filled.statements).toBeGreaterThan(0);
+    for (const result of results) {
+      expect(result.value).toEqual(filled.value);
+      expect(result.statements).toBe(0);
+      expect(result.result.cacheReads).toBeLessThanOrEqual(3);
+    }
+  });
+
+  it("serializes fresh outage fallbacks and wakes followers after an owner failure", async () => {
+    await seedUsers();
+    const query = findUser(1);
+    const outage = { coordinator:"broken", outageProbe:`outage-${coordinatorName}` };
+    const owner = one(query, { ...outage, outageBarrier:"outage-source", outageFail:true, allowError:true });
+    await until(() => rig.barrierState("outage-source"), (state) => state === "waiting", "outage source admitted");
+    const followers = Promise.all(Array.from({ length:3 }, () => one(query, outage)));
+    try {
+      const unrelated = await one(findUser(2), { coordinator:"broken", outageProbe:`other-${coordinatorName}`, outageInspect:outage.outageProbe });
+      expect(unrelated.value).toMatchObject({ name:"Bob" });
+      expect(unrelated.result.outage?.calls).toBe(1);
+    } finally { await rig.release("outage-source"); }
+    const failed = await owner;
+    expect(failed.result.results[0]?.error).toContain("outage source failure");
+    const results = await followers;
+    for (const result of results) {
+      expect(result.value).toMatchObject({ name:"Ada" });
+      expect(result.result.outage?.max).toBe(1);
+    }
+    expect(Math.max(...results.map((result) => result.result.outage?.calls ?? 0))).toBe(4);
+  });
+
+  it("serializes scoped Prisma dependency-outage fallbacks without blocking other keys", async () => {
+    await seedUsers();
+    const outage = { dependencyScope:"actor", brokenDependency:true, outageProbe:`dependency-${coordinatorName}` };
+    const owner = one(findUser(1), { ...outage, outageBarrier:"dependency-outage", outageFail:true, allowError:true });
+    await until(() => rig.barrierState("dependency-outage"), (state) => state === "waiting", "dependency outage source admitted");
+    const followers = Promise.all(Array.from({ length:3 }, () => one(findUser(1), outage)));
+    try {
+      const unrelated = await one(findUser(2), { ...outage, outageProbe:`dependency-other-${coordinatorName}`, outageInspect:outage.outageProbe });
+      expect(unrelated.value).toMatchObject({ name:"Bob" });
+      expect(unrelated.result.outage?.calls).toBe(1);
+    } finally { await rig.release("dependency-outage"); }
+    const failed = await owner;
+    expect(failed.result.results[0]?.error).toContain("outage source failure");
+    const results = await followers;
+    for (const result of results) {
+      expect(result.value).toMatchObject({ name:"Ada" });
+      expect(result.result.outage?.max).toBe(1);
+    }
+    expect(Math.max(...results.map((result) => result.result.outage?.calls ?? 0))).toBe(4);
+  });
+
+  it("reuses foreground fills after a local HTTP client abort", async () => {
+    await seedUsers();
+    const query = findUser(1);
+    const isolated = `${coordinatorName}-disconnect`;
+    const controller = new AbortController();
+    const owner = rig.abortableRun({ coordinatorName:isolated, steps:[query], barrierAfterFill:"disconnect-owner" }, controller.signal);
+    const settled = owner.then(() => 'resolved', () => 'aborted');
+    await until(() => rig.barrierState("disconnect-owner"), (state) => state === "waiting", "foreground owner at barrier");
+    controller.abort();
+    try { expect(await settled).toBe('aborted'); }
+    finally { await rig.release("disconnect-owner"); }
+    const result = await one(query, { coordinatorName:isolated });
+    expect(result.value).toMatchObject({ name:"Ada" });
+    expect(result.statements).toBe(0);
+    const control = new AbortController();
+    const controlName = `${isolated}-control`;
+    const controlOwner = rig.abortableRun({ coordinatorName:controlName, steps:[query], barrierAfterFill:"disconnect-control", disableWaitUntil:true, lockMs:500 }, control.signal);
+    const controlSettled = controlOwner.then(() => 'resolved', () => 'aborted');
+    await until(() => rig.barrierState("disconnect-control"), (state) => state === "waiting", "control owner at barrier");
+    control.abort();
+    try { expect(await controlSettled).toBe('aborted'); }
+    finally { await rig.release("disconnect-control"); }
+    const controlRead = await one(query, { coordinatorName:controlName, lockMs:500 });
+    expect(controlRead.value).toMatchObject({ name:"Ada" });
+    expect(controlRead.statements).toBe(0);
+  });
+
   it("rejects a fill whose database read raced a committed write", async () => {
     await seedUsers();
     const reader = one(findUser(1), { barrierAfterFill: "race" });

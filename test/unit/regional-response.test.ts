@@ -90,3 +90,61 @@ it('honors a shorter shared lifetime and namespaces', async () => {
   vi.setSystemTime(101_000);
   expect(await (await cacheRegionalResponse(request(), options, load)).json()).toEqual({ value:3 });
 });
+
+it('coalesces cold responses without sharing bodies', async () => {
+  let release = () => {};
+  let ready = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const started = new Promise<void>((resolve) => { ready = resolve; });
+  const load = vi.fn(async () => { ready(); await held; return origin(); });
+  const first = cacheRegionalResponse(request(), options, load);
+  await started;
+  const second = cacheRegionalResponse(request(), options, load);
+  release();
+  const responses = await Promise.all([first, second]);
+  expect(await Promise.all(responses.map((response) => response.json()))).toEqual([{ value:1 }, { value:1 }]);
+  expect(load).toHaveBeenCalledOnce();
+});
+
+it('releases response waiters after a source error', async () => {
+  let release = () => {};
+  let ready = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const started = new Promise<void>((resolve) => { ready = resolve; });
+  const first = cacheRegionalResponse(request(), options, async () => { ready(); await held; throw Error('source'); });
+  const failed = expect(first).rejects.toThrow('source');
+  await started;
+  const second = cacheRegionalResponse(request(), options, async () => origin(2));
+  release();
+  await failed;
+  expect(await (await second).json()).toEqual({ value:2 });
+});
+
+it('does not write a takeover while an older response put is stalled', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(100_000);
+  let release = () => {};
+  let ready = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const started = new Promise<void>((resolve) => { ready = resolve; });
+  cache.put.mockImplementationOnce(async (key, response) => { ready(); await held; entries.set(key, response.clone()); });
+  const first = cacheRegionalResponse(request(), options, async () => origin(1));
+  await started;
+  vi.setSystemTime(101_001);
+  expect(await (await cacheRegionalResponse(request(), options, async () => origin(2))).json()).toEqual({ value:2 });
+  release();
+  expect(await (await first).json()).toEqual({ value:1 });
+  expect(cache.put).toHaveBeenCalledTimes(1);
+});
+
+it('does not coalesce cold responses across namespaces or request identities', async () => {
+  let release = () => {};
+  let ready = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const started = new Promise<void>((resolve) => { ready = resolve; });
+  const first = cacheRegionalResponse(request(), options, async () => { ready(); await held; return origin(1); });
+  await started;
+  expect(await (await cacheRegionalResponse(request(), { ...options, namespace:'other' }, async () => origin(2))).json()).toEqual({ value:2 });
+  expect(await (await cacheRegionalResponse(request('https://b.test/data'), options, async () => origin(3))).json()).toEqual({ value:3 });
+  release();
+  expect(await (await first).json()).toEqual({ value:1 });
+});

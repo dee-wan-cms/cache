@@ -1,5 +1,6 @@
 import { responseEntry, type JsonResponseEntry } from './json-read';
-import { regionalKey, regionalRead, regionalWrite } from './regional';
+import { createLocalFills } from '../core/local-fill';
+import { createRegionalCache } from './regional';
 import { D1_BOOKMARK_HEADER, decodeD1Bookmarks, serializeD1Bookmarks } from './bookmarks';
 import { d1SessionBookmarkFloor, trackD1SessionSource, responseD1SessionBookmarks, advanceD1SessionBookmarks, varyD1Bookmarks, runPrimaryD1SessionSource } from './session';
 
@@ -8,6 +9,8 @@ export interface RegionalResponseOptions {
   ttlMs: number;
   waitUntil?: (promise: Promise<void>) => void;
 }
+
+const localFills = createLocalFills();
 
 const sensitive = /^(?:cookie|authorization|proxy-authorization|(?:x-)?api-key|(?:x-)?site-token|(?:x-)?site-key|(?:x-)?capability(?:-token)?|x-preview|preview)$/i;
 const ephemeral = /^(?:cf-ray|x-request-id|traceparent|tracestate|cf-connecting-ip|x-forwarded-for)$/i;
@@ -62,10 +65,14 @@ export async function cacheRegionalResponse(request: Request, options: RegionalR
   let requestIdentity: unknown | null;
   try { requestIdentity = identity(request); } catch { return load(); }
   if (requestIdentity === null || typeof options.namespace !== 'string' || !options.namespace.trim()) return load();
+  let cache: Cache | undefined;
+  try { cache = caches.default; } catch { /* Cache API is optional. */ }
+  const capturedCache = cache;
+  const regional = createRegionalCache(5000, undefined, { cache:capturedCache ? () => capturedCache : undefined });
   const floor = d1SessionBookmarkFloor();
-  const key = await regionalKey(options.ttlMs, ['http-response', floor ? 'session-v1' : null, options.namespace, options.ttlMs, requestIdentity]);
+  const key = await regional.regionalKey(options.ttlMs, ['http-response', floor ? 'session-v1' : null, options.namespace, options.ttlMs, requestIdentity]);
   if (!key) return load();
-  const cached = await regionalRead(key, options.ttlMs);
+  const cached = await regional.regionalRead(key, options.ttlMs);
   if (cached) {
     const response = reconstruct(cached.value);
     if (response) {
@@ -79,7 +86,28 @@ export async function cacheRegionalResponse(request: Request, options: RegionalR
       void response.body?.cancel().catch(() => undefined);
     }
   }
+  let acquired = await localFills.acquire(cache, key);
+  if (acquired.retry) {
+    const retry = await regional.regionalRead(key, options.ttlMs);
+    if (retry) {
+      const response = reconstruct(retry.value);
+      if (response) {
+        if (!floor) return response;
+        const raw = response.headers.get(D1_BOOKMARK_HEADER);
+        const source = decodeD1Bookmarks(raw);
+        if (raw && source && Object.entries(floor).every(([id, bookmark]) => source[id] && source[id] >= bookmark)) {
+          advanceD1SessionBookmarks(source);
+          return response;
+        }
+        void response.body?.cancel().catch(() => undefined);
+      }
+    }
+    acquired = await localFills.acquire(cache, key);
+  }
+  const fill = acquired.fill;
   const started = Date.now();
+  let deferred = false;
+  try {
   const tracked = await trackD1SessionSource(() => runPrimaryD1SessionSource(load));
   let response = tracked.value;
   const bookmarks = responseD1SessionBookmarks(response.headers, tracked.bookmarks);
@@ -97,9 +125,21 @@ export async function cacheRegionalResponse(request: Request, options: RegionalR
   const output = reconstruct(entry);
   if (!output) return response;
   const sharedAge = (response.headers.get('cache-control') ?? '').split(',').map((part) => /^\s*s-maxage\s*=\s*"?([1-9]\d*)"?\s*$/i.exec(part)).filter((match): match is RegExpExecArray => match !== null).map((match) => Number(match[1]));
-  const fill = regionalWrite(key, Math.min(options.ttlMs, ...sharedAge.map((age) => age * 1000)), started, entry);
-  if (options.waitUntil) {
-    try { options.waitUntil(fill); } catch { await fill; }
-  } else await fill;
+  if (fill?.valid) {
+    fill.putting = true;
+    const write = regional.regionalWrite(key, Math.min(options.ttlMs, ...sharedAge.map((age) => age * 1000)), started, entry);
+    if (options.waitUntil) {
+      const owner = fill;
+      const task = write.finally(() => {
+        localFills.release(cache, key, owner);
+      });
+      try { options.waitUntil(task); deferred = true; } catch { await task; }
+    } else await write;
+  }
   return output;
+  } finally {
+    if (fill && !deferred) {
+      localFills.release(cache, key, fill);
+    }
+  }
 }

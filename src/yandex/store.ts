@@ -175,10 +175,14 @@ export function createYandexCacheStore(database: CacheDatabase, options: { maxSt
           const nextLock: Lock = { token: token(), expires: time + duration(request.lockMs, MAX_LOCK_MS), acquired: time, kind, gc: meta.gc };
           await tx.put('lock', { key: request.key, value: JSON.stringify(nextLock), expiresAt: nextLock.expires }); return nextLock.token;
         };
-        if (!held && entry && entry.expires > time && entry.gc === meta.gc && validSnapshot(entry.snapshot) && matches(entry.snapshot, values)) {
+        if (!held && entry && entry.expires > time && entry.gc === meta.gc && validSnapshot(entry.snapshot) && matches(entry.snapshot, values) && entry.value !== request.rejectValue) {
           const refreshToken = request.refresh && time >= entry.softExpires && !liveLock && !held ? await acquire('refresh') : null;
           if (changed || refreshToken !== null) await saveMeta(tx, meta);
           return { kind: 'hit' as const, value: entry.value, epochs: current, freshUntil: Math.min(entry.softExpires, entry.expires), refreshToken };
+        }
+        if (entry && request.rejectValue === entry.value && liveLock) {
+          if (changed) await saveMeta(tx, meta);
+          return { kind: 'miss' as const, epochs: current, pending: held, lockToken: null, lockHeldForMs: lock ? Math.max(0, time - lock.acquired) : null };
         }
         if (entry) { await tx.delete('entry', request.key); meta.entries--; meta.bytes = Math.max(0, meta.bytes - entry.bytes); }
         const fillHeld = liveLock && lock?.kind !== 'refresh';

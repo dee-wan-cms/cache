@@ -397,3 +397,16 @@ describe("request validation", () => {
     ).toThrow(TypeError);
   });
 });
+
+describe('conditional repair', () => {
+  it('replaces only the rejected value and preserves a competing owner', () => {
+    expect(fill('repair', ['g'], 0, 'old')).toEqual({ ok:true });
+    const first = read('repair', ['g'], 1, { rejectValue:'old' });
+    expect(first.kind).toBe('miss');
+    if (first.kind !== 'miss' || !first.lockToken) throw new Error('missing repair lock');
+    const follower = read('repair', ['g'], 2, { rejectValue:'old' });
+    expect(follower).toMatchObject({ kind:'miss', lockToken:null, pending:false });
+    expect(core.write({ key:'repair', lockToken:first.lockToken, snapshot:first.epochs, softTtlMs:500, ttlMs:1000, value:'new' }, 3)).toEqual({ ok:true });
+    expect(read('repair', ['g'], 4, { rejectValue:'old' })).toMatchObject({ kind:'hit', value:'new' });
+  });
+});

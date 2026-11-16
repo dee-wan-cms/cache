@@ -216,12 +216,15 @@ it('bounds exposed Prisma raw write and invalidate helpers', async () => {
 it('unscoped Prisma reads fall back after a coordinator timeout and release a late miss lock', async () => {
   vi.useFakeTimers();
   const { core, store } = setup();
-  let finishRead: (() => void) | undefined;
+  const finishReads: Array<() => void> = [];
   let readStarted: (() => void) | undefined;
+  let retryStarted: (() => void) | undefined;
+  let readCount = 0;
   const started = new Promise<void>((resolve) => { readStarted = resolve; });
+  const retried = new Promise<void>((resolve) => { retryStarted = resolve; });
   store.read = async (request) => {
-    readStarted?.();
-    await new Promise<void>((resolve) => { finishRead = resolve; });
+    if (++readCount === 1) readStarted?.(); else retryStarted?.();
+    await new Promise<void>((resolve) => { finishReads.push(resolve); });
     return core.read(request, Date.now());
   };
   const release = vi.fn(async (request: Parameters<CacheStore['release']>[0]) => { core.release(request); });
@@ -230,9 +233,12 @@ it('unscoped Prisma reads fall back after a coordinator timeout and release a la
   const result = prismaExtension(store, false).query.$allModels.$allOperations({ model: 'Post', operation: 'findMany', args: {}, query });
   await started;
   await vi.advanceTimersByTimeAsync(2_000);
+  await retried;
+  await vi.advanceTimersByTimeAsync(2_000);
   await expect(result).resolves.toEqual([{ id: 1 }]);
   expect(query).toHaveBeenCalledTimes(1);
-  finishRead?.();
+  expect(finishReads).toHaveLength(2);
+  for (const finish of finishReads) finish();
   await vi.advanceTimersByTimeAsync(0);
   expect(release).toHaveBeenCalledOnce();
 });

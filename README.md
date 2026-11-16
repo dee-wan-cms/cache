@@ -140,7 +140,8 @@ Invalid options throw a `TypeError` at construction.
 | `waitUntil` | none | Enables refresh after the soft TTL. |
 | `leaseMs` | 60000 | Write lease, at most 600000. |
 | `lockMs` | 30000 | Fill lock, at most 300000. |
-| `fillPollDelaysMs` | 20, 40, 80, 160, 320, 640 | Waits while another request fills the same key. Readers stop waiting once the holder has held the lock longer than the whole budget. |
+| `fillPollDelaysMs` | 50, 100, 200, 500 | Poll delays while another request fills the same key. The last delay repeats. |
+| `fillWaitMs` | `lockMs` | Follower polling deadline; timeout raises `CacheFillTimeoutError` (503). Stores must bound coordinator RPCs. |
 | `maxValueBytes` | 1500000 | Larger results are served but not cached. At most 1900000. |
 | `onError` | none | Receives coordinator, serialization and write errors. |
 

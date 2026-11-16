@@ -245,10 +245,11 @@ it('does not promote a primary pending read or an invalid regional envelope', as
   const f = fixture();
   const db = f.database();
   const options = { key:'pending-primary', scope:'actor', regionalTtlMs:5000 };
-  f.read.mockResolvedValueOnce({ kind:'miss', epochs:{ g:0 }, lockHeldForMs:null, lockToken:null, pending:true });
+  const pending = { kind:'miss' as const, epochs:{ g:0 }, lockHeldForMs:null, lockToken:null, pending:true };
+  f.read.mockResolvedValueOnce(pending).mockResolvedValueOnce(pending);
   expect(await cacheD1Read(db, options, async () => 1)).toBe(1);
   expect(await cacheD1Read(db, options, async () => 2)).toBe(2);
-  expect(f.read).toHaveBeenCalledTimes(2);
+  expect(f.read).toHaveBeenCalledTimes(3);
   const key = await regionalKey(5000, 'bad-envelope');
   if (!key) throw Error('key missing');
   entries.set(key, new Response(JSON.stringify({ expires:Date.now() + 10_000, value:1 })));

@@ -53,7 +53,7 @@ request flow. Fail to the database, never to stale cache.
 - Scope discovery skips only the bootstrap variant actually loaded. A discovered scope can warm
   the same URL under its own header key.
 - HTTP lease cold fills coalesce within one isolate and credential key, up to 1024 active keys.
-  Followers wait at most 5 seconds, then recheck cache and bookmark floors. No source response sharing.
+  Foreground followers wait at most 100 ms; internal warm followers wait at most 5 seconds. Both recheck cache and bookmark floors. No source response sharing.
   Warm jobs and foreground reads share the fill. Fresh reads bypass the wait. Aborting an owner
   releases its waiters and rejects its later fill. Failed fills fall back to source.
 - Warm URLs: same origin, max 8192 characters. Consumer portability rules can set a lower limit.
@@ -97,9 +97,9 @@ DO.read(key, fences = g, m:root, w:each target, e:root:pk when findUnique by pk)
 hit  -> entry snapshot equals current epochs -> return value
 miss -> fill lock granted when no open lease on requested fences and no live fill lock
 lock -> query D1 -> DO.write(key, lock, snapshot) -> return value
-lock held by a fill -> poll 20,40,80,160,320,640 ms; stop at once and query D1 when the holder has
-  held it longer than the whole poll budget
-lease open -> query D1, no write
+lock held by a fill -> poll 50,100,200,500 ms, then every 500 ms until fillWaitMs or lockMs
+  expires; throw CacheFillTimeoutError on timeout
+lease open -> serialize compatible local source admissions, recheck, query D1 fresh; no cache write
 DO error -> query D1
 ```
 
@@ -218,7 +218,7 @@ target through a foreign key are widened. Unknown model names throw. Wrong key a
 ```text
 cached read, hit                   1 DO call
 cached read, miss                  1 DO call + D1 queries + 1 DO call (fill write or release)
-cached read, fill lock contended   up to 7 DO calls (polls) + D1 queries when the holder is slow
+cached read, fill lock contended   bounded polling until the result or wait deadline
 read in a batch transaction        D1 queries only
 non-cacheable read                 D1 queries only
 write                              2 DO calls + D1 queries; each retried up to 3 attempts
@@ -314,3 +314,11 @@ raw D1 writes, and explicit invalidation. Multiple RPCs can exceed 2 seconds in 
 - Full budget: replace queued cold seeds only. Protect running, completed, earlier
   discovered, learned and unscoped targets.
 - Equal-priority duplicate: keep its queue position.
+
+### Fill waiting and session floors
+
+A coordinated fill has a 30 second lock by default. Followers poll with bounded backoff until the lock lifetime or the configured `fillWaitMs` deadline. A wait timeout raises `CacheFillTimeoutError` with status 503. The wait deadline does not cancel a coordinator RPC; caller-supplied stores must bound their own RPCs. When provided, host `waitUntil` retains a foreground fill. Cloudflare limits that retention to 30 seconds after a response or disconnect; local Miniflare abort controls did not reproduce server cancellation. Lock expiry cannot cancel a stalled source: a successor can overlap it, but the expired token cannot publish a late result. Pending writes bypass the cache. Compatible same-key reads take local admission in turn, recheck state and query the source fresh; they never share a source value. Local notification tracks at most 1024 owners and 1024 waiters per isolate; saturation raises `CacheFillTimeoutError` for queued source admission. Coordinator failures fall back to the source. Compatible local fallbacks run in turn and do not share results. A recovered coordinator can admit a fill while an outage fallback still runs. No cross-isolate coalescing guarantee applies during an outage.
+
+D1 Prisma and session-hook fills anchor each declared database on primary before the query. The cached bookmark is the pre-query floor, not a later bookmark from a concurrent operation. This adds one `SELECT 1` per database on a cold fill. The database list must include every dependency of the result.
+
+Generic D1 and Yandex reads apply downward TTL jitter by default: 90–100% of `ttlMs`. Set `ttlJitterRatio` to 0 to disable it, or a value up to 1 to configure it. The result never exceeds the configured TTL.

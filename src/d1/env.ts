@@ -1,3 +1,5 @@
+import { CacheFillTimeoutError, localFillOwner } from '../core/wait';
+import { D1_BOOKMARK_HEADER, serializeD1Bookmarks } from './bookmarks';
 import { createDurableObjectStore } from '../cloudflare/store';
 import type { CoordinatorLocationHint } from '../cloudflare/store-options';
 import type { CacheCoordinator } from '../cloudflare/coordinator';
@@ -11,7 +13,7 @@ import { boundedD1Store } from './bounded-store';
 import { regionalKey, regionalRead, regionalWrite } from './regional';
 import { limitRegionalDataUntil } from './regional-deadline';
 import { readTargets } from '../core/targets';
-import { registerD1SessionAlias, d1SessionBookmarkFloor, wrapD1SessionCacheValue, unwrapD1SessionCacheValue, advanceD1SessionBookmarks, trackD1SessionSource, runPrimaryD1SessionSource } from './session';
+import { registerD1SessionAlias, d1SessionBookmarkFloor, wrapD1SessionCacheValue, unwrapD1SessionCacheValue, advanceD1SessionBookmarks, trackD1SessionSource, d1SessionResponseBookmarks, runIsolatedD1Session, withD1SessionAnchor } from './session';
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const hints = new Set(['wnam', 'enam', 'sam', 'weur', 'eeur', 'apac', 'oc', 'afr', 'me']);
@@ -86,6 +88,7 @@ export interface D1PrismaCacheOptions {
   validateQuery?: (model: string, operation: string, args: unknown) => void;
   regionalTtlMs?: number;
   regionalModels?: readonly string[];
+  waitUntil?: (promise: Promise<unknown>) => void;
 }
 
 export function d1PrismaCacheExtension(database: object, config: GeneratedCacheConfig, optionsOrDecimal?: D1PrismaCacheOptions | DecimalConstructor, decimalArg?: DecimalConstructor): ReturnType<typeof createCacheExtension> | undefined {
@@ -95,19 +98,23 @@ export function d1PrismaCacheExtension(database: object, config: GeneratedCacheC
   const decimal = typeof optionsOrDecimal === 'function' ? optionsOrDecimal : decimalArg;
   const allowed = new Set(runtime.readModels);
   const scopedConfig = { ...config, cacheableByModel: Object.fromEntries(Object.entries(config.cacheableByModel).map(([model, enabled]) => [model, enabled && allowed.has(model)])) };
-  const common = { config: scopedConfig, store: runtime.store, generation: runtime.generation, coordinationGeneration: runtime.generation, ...(decimal ? { decimal } : {}), ...(options?.keyArgs ? { keyArgs: options.keyArgs } : {}) };
+  const common = { config: scopedConfig, store: runtime.store, generation: runtime.generation, coordinationGeneration: runtime.generation, ...(decimal ? { decimal } : {}), ...(options?.keyArgs ? { keyArgs: options.keyArgs } : {}), ...(options?.waitUntil ? { waitUntil: options.waitUntil, backgroundRefresh: (operation: () => Promise<void>) => {
+    const bookmarks = d1SessionResponseBookmarks();
+    if (!bookmarks) return operation();
+    const encoded = serializeD1Bookmarks(bookmarks);
+    return runIsolatedD1Session(new Request('https://d1-session.invalid/', { headers:encoded ? { [D1_BOOKMARK_HEADER]:encoded } : {} }), operation);
+  } } : {}) };
   const base = createCacheExtension({ ...common, scope: runtime.databaseId });
   const operation = base.query.$allModels.$allOperations;
   if (!options) return { ...base, query: { $allModels: { $allOperations(params: Parameters<typeof operation>[0]) {
     return d1SessionBookmarkFloor() ? params.query(params.args) : operation(params);
   } } } };
-  return {
-    ...base,
-    query: { $allModels: { async $allOperations(params: Parameters<typeof operation>[0]) {
-      if (params.model) options.validateQuery?.(params.model, params.operation, params.args);
+  const scopedOptions = options;
+  const scopedOperation = async (params: Parameters<typeof operation>[0], fallbackOwner = false, waitDeadline?: number): Promise<unknown> => {
+      if (params.model) scopedOptions.validateQuery?.(params.model, params.operation, params.args);
       if (!params.model || !allowed.has(params.model) || !['findUnique', 'findUniqueOrThrow', 'findFirst', 'findFirstOrThrow', 'findMany', 'count', 'aggregate', 'groupBy'].includes(params.operation)) return operation(params);
-      if (options.scope === null || options.scope === undefined || !boundedValue(options.scope, 32_768, true) || (options.dependencies?.length ?? 0) > 32) return params.query(params.args);
-      const dependencies = dependencyRuntimes(database, options.dependencies ?? []);
+      if (scopedOptions.scope === null || scopedOptions.scope === undefined || !boundedValue(scopedOptions.scope, 32_768, true) || (scopedOptions.dependencies?.length ?? 0) > 32) return params.query(params.args);
+      const dependencies = dependencyRuntimes(database, scopedOptions.dependencies ?? []);
       if (!dependencies) return params.query(params.args);
       const internal = params.__internalParams;
       const dataPath = internal && typeof internal === 'object' && Array.isArray(Reflect.get(internal, 'dataPath')) ? Reflect.get(internal, 'dataPath') : [];
@@ -118,35 +125,58 @@ export function d1PrismaCacheExtension(database: object, config: GeneratedCacheC
       let normalized = false;
       try {
         const identities = [runtime, ...dependencies].map((item) => [item.databaseId, item.generation, item.coordinatorName, item.regionalIdentity]);
-        const targets = options.regionalModels ? readTargets(config.relationGraph, params.model, params.args) : undefined;
-        const allowedTargets = !options.regionalModels || (!!targets && [...targets.models].every((model) => options.regionalModels?.includes(model)));
-        if (options.regionalTtlMs && options.regionalTtlMs > 0 && options.regionalTtlMs <= 5000 && !inBatch && allowedTargets && identities.every((item) => item[3])) {
-          normalizedArgs = options.keyArgs ? options.keyArgs(params.args) : params.args;
+        const targets = scopedOptions.regionalModels ? readTargets(config.relationGraph, params.model, params.args) : undefined;
+        const allowedTargets = !scopedOptions.regionalModels || (!!targets && [...targets.models].every((model) => scopedOptions.regionalModels?.includes(model)));
+        if (scopedOptions.regionalTtlMs && scopedOptions.regionalTtlMs > 0 && scopedOptions.regionalTtlMs <= 5000 && !inBatch && allowedTargets && identities.every((item) => item[3])) {
+          normalizedArgs = scopedOptions.keyArgs ? scopedOptions.keyArgs(params.args) : params.args;
           normalized = true;
           const configDigest = await sha256Hex(stableStringify(config));
-          regional = await regionalKey(options.regionalTtlMs, ['prisma', d1SessionBookmarkFloor() ? 'session-v1' : null, options.regionalTtlMs, identities, configDigest, options.scope, params.model, params.operation, dataPath, normalizedArgs ?? null]);
+          regional = await regionalKey(scopedOptions.regionalTtlMs, ['prisma', d1SessionBookmarkFloor() ? 'session-v1' : null, scopedOptions.regionalTtlMs, identities, configDigest, scopedOptions.scope, params.model, params.operation, dataPath, normalizedArgs ?? null]);
         }
       } catch { /* Key callbacks use the strict path on failure. */ }
-      const hit = await regionalRead(regional, options.regionalTtlMs, decimal);
+      const hit = await regionalRead(regional, scopedOptions.regionalTtlMs, decimal);
       if (hit) {
         const cached = unwrapD1SessionCacheValue(hit.value, [runtime, ...dependencies].map((item) => item.databaseId));
         if (cached) { if (cached.bookmarks) advanceD1SessionBookmarks(cached.bookmarks); limitRegionalDataUntil(hit.expires); return cached.value; }
       }
       let started = Date.now();
       const snapshot = await inspect(dependencies);
-      if (!snapshot) return params.query(params.args);
+      if (!snapshot) {
+        if (inBatch) return params.query(params.args);
+        if (fallbackOwner) {
+          if (waitDeadline !== undefined && Date.now() >= waitDeadline) throw new CacheFillTimeoutError();
+          return params.query(params.args);
+        }
+        let fallbackKey: string;
+        try {
+          const args = normalized ? normalizedArgs : scopedOptions.keyArgs ? scopedOptions.keyArgs(params.args) : params.args;
+          const identity = stableStringify([runtime.databaseId, runtime.generation, dependencies.map((item) => [item.databaseId, item.generation, item.coordinatorName]), scopedOptions.scope, params.model, params.operation, dataPath, args]);
+          if (new TextEncoder().encode(identity).byteLength > 32_768) return params.query(params.args);
+          fallbackKey = `dependency-prisma:${await sha256Hex(identity)}`;
+        } catch { return params.query(params.args); }
+        const deadline = waitDeadline ?? Date.now() + 30_000;
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) throw new CacheFillTimeoutError();
+        return localFillOwner(runtime.store.coordinationIdentity ?? runtime.store, fallbackKey, remaining, () => scopedOperation(params, true, deadline));
+      }
       let scope: string;
       try {
-        scope = stableStringify([d1SessionBookmarkFloor() ? 'session-v1' : null, runtime.databaseId, runtime.generation, options.scope, snapshot.map(({ runtime: dependency, epoch }) => [dependency.databaseId, dependency.generation, epoch])]);
+        scope = stableStringify([d1SessionBookmarkFloor() ? 'session-v1' : null, runtime.databaseId, runtime.generation, scopedOptions.scope, snapshot.map(({ runtime: dependency, epoch }) => [dependency.databaseId, dependency.generation, epoch])]);
         if (new TextEncoder().encode(scope).byteLength > 32_768) return params.query(params.args);
       } catch { return params.query(params.args); }
       let verifiedHit = false;
       let hitBookmarks: Record<string, string> | undefined;
       let verifiedWrite = false;
       let queried = false;
-      const store: CacheStore = { ...runtime.store,
+      let sourceBookmarks: Record<string, string> | undefined;
+      const store: CacheStore = { ...runtime.store, coordinationIdentity: runtime.store.coordinationIdentity ?? runtime.store,
         async write(request) {
-          const value = d1SessionBookmarkFloor() ? JSON.stringify(wrapD1SessionCacheValue(request.value)) : request.value;
+          const wrapped = d1SessionBookmarkFloor() ? (sourceBookmarks ? { d1SessionCache:1, bookmarks:sourceBookmarks, value:request.value } : { d1SessionCache:0 }) : request.value;
+          if (wrapped && typeof wrapped === 'object' && Reflect.get(wrapped, 'd1SessionCache') === 0) {
+            await runtime.store.release({ key: request.key, lockToken: request.lockToken });
+            return { ok:false, reason:'invalid' };
+          }
+          const value = typeof wrapped === 'string' ? wrapped : JSON.stringify(wrapped);
           const result = await runtime.store.write({ ...request, value });
           verifiedWrite = result.ok;
           return result;
@@ -157,7 +187,11 @@ export function d1PrismaCacheExtension(database: object, config: GeneratedCacheC
         if (result.kind === 'hit' && d1SessionBookmarkFloor()) {
           let cached;
           try { cached = unwrapD1SessionCacheValue(JSON.parse(result.value), [runtime, ...dependencies].map((item) => item.databaseId)); } catch { cached = null; }
-          if (!cached || typeof cached.value !== 'string') return { kind:'miss', epochs:result.epochs, lockHeldForMs:null, lockToken:null, pending:true };
+          if (!cached || typeof cached.value !== 'string') {
+            if (result.refreshToken) await runtime.store.release({ key:request.key, lockToken:result.refreshToken });
+            const replacement = await runtime.store.read({ ...request, refresh:false, rejectValue:result.value });
+            return replacement.kind === 'hit' ? { kind:'miss', epochs:replacement.epochs, lockHeldForMs:null, lockToken:null, pending:false } : replacement;
+          }
           hitBookmarks = cached.bookmarks;
           verifiedHit = true;
           return { ...result, value:cached.value };
@@ -165,20 +199,24 @@ export function d1PrismaCacheExtension(database: object, config: GeneratedCacheC
         if (result.kind === 'hit') verifiedHit = true;
         return result;
       } };
-      const scoped = createCacheExtension({ ...common, store, scope, ...(normalized ? { keyArgs: () => normalizedArgs } : {}) });
+      const remaining = waitDeadline === undefined ? undefined : waitDeadline - Date.now();
+      if (remaining !== undefined && remaining <= 0) throw new CacheFillTimeoutError();
+      const scoped = createCacheExtension({ ...common, store, scope, ...(remaining === undefined ? {} : { fillWaitMs:remaining }), ...(normalized ? { keyArgs: () => normalizedArgs } : {}) });
       const tracked = await trackD1SessionSource(async () => {
         const value = await scoped.query.$allModels.$allOperations({ ...params, query: async (args) => {
           queried = true;
           started = Date.now();
-          return runPrimaryD1SessionSource(() => params.query(args));
+          const result = await withD1SessionAnchor([database, ...(scopedOptions.dependencies ?? [])], () => params.query(args));
+          sourceBookmarks = result.bookmarks;
+          return result.value;
         } });
         if (!queried && verifiedHit && hitBookmarks) advanceD1SessionBookmarks(hitBookmarks);
         return value;
       });
-      if (regional && ((!queried && verifiedHit) || verifiedWrite) && sameSnapshots(snapshot, await inspect(dependencies))) await regionalWrite(regional, options.regionalTtlMs, started, wrapD1SessionCacheValue(tracked.value, tracked.bookmarks));
+      if (regional && ((!queried && verifiedHit) || verifiedWrite) && sameSnapshots(snapshot, await inspect(dependencies))) await regionalWrite(regional, scopedOptions.regionalTtlMs, started, queried && sourceBookmarks ? { d1SessionCache:1, bookmarks:sourceBookmarks, value:tracked.value } : wrapD1SessionCacheValue(tracked.value, tracked.bookmarks));
       return tracked.value;
-    } } },
-  };
+    };
+  return { ...base, query:{ $allModels:{ $allOperations:(params) => scopedOperation(params) } } };
 }
 
 export function withD1PrismaCache<Client extends object>(client: Client, database: object, config: GeneratedCacheConfig, optionsOrDecimal?: D1PrismaCacheOptions | DecimalConstructor, decimalArg?: DecimalConstructor): Client {

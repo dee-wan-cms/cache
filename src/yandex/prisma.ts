@@ -11,13 +11,14 @@ export function withYandexPrismaCache<Client extends object>(client: Client, opt
   inTransaction: () => boolean;
   keyArgs?: (args: unknown) => unknown;
   validateQuery?: (model: string, operation: string, args: unknown) => void;
+  waitUntil?: (promise: Promise<unknown>) => void;
 }): Client {
   if (options.scope === null || options.scope === undefined || !boundedValue(options.scope, 32768, true)) return client;
   let scope: string;
   try { scope = stableStringify(options.scope); } catch { return client; }
   const allowed = new Set(options.readModels);
   const config = { ...options.config, cacheableByModel: Object.fromEntries(Object.entries(options.config.cacheableByModel).map(([model, enabled]) => [model, enabled && allowed.has(model)])) };
-  const base = createCacheExtension({ config, store: options.store, scope, ...(options.keyArgs ? { keyArgs: options.keyArgs } : {}) });
+  const base = createCacheExtension({ config, store: options.store, scope, ...(options.keyArgs ? { keyArgs: options.keyArgs } : {}), ...(options.waitUntil ? { waitUntil: options.waitUntil } : {}) });
   const operation = base.query.$allModels.$allOperations;
   const extension = { ...base, query: { $allModels: { $allOperations(params: Parameters<typeof operation>[0]) {
     if (params.model) options.validateQuery?.(params.model, params.operation, params.args);

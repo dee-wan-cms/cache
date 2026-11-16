@@ -1,3 +1,4 @@
+import { CacheFillTimeoutError, waitForFill, localFillOwner, trackLocalFill } from '../core/wait';
 import { boundedValue } from '../core/bounded-value';
 import type { D1Database } from '@cloudflare/workers-types';
 import { decode, encode, sha256Hex, stableStringify } from '../core/codec';
@@ -18,6 +19,7 @@ export interface D1ReadOptions<T> {
   scope: unknown;
   dependencies?: readonly D1Database[];
   ttlMs?: number;
+  ttlJitterRatio?: number;
   regionalTtlMs?: number;
   cacheable?: (value: T) => boolean;
 }
@@ -77,10 +79,16 @@ export function dependencyRuntimes(database: object, dependencies: readonly obje
   return [...byId.values()].sort((a, b) => a.databaseId.localeCompare(b.databaseId));
 }
 
-export async function cacheD1Read<T>(database: D1Database, options: D1ReadOptions<T>, load: () => Promise<T>): Promise<T> {
+export function cacheD1Read<T>(database: D1Database, options: D1ReadOptions<T>, load: () => Promise<T>): Promise<T> {
+  return cacheD1ReadInternal(database, options, load, false);
+}
+
+async function cacheD1ReadInternal<T>(database: D1Database, options: D1ReadOptions<T>, load: () => Promise<T>, fallbackOwner: boolean, waitDeadline?: number, pendingOwner = false): Promise<T> {
   const primary = d1CacheRuntime(database);
-  const ttl = options.ttlMs ?? DEFAULT_TTL_MS;
-  if (!primary || !primary.readsEnabled || !Number.isFinite(ttl) || ttl <= 0 || ttl > MAX_TTL_MS || options.scope === undefined || options.scope === null || !boundedValue(options.scope, MAX_IDENTITY_BYTES, true) || !boundedValue(options.key, MAX_IDENTITY_BYTES, true)) return load();
+  const ceiling = options.ttlMs ?? DEFAULT_TTL_MS;
+  const jitter = options.ttlJitterRatio ?? 0.1;
+  const ttl = Math.max(1, Math.floor(ceiling * (1 - Math.random() * jitter)));
+  if (!primary || !primary.readsEnabled || !Number.isFinite(ceiling) || ceiling < 1 || ceiling > MAX_TTL_MS || !Number.isFinite(jitter) || jitter < 0 || jitter > 1 || options.scope === undefined || options.scope === null || !boundedValue(options.scope, MAX_IDENTITY_BYTES, true) || !boundedValue(options.key, MAX_IDENTITY_BYTES, true)) return load();
   const source = () => runPrimaryD1SessionSource(load);
   const runtimes = dependencyRuntimes(database, options.dependencies ?? []);
   if (!runtimes) return source();
@@ -94,17 +102,40 @@ export async function cacheD1Read<T>(database: D1Database, options: D1ReadOption
   }
   const started = Date.now();
   const snapshot = await inspect(runtimes);
-  if (!snapshot) return source();
+  if (!snapshot) {
+    if (fallbackOwner || pendingOwner) {
+      if (waitDeadline !== undefined && Date.now() >= waitDeadline) throw new CacheFillTimeoutError();
+      return source();
+    }
+    let fallbackKey: string;
+    try { fallbackKey = `dependency:${await sha256Hex(stableStringify([primary.databaseId, primary.generation, regionalIdentities, options.scope, options.key]))}`; }
+    catch { return source(); }
+    const deadline = waitDeadline ?? Date.now() + 30_000;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new CacheFillTimeoutError();
+    return localFillOwner(primary.store.coordinationIdentity ?? primary.store, fallbackKey, remaining, () => cacheD1ReadInternal(database, options, load, true, deadline));
+  }
   let key: string;
   try {
     const identity = stableStringify(['d1-read-v1', d1SessionBookmarkFloor() ? 'session-v1' : null, primary.databaseId, primary.generation, options.scope, options.key, snapshot.map(({ runtime, epoch }) => [runtime.databaseId, runtime.generation, epoch])]);
     if (new TextEncoder().encode(identity).byteLength > MAX_IDENTITY_BYTES) return load();
     key = `d1:${await sha256Hex(identity)}`;
   } catch { return load(); }
+  const request = { key, fences:FENCES, generation:primary.generation, lockMs:30_000, refresh:false };
+  const deadline = waitDeadline ?? Date.now() + request.lockMs;
+  const localIdentity = primary.store.coordinationIdentity ?? primary.store;
+  const localKey = JSON.stringify([request.generation, key]);
+  const fallback = () => {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new CacheFillTimeoutError();
+    if (fallbackOwner || pendingOwner) return source();
+    return localFillOwner(localIdentity, `${localKey}:fresh`, remaining, () => cacheD1ReadInternal(database, options, load, true, deadline));
+  };
   let result;
-  try { result = await primary.store.read({ key, fences: FENCES, generation: primary.generation, lockMs: 30_000, refresh: false }); }
-  catch { return source(); }
-  if (result.kind === 'hit') {
+  try { result = await waitForFill(primary.store, request, deadline); }
+  catch (error) { if (error instanceof CacheFillTimeoutError) throw error; return fallback(); }
+  let rejected: string | undefined;
+  while (result.kind === 'hit') {
     try {
       const raw: unknown = decode(JSON.parse(result.value));
       const cached = unwrapD1SessionCacheValue(raw, [primary, ...runtimes].map((runtime) => runtime.databaseId));
@@ -115,16 +146,27 @@ export async function cacheD1Read<T>(database: D1Database, options: D1ReadOption
         return value as T;
       }
     } catch { /* Invalid cached values are read from the source. */ }
-    return source();
+    if (result.value === rejected || Date.now() >= deadline) throw new CacheFillTimeoutError();
+    rejected = result.value;
+    try { result = await waitForFill(primary.store, { ...request, rejectValue:result.value }, deadline); }
+    catch (error) { if (error instanceof CacheFillTimeoutError) throw error; return fallback(); }
   }
-  if (!result.lockToken || result.pending) return source();
+  if (result.pending) {
+    if (pendingOwner || fallbackOwner) return source();
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new CacheFillTimeoutError();
+    return localFillOwner(localIdentity, `${localKey}:fresh`, remaining, () => cacheD1ReadInternal(database, options, load, false, deadline, true));
+  }
+  if (!result.lockToken) return source();
   const lockToken = result.lockToken;
+  return trackLocalFill(localIdentity, localKey, request.lockMs, async () => {
   try {
     const tracked = await trackD1SessionSource(source);
     const value = tracked.value;
     try {
       if (value !== null && value !== undefined && boundedValue(value, MAX_VALUE_SIZE, false) && (options.cacheable?.(value) ?? true)) {
         const cachedValue = wrapD1SessionCacheValue(value, tracked.bookmarks);
+        if (cachedValue && typeof cachedValue === 'object' && Reflect.get(cachedValue, 'd1SessionCache') === 0) return value;
         const text = JSON.stringify(encode(cachedValue));
         if (new TextEncoder().encode(text).byteLength <= MAX_VALUE_SIZE && sameSnapshots(snapshot, await inspect(runtimes))) {
           const written = await primary.store.write({ key, lockToken, snapshot: result.epochs, ttlMs: ttl, softTtlMs: ttl, value: text });
@@ -136,4 +178,5 @@ export async function cacheD1Read<T>(database: D1Database, options: D1ReadOption
   } finally {
     try { await primary.store.release({ key, lockToken }); } catch { /* The lock expires if the coordinator cannot be reached. */ }
   }
+  });
 }

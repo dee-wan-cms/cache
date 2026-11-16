@@ -18,6 +18,7 @@ export interface RunResult {
   errors: string[];
   inner: number;
   cacheReads: number;
+  outage?: { active:number; max:number; calls:number };
   inspections: number;
   results: StepResult[];
   statements: number;
@@ -31,6 +32,8 @@ export interface Rig {
   isolateId(worker: WorkerName): Promise<string>;
   release(name: string): Promise<void>;
   sessionBatch(name: string): Promise<FixtureResponse>;
+  sessionPage(name: string, hook?: boolean, bookmark?: string): Promise<FixtureResponse>;
+  advanceSession(name: string): Promise<string>;
   sessionUnique(name: string, sequential?: boolean): Promise<FixtureResponse>;
   sessionPendingWriteRace(): Promise<FixtureResponse>;
   sessionWarmWriteRace(): Promise<FixtureResponse>;
@@ -39,6 +42,7 @@ export interface Rig {
   statusWithoutToken(): Promise<number>;
   reset(): Promise<void>;
   run(body: Record<string, unknown>, worker?: WorkerName): Promise<RunResult>;
+  abortableRun(body: Record<string, unknown>, signal: AbortSignal): Promise<void>;
 }
 
 const SMOKE_TOKEN = "rig-token";
@@ -95,6 +99,17 @@ export async function startRig(): Promise<Rig> {
       (await fetchJson<{ state: null | string }>("cache-test-a", `/barrier?name=${encodeURIComponent(name)}`)).state,
     dispose: () => mf.dispose(),
     isolateId: async (worker) => (await fetchJson<{ isolateId: string }>(worker, "/isolate")).isolateId,
+    advanceSession: async (name) => {
+      const session = db.withSession('first-primary');
+      await session.prepare('UPDATE User SET email = ? WHERE name = ?').bind(`${name}-new@example.test`, name).run();
+      const bookmark = session.getBookmark();
+      if (!bookmark) throw new Error('missing D1 bookmark');
+      return JSON.stringify({ '00000000-0000-0000-0000-000000000001':bookmark });
+    },
+    sessionPage: async (name, hook, bookmark) => {
+      const fetcher = await mf.getWorker('cache-test-a');
+      return fetcher.fetch(`http://rig/session?name=${encodeURIComponent(name)}&page=1${hook ? '&hook=1' : ''}`, { headers:{ 'x-smoke-token':SMOKE_TOKEN, ...(bookmark ? { 'X-Dee-Wan-D1-Bookmarks':bookmark } : {}) } });
+    },
     sessionBatch: async (name) => {
       const fetcher = await mf.getWorker('cache-test-a');
       return fetcher.fetch(`http://rig/session?name=${encodeURIComponent(name)}&batch=1`, { headers:{ 'x-smoke-token':SMOKE_TOKEN } });
@@ -126,6 +141,11 @@ export async function startRig(): Promise<Rig> {
     reset: async () => {
       for (const table of tables) await db.prepare(`DELETE FROM "${table}"`).run();
       await db.prepare("DELETE FROM sqlite_sequence").run().catch(() => undefined);
+    },
+    abortableRun: async (body, signal) => {
+      const address = await mf.ready;
+      const response = await fetch(new URL('/run', address), { method:'POST', signal, body:JSON.stringify(body), headers:{ 'x-smoke-token':SMOKE_TOKEN, 'content-type':'application/json' } });
+      await response.text();
     },
     run: (body, worker = "cache-test-a") =>
       fetchJson<RunResult>(worker, "/run", { body: JSON.stringify(body), headers: { "content-type": "application/json" }, method: "POST" }),

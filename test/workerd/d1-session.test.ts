@@ -138,3 +138,34 @@ export default { fetch:handler };
     response.webSocket?.close();
   } finally { await worker.dispose(); }
 });
+
+it.each([false, true])('reuses both rows and count after a concurrent cold page read (hook %s)', async (hook) => {
+  await rig.reset();
+  expect((await rig.session('page-user', { method:'POST' })).status).toBe(200);
+  const cold = await rig.sessionPage('page-user', hook);
+  expect(cold.status, await cold.clone().text()).toBe(200);
+  const first = await cold.json() as { rows:Array<{ name:string }>; count:number; sourceReads:number };
+  expect(first.rows.map((row) => row.name)).toEqual(['page-user']);
+  expect(first.count).toBe(1);
+  const warm = await rig.sessionPage('page-user', hook);
+  expect(warm.status, await warm.clone().text()).toBe(200);
+  const second = await warm.json() as typeof first;
+  expect(second.rows).toEqual(first.rows);
+  expect(second.count).toBe(1);
+  expect(second, JSON.stringify({ first, second })).toMatchObject({ sourceReads:first.sourceReads });
+});
+
+it.each([false, true])('repairs a cached page for a newer session bookmark (hook %s)', async (hook) => {
+  await rig.reset();
+  expect((await rig.session('bookmark-user', { method:'POST' })).status).toBe(200);
+  expect((await rig.sessionPage('bookmark-user', hook)).status).toBe(200);
+  const bookmark = await rig.advanceSession('bookmark-user');
+  const repaired = await rig.sessionPage('bookmark-user', hook, bookmark);
+  expect(repaired.status, await repaired.clone().text()).toBe(200);
+  const first = await repaired.json() as { rows:Array<{ email:string }>; sourceReads:number };
+  expect(first.rows[0]?.email).toBe('bookmark-user-new@example.test');
+  const repeated = await rig.sessionPage('bookmark-user', hook, bookmark);
+  const second = await repeated.json() as typeof first;
+  expect(second.rows).toEqual(first.rows);
+  expect(second.sourceReads).toBe(first.sourceReads);
+});

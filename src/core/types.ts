@@ -35,6 +35,7 @@ export interface ReadRequest {
   key: string;
   lockMs: number;
   refresh: boolean;
+  rejectValue?: string;
 }
 
 export interface WriteRequest {
@@ -76,6 +77,7 @@ export interface InspectFencesResponse {
 }
 
 export interface CacheStore {
+  coordinationIdentity?: object;
   inspectFences?(request: InspectFencesRequest): Promise<InspectFencesResponse>;
   beginWrite(request: BeginWriteRequest): Promise<void>;
   endWrite(request: EndWriteRequest): Promise<void>;
@@ -110,7 +112,7 @@ export interface DecimalConstructor {
 export interface CacheSessionHooks {
   key(): unknown;
   read(value: unknown): { value: unknown } | null;
-  fill(load: () => Promise<unknown>): Promise<{ value: unknown; cached: unknown }>;
+  fill(load: () => Promise<unknown>): Promise<{ value: unknown; cached: unknown; cacheable?: boolean }>;
   background?(operation: () => Promise<void>): Promise<void>;
 }
 
@@ -120,6 +122,7 @@ export interface CacheExtensionOptions {
   enabled?: boolean;
   excludeModels?: string[];
   fillPollDelaysMs?: number[];
+  fillWaitMs?: number;
   generation?: string;
   coordinationGeneration?: string;
   keyArgs?: (args: unknown) => unknown;
@@ -134,6 +137,7 @@ export interface CacheExtensionOptions {
   /** Test-only fault injection. Never set in production: `skipEndWrite` disables invalidation. */
   unsafeTestHooks?: CacheTestHooks;
   waitUntil?: (promise: Promise<unknown>) => void;
+  backgroundRefresh?: (operation: () => Promise<void>) => Promise<void>;
 }
 
 export type InvalidationTarget =

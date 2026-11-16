@@ -213,3 +213,71 @@ it('orders a foreground fill after a refresh put already in progress', async () 
   await Promise.all(jobs);
   expect(await cacheReadValue(options, async () => 9)).toBe(3);
 });
+
+it('coalesces cold reads and validates the cached value for each caller', async () => {
+  const { options } = setup();
+  let release = () => {};
+  let ready = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const started = new Promise<void>((resolve) => { ready = resolve; });
+  const load = vi.fn(async () => { ready(); await held; return 1; });
+  const first = cacheReadValue(options, load);
+  await started;
+  const second = cacheReadValue(options, load);
+  release();
+  expect(await Promise.all([first, second])).toEqual([1, 1]);
+  expect(load).toHaveBeenCalledOnce();
+  expect(await cacheReadValue({ ...options, validate:(value: unknown): value is number => value === 2 }, async () => 2)).toBe(2);
+});
+
+it('releases waiters after a source error', async () => {
+  const { options } = setup();
+  let release = () => {};
+  let ready = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const started = new Promise<void>((resolve) => { ready = resolve; });
+  const first = cacheReadValue(options, async () => { ready(); await held; throw Error('source'); });
+  const failed = expect(first).rejects.toThrow('source');
+  await started;
+  const second = cacheReadValue(options, async () => 2);
+  release();
+  await failed;
+  expect(await second).toBe(2);
+});
+
+it('does not write a takeover while an older cache put is stalled', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(100_000);
+  try {
+    const base = setup();
+    let release = () => {};
+    let ready = () => {};
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const started = new Promise<void>((resolve) => { ready = resolve; });
+    const cache: Pick<Cache, 'match' | 'put'> = {
+      match:base.cache.match,
+      put:async (key, response) => { ready(); await held; await base.cache.put(key, response); },
+    };
+    const options = { ...base.options, cache };
+    const first = cacheReadValue(options, async () => 1);
+    await started;
+    vi.setSystemTime(101_001);
+    expect(await cacheReadValue(options, async () => 2)).toBe(2);
+    release();
+    expect(await first).toBe(1);
+    expect(base.cache.put).toHaveBeenCalledTimes(1);
+  } finally { vi.useRealTimers(); }
+});
+
+it('does not coalesce cold reads across cache instances or keys', async () => {
+  const a = setup(), b = setup();
+  let release = () => {};
+  let ready = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const started = new Promise<void>((resolve) => { ready = resolve; });
+  const first = cacheReadValue(a.options, async () => { ready(); await held; return 1; });
+  await started;
+  expect(await cacheReadValue({ ...a.options, key:'other' }, async () => 2)).toBe(2);
+  expect(await cacheReadValue(b.options, async () => 3)).toBe(3);
+  release();
+  expect(await first).toBe(1);
+});

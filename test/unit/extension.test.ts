@@ -171,7 +171,7 @@ describe("review fixes in the extension", () => {
     expect(() => createCacheExtension({ config, coordinationGeneration: "x".repeat(257), store })).toThrow(/coordinationGeneration/);
   });
 
-  it("keeps polling a fresh fill lock but stops once its holder has been slower than the whole poll budget", async () => {
+  it("waits for a fill and rejects at the configured deadline", async () => {
     const fresh: ReadResponse = { epochs: { g: 0 }, kind: "miss", lockHeldForMs: 5, lockToken: null, pending: false };
     const hit: ReadResponse = { epochs: { g: 0 }, kind: "hit", refreshToken: null, value: JSON.stringify({ id: 1, from: "cache" }) };
     let reads = 0;
@@ -179,9 +179,9 @@ describe("review fixes in the extension", () => {
     await expect(call(createCacheExtension({ config, store: polling.store }), { where: { id: 1 } }, {})).resolves.toEqual({ from: "cache", id: 1 });
     const held: ReadResponse = { epochs: { g: 0 }, kind: "miss", lockHeldForMs: 25_000, lockToken: null, pending: false };
     const { calls, store } = recordingStore({ read: () => Promise.resolve(held) });
-    const extension = createCacheExtension({ config, store });
-    await expect(call(extension, { where: { id: 1 } }, {}, () => Promise.resolve({ id: 1, from: "db" }))).resolves.toEqual({ from: "db", id: 1 });
-    expect(calls.filter(([name]) => name === "read")).toHaveLength(1);
+    const extension = createCacheExtension({ config, store, fillWaitMs:5 });
+    await expect(call(extension, { where: { id: 1 } }, {}, () => Promise.resolve({ id: 1, from: "db" }))).rejects.toMatchObject({ name:"CacheFillTimeoutError" });
+    expect(calls.filter(([name]) => name === "read").length).toBeGreaterThan(1);
   });
 
   it("rejects TTLs long enough to be refused by the coordinator", () => {
@@ -232,4 +232,90 @@ it('uses keyArgs only for read identity and bypasses cache on callback errors', 
   expect(await run({ invalid: true })).toEqual({ id: 3 });
   expect(executed).toEqual([first, { where: { id: 'b:1' } }, { invalid: true }]);
   expect(calls.filter(([name]) => name === 'read')).toHaveLength(3);
+});
+
+describe('rejected session cache values', () => {
+  it('fails boundedly when a legacy store ignores conditional repair', async () => {
+    const hit: ReadResponse = { epochs:{ g:0 }, kind:'hit', refreshToken:null, value:JSON.stringify('old') };
+    const { store } = recordingStore({ read:() => Promise.resolve(hit) });
+    const { run } = readUser(store, { sessionCache:{ key:() => 'session', read:() => null, fill:async (load:() => Promise<unknown>) => ({ value:await load(), cached:null }) } });
+    await expect(run(() => Promise.resolve('source'))).rejects.toMatchObject({ name:'CacheFillTimeoutError', status:503 });
+  });
+});
+
+it('releases a session fill that cannot safely be cached', async () => {
+  const { calls, store } = recordingStore({ read:() => Promise.resolve(miss) });
+  const { run } = readUser(store, { sessionCache:{ key:() => 'session', read:() => null, fill:async (load:() => Promise<unknown>) => ({ value:await load(), cached:undefined, cacheable:false }) } });
+  await expect(run(() => Promise.resolve('source'))).resolves.toBe('source');
+  expect(calls.some(([name]) => name === 'write')).toBe(false);
+  expect(calls).toContainEqual(['release', { key:expect.any(String), lockToken:'lock-1' }]);
+});
+
+it('rechecks the cache after coordinator recovery before fallback source admission', async () => {
+  let reads = 0;
+  const { store } = recordingStore({ read:async () => {
+    if (++reads === 1) throw new Error('temporarily unavailable');
+    return { kind:'hit', epochs:{ g:0 }, refreshToken:null, value:JSON.stringify({ id:1 }) };
+  } });
+  let sources = 0;
+  const { run } = readUser(store);
+  await expect(run(async () => { sources++; return { id:2 }; })).resolves.toEqual({ id:1 });
+  expect(reads).toBe(2);
+  expect(sources).toBe(0);
+});
+
+it('registers a foreground fill with waitUntil and settles cleanup on rejection', async () => {
+  const { calls, store } = recordingStore({ read:() => Promise.resolve(miss) });
+  const retained: Promise<unknown>[] = [];
+  const { run } = readUser(store, { waitUntil:(task:Promise<unknown>) => retained.push(task) });
+  await expect(run(async () => { throw new Error('source failure'); })).rejects.toThrow('source failure');
+  expect(retained).toHaveLength(1);
+  await expect(retained[0]).resolves.toBeUndefined();
+  expect(calls).toContainEqual(['release', { key:expect.any(String), lockToken:'lock-1' }]);
+});
+
+it('serializes same-key pending-write source reads without sharing their values', async () => {
+  const pending: ReadResponse = { kind:'miss', epochs:{ g:1 }, lockToken:null, lockHeldForMs:null, pending:true };
+  const { store } = recordingStore({ read:async () => pending });
+  const { run } = readUser(store);
+  let release!: () => void;
+  let entered!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const started = new Promise<void>((resolve) => { entered = resolve; });
+  let active = 0, max = 0, calls = 0;
+  const load = async () => {
+    active++; calls++; max = Math.max(max, active);
+    try { if (calls === 1) { entered(); await held; } return calls; }
+    finally { active--; }
+  };
+  const first = run(load);
+  await started;
+  const second = run(load);
+  release();
+  expect(await Promise.all([first, second])).toEqual([1, 2]);
+  expect(max).toBe(1);
+  expect(calls).toBe(2);
+});
+
+it.each([
+  ['error', 'pending', 'pending', 'error'],
+  ['pending', 'error', 'error', 'pending'],
+])('keeps fresh admissions live while coordinator state changes (%s then %s)', async (...states) => {
+  const pending: ReadResponse = { kind:'miss', epochs:{ g:1 }, lockToken:null, lockHeldForMs:null, pending:true };
+  let reads = 0;
+  let release!: () => void;
+  const bothStarted = new Promise<void>((resolve) => { release = resolve; });
+  const { store } = recordingStore({ read:async () => {
+    const index = reads++;
+    if (reads === 2) release();
+    if (index < 2) await bothStarted;
+    if (states[index] === 'error') throw new Error('coordinator unavailable');
+    return pending;
+  } });
+  const { run } = readUser(store, { fillWaitMs:200 });
+  let sources = 0, active = 0, max = 0;
+  const load = async () => { active++; sources++; max = Math.max(max, active); try { await Promise.resolve(); return sources; } finally { active--; } };
+  expect((await Promise.all([run(load), run(load)])).sort()).toEqual([1, 2]);
+  expect(sources).toBe(2);
+  expect(max).toBe(1);
 });

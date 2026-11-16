@@ -1,3 +1,4 @@
+import { CacheFillTimeoutError, localFillOwner, trackLocalFill, waitLocalOwner } from "./wait";
 import type { CacheExtensionOptions, InvalidationTarget, ReadResponse } from "./types";
 
 import { decode, encode, sha256Hex, stableStringify } from "./codec";
@@ -23,7 +24,7 @@ export class CacheUnavailableError extends Error {
   }
 }
 
-export const DEFAULT_FILL_POLL_DELAYS_MS = [20, 40, 80, 160, 320, 640];
+export const DEFAULT_FILL_POLL_DELAYS_MS = [50, 100, 200, 500];
 export const DEFAULT_LOCK_MS = 30_000;
 export const DEFAULT_LEASE_MS = 60_000;
 export const DEFAULT_MAX_VALUE_BYTES = 1_500_000;
@@ -55,7 +56,6 @@ const pickEpochs = (epochs: Record<string, number>, fences: string[]): Record<st
 
 const isNegative = (value: unknown): boolean => value === null || (Array.isArray(value) && value.length === 0);
 
-const sum = (values: number[]): number => values.reduce((total, value) => total + value, 0);
 
 function internalParams(params: OperationParams): { dataPath: unknown[]; inBatch: boolean } {
   const internal = isPlainRecord(params.__internalParams) ? params.__internalParams : {};
@@ -74,6 +74,7 @@ function validateOptions(options: CacheExtensionOptions): void {
   }
   const inRange = (value: number | undefined, max: number) => value === undefined || (Number.isFinite(value) && value > 0 && value <= max);
   const problems = [
+    !inRange(options.fillWaitMs, MAX_LOCK_MS) && `fillWaitMs must be in (0, ${MAX_LOCK_MS}]`,
     !inRange(options.lockMs, MAX_LOCK_MS) && `lockMs must be in (0, ${MAX_LOCK_MS}]`,
     !inRange(options.leaseMs, MAX_LEASE_MS) && `leaseMs must be in (0, ${MAX_LEASE_MS}]`,
     !inRange(options.maxValueBytes, MAX_VALUE_BYTES) && `maxValueBytes must be in (0, ${MAX_VALUE_BYTES}]`,
@@ -148,6 +149,7 @@ export function createCacheExtension(options: CacheExtensionOptions) {
       value = loaded.value;
       cached = options.sessionCache ? loaded.cached : value;
       await hooks?.afterFillQuery?.();
+      if ("cacheable" in loaded && loaded.cacheable === false) { await release(ctx.key, lockToken); return value; }
     } catch (error) {
       await release(ctx.key, lockToken);
       throw error;
@@ -184,14 +186,14 @@ export function createCacheExtension(options: CacheExtensionOptions) {
     if (!options.waitUntil) return release(ctx.key, token);
     try {
       const refresh = () => fill(ctx, token, response.epochs).then(() => undefined);
-      options.waitUntil((options.sessionCache?.background ? options.sessionCache.background(refresh) : refresh()).catch((error) => report(error, "refresh")));
+      options.waitUntil((options.backgroundRefresh ? options.backgroundRefresh(refresh) : options.sessionCache?.background ? options.sessionCache.background(refresh) : refresh()).catch((error) => report(error, "refresh")));
     } catch (error) {
       report(error, "waitUntil");
       await release(ctx.key, token);
     }
   }
 
-  async function handleRead(model: string, operation: string, args: unknown, query: Query, dataPath: unknown[]): Promise<unknown> {
+  async function handleRead(model: string, operation: string, args: unknown, query: Query, dataPath: unknown[], fallbackOwner = false, waitDeadline?: number, pendingOwner = false): Promise<unknown> {
     let key: string;
     try {
       const identity = [PLANNER_VERSION, config.cacheVersion, scope, ...(options.sessionCache ? [options.sessionCache.key()] : []), model, operation, dataPath, (options.keyArgs ? options.keyArgs(args) : args) ?? null];
@@ -202,13 +204,20 @@ export function createCacheExtension(options: CacheExtensionOptions) {
     }
     const ctx = readContext(model, operation, args, query, key);
     if (!ctx) return query(args);
+    const deadline = waitDeadline ?? Date.now() + (options.fillWaitMs ?? lockMs);
+    const localIdentity = store.coordinationIdentity ?? store;
+    const localKey = JSON.stringify([generation, key]);
+    let rejectedValue: string | undefined;
     for (let attempt = 0; ; attempt++) {
       let response: ReadResponse;
       try {
-        response = await store.read({ fences: ctx.fences, generation, key, lockMs, refresh: !!options.waitUntil });
+        response = await store.read({ fences: ctx.fences, generation, key, lockMs, refresh: !!options.waitUntil, ...(rejectedValue === undefined ? {} : { rejectValue:rejectedValue }) });
       } catch (error) {
         report(error, "read");
-        return query(args);
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) throw new CacheFillTimeoutError();
+        if (fallbackOwner || pendingOwner) return query(args);
+        return localFillOwner(localIdentity, `${localKey}:fresh`, remaining, () => handleRead(model, operation, args, query, dataPath, true, deadline));
       }
       if (response.kind === "hit") {
         let value: unknown;
@@ -218,11 +227,14 @@ export function createCacheExtension(options: CacheExtensionOptions) {
             const cached = options.sessionCache.read(value);
             if (!cached) {
               if (response.refreshToken) await release(key, response.refreshToken);
-              return (await options.sessionCache.fill(() => query(args))).value;
+              if (response.value === rejectedValue || Date.now() >= deadline) throw new CacheFillTimeoutError();
+              rejectedValue = response.value;
+              continue;
             }
             value = cached.value;
           }
         } catch (error) {
+          if (error instanceof CacheFillTimeoutError) throw error;
           report(error, "decode");
           if (response.refreshToken) await release(key, response.refreshToken);
           return query(args);
@@ -230,11 +242,26 @@ export function createCacheExtension(options: CacheExtensionOptions) {
         await scheduleRefresh(ctx, response);
         return value;
       }
-      if (response.lockToken) return fill(ctx, response.lockToken, response.epochs);
-      const delay = pollDelays[attempt];
-      const holderTooSlow = response.lockHeldForMs !== null && response.lockHeldForMs > sum(pollDelays);
-      if (response.pending || delay === undefined || holderTooSlow) return query(args);
-      await sleep(delay);
+      if (response.lockToken) {
+        const token = response.lockToken;
+        const task = trackLocalFill(localIdentity, localKey, lockMs, () => fill(ctx, token, response.epochs));
+        if (options.waitUntil) {
+          try { options.waitUntil(task.then(() => undefined, () => undefined)); }
+          catch (error) { report(error, "waitUntil"); }
+        }
+        return task;
+      }
+      if (response.pending) {
+        if (pendingOwner || fallbackOwner) return query(args);
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) throw new CacheFillTimeoutError();
+        return localFillOwner(localIdentity, `${localKey}:fresh`, remaining, () => handleRead(model, operation, args, query, dataPath, false, deadline, true));
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new CacheFillTimeoutError();
+      if (await waitLocalOwner(localIdentity, localKey, deadline)) continue;
+      const delay = pollDelays[Math.min(attempt, pollDelays.length - 1)] ?? 500;
+      await sleep(Math.min(Math.max(delay, 1), remaining));
     }
   }
 

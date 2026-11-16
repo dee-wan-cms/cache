@@ -494,6 +494,7 @@ export function createRegionalStore(
         if (
           hit &&
           cached &&
+          cached.value !== request.rejectValue &&
           revision === state.revision &&
           !blocked() &&
           cached.sourceStarted > state.floor &&
