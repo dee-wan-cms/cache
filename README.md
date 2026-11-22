@@ -381,11 +381,22 @@ compatibility flag, including when D1 sessions are not enabled.
 
 Wrap HTTP handlers with `wrapD1ReadSessionHandler(handler, options)` outside
 `wrapD1Handler`. Set `bindingNames`, `bindingPrefixes`, `databaseIdsEnv`, and
-optionally `primaryBindings`, `freshnessHeader`, and `ignoreRequestCacheControl`. The named environment variable contains a JSON
+optionally `primaryBindings`, `primaryOnlyBindings`, `freshnessHeader`, and `ignoreRequestCacheControl`. The named environment variable contains a JSON
 map from each configured binding name to its physical D1 UUID. Bindings that
-share a UUID share a request session. If the variable is absent, bindings keep
+share a UUID share request watermarks and admission. If the variable is absent, bindings keep
 their original behavior. Invalid maps fail configuration; invalid bookmark
 headers return HTTP 400.
+
+`primaryBindings` anchors first query only. Later reads may use replicas.
+`primaryOnlyBindings` opens fresh `first-primary` session per terminal SQL action;
+one native batch stays one atomic batch. Aliases share physical-database policy.
+Use for live authorization, revocation and write fences. No snapshot or
+cross-database transaction implied. Capability: `D1_PRIMARY_ONLY_BINDINGS_SUPPORTED`.
+
+Strict explicit `withSession` outside active operation scope refuses. Direct raw
+`prepare`/`batch` outside scope keep native primary behavior. `sessionD1Env` alone
+does not create root operation context. Scope each scheduled/DO/queue operation;
+HTTP upgrade does not scope later WebSocket frames.
 
 For a reusable Prisma D1 adapter, pass `prismaD1SessionDatabase(database)` to
 `PrismaD1` and run every Prisma operation through

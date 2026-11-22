@@ -6,7 +6,7 @@ import type { CacheShape, CacheStore, CacheTestHooks, InvalidationTarget } from 
 import { createDurableObjectStore } from "../../../dist/cloudflare/index.js";
 import { createCacheExtension } from "../../../dist/index.js";
 import { limitReadResponseLeaseUntil, wrapReadResponseLease } from "../../../dist/response-lease.js";
-import { createD1CacheRuntime, fenceD1Writes, withD1PrismaCache, wrapD1ReadSessionHandler, prismaD1SessionDatabase, runD1SessionOperation, d1SessionCacheHooks } from "../../../dist/d1/index.js";
+import { D1_PRIMARY_ONLY_BINDINGS_SUPPORTED, createD1CacheRuntime, fenceD1Writes, withD1PrismaCache, wrapD1ReadSessionHandler, prismaD1SessionDatabase, runD1SessionOperation, d1SessionCacheHooks } from "../../../dist/d1/index.js";
 import { cacheConfig } from "../generated/cache/cache-config";
 import { Prisma, PrismaClient } from "../generated/prisma";
 
@@ -332,7 +332,7 @@ function createSessionClient(database: D1Database, env: Env, beforeRead?: () => 
 }
 const sessionClients = new WeakMap<D1Database, ReturnType<typeof createSessionClient>>();
 const hookSessionClients = new WeakMap<D1Database, ReturnType<typeof createSessionClient>>();
-const sessionHandler = wrapD1ReadSessionHandler(async (request: Request, env: Env & { SITE_alias: D1Database; SESSION_IDS: string }) => {
+const sessionOperation = async (request: Request, env: Env & { SITE_alias: D1Database; SESSION_IDS: string }) => {
   const hook = new URL(request.url).searchParams.has('hook');
   const clients = hook ? hookSessionClients : sessionClients;
   let client = clients.get(env.DB);
@@ -361,7 +361,9 @@ const sessionHandler = wrapD1ReadSessionHandler(async (request: Request, env: En
   const batch = url.searchParams.has('batch') ? await client.$transaction([client.user.findMany({ where:{ name } }), client.user.count({ where:{ name } })]) : null;
   const alias = await env.SITE_alias.prepare('SELECT COUNT(*) AS total FROM User WHERE name = ?').bind(name).first();
   return Response.json({ rows, batch, alias, clientCount:sessionClientCount, cacheHits:sessionCacheHits });
-}, sessionOptions);
+};
+const sessionHandler = wrapD1ReadSessionHandler(sessionOperation, sessionOptions);
+const primaryOnlySessionHandler = wrapD1ReadSessionHandler(sessionOperation, { ...sessionOptions, primaryOnlyBindings:['DB'] });
 
 async function sessionPendingWriteRace(env: Env, ctx: ExecutionContext): Promise<Response> {
   let entered!: () => void;
@@ -538,7 +540,12 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext):
   }
   if (url.pathname === '/session-pending-write-race') return sessionPendingWriteRace(env, ctx);
   if (url.pathname === '/session-warm-write-race') return sessionWarmWriteRace(env, ctx);
-  if (url.pathname === '/session') return sessionHandler(request, { ...env, SITE_alias:env.DB, SESSION_IDS:JSON.stringify({ DB:'00000000-0000-0000-0000-000000000001', SITE_alias:'00000000-0000-0000-0000-000000000001' }) }, ctx);
+  if (url.pathname === '/session') {
+    const strict = request.headers.get('x-cache-test-primary-only') === '1';
+    if (strict && D1_PRIMARY_ONLY_BINDINGS_SUPPORTED !== true) throw new Error('Built package lacks strict-primary session capability');
+    const handler = strict ? primaryOnlySessionHandler : sessionHandler;
+    return handler(request, { ...env, SITE_alias:env.DB, SESSION_IDS:JSON.stringify({ DB:'00000000-0000-0000-0000-000000000001', SITE_alias:'00000000-0000-0000-0000-000000000001' }) }, ctx);
+  }
   if (url.pathname === "/isolate") {
     isolateId ??= crypto.randomUUID();
     return Response.json({ isolateId });

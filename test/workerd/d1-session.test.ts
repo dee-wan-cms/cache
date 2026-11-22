@@ -169,3 +169,47 @@ it.each([false, true])('repairs a cached page for a newer session bookmark (hook
   expect(second.rows).toEqual(first.rows);
   expect(second.sourceReads).toBe(first.sourceReads);
 });
+
+
+it('uses the built strict-primary API for native D1 mutation, Prisma cache reads and a physical alias', async () => {
+  await rig.reset();
+  const physicalId = '00000000-0000-0000-0000-000000000001';
+  const headers = { 'x-cache-test-primary-only':'1' };
+  const summarize = async (response: Awaited<ReturnType<Rig['session']>>) => {
+    const body: unknown = await response.json();
+    if (!body || typeof body !== 'object') throw new Error('Expected session response object');
+    const rows: unknown = Reflect.get(body, 'rows');
+    const alias: unknown = Reflect.get(body, 'alias');
+    const cacheHits: unknown = Reflect.get(body, 'cacheHits');
+    if (!Array.isArray(rows) || !alias || typeof alias !== 'object' || typeof cacheHits !== 'number')
+      throw new Error('Expected native session rows, alias result and existing cache-hit count');
+    const names = rows.map((row: unknown) => {
+      if (!row || typeof row !== 'object' || typeof Reflect.get(row, 'name') !== 'string') throw new Error('Expected native User name');
+      return Reflect.get(row, 'name');
+    });
+    return { names, aliasTotal:Reflect.get(alias, 'total'), cacheHits };
+  };
+  const bookmarkOf = (response: Awaited<ReturnType<Rig['session']>>) => {
+    const encoded = response.headers.get('X-Dee-Wan-D1-Bookmarks');
+    if (!encoded) throw new Error('Expected real D1 session bookmark');
+    const bookmarks: unknown = JSON.parse(encoded);
+    if (!bookmarks || typeof bookmarks !== 'object' || Array.isArray(bookmarks)) throw new Error('Expected physical bookmark map');
+    expect(Object.keys(bookmarks)).toEqual([physicalId]);
+    expect(Reflect.get(bookmarks, physicalId)).toBeTypeOf('string');
+    expect(Reflect.get(bookmarks, physicalId)).not.toBe('');
+    return encoded;
+  };
+  const write = await rig.session('strict-session-user', { method:'POST', headers });
+  expect(write.status, await write.clone().text()).toBe(200);
+  const floor = bookmarkOf(write);
+  const written = await summarize(write);
+  expect(written.names).toEqual(['strict-session-user']);
+  expect(written.aliasTotal).toBe(1);
+  const read = await rig.session('strict-session-user', { headers:{ ...headers, 'X-Dee-Wan-D1-Bookmarks':floor } });
+  expect(read.status, await read.clone().text()).toBe(200);
+  bookmarkOf(read);
+  const result = await summarize(read);
+  expect(result.names).toEqual(['strict-session-user']);
+  expect(result.aliasTotal).toBe(1);
+  expect(result.cacheHits).toBeGreaterThan(written.cacheHits);
+});

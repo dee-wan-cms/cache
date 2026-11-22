@@ -7,7 +7,7 @@ import { hasCacheBypass } from './request-freshness';
 import { D1_BOOKMARK_HEADER, mergeD1Bookmarks, parseD1Bookmarks, decodeD1Bookmarks, serializeD1Bookmarks, type D1Bookmarks } from './bookmarks';
 
 type SessionContext = { input: D1Bookmarks; sessions: Map<string, D1DatabaseSession>; bookmarks: D1Bookmarks; primary: boolean; primaryIds: Set<string>; allowedIds: Set<string>; operations: Map<string, Promise<void>>; closed: boolean };
-type DatabaseInfo = { id: string; db: D1Database; primary: boolean };
+type DatabaseInfo = { id: string; db: D1Database; primary: boolean; primaryOnly: boolean };
 const storage = new AsyncLocalStorage<SessionContext | undefined>();
 const tracking = new AsyncLocalStorage<D1Bookmarks>();
 const primarySource = new AsyncLocalStorage<Set<string>>();
@@ -25,9 +25,12 @@ const queues = new Map<string, AdmissionGate>();
 const admitted = new Map<string, AdmissionGroup>();
 const prismaFacades = new WeakMap<object, D1Database>();
 
+export const D1_PRIMARY_ONLY_BINDINGS_SUPPORTED = true;
+
 export interface D1ReadSessionOptions extends Pick<D1CacheProfile, 'bindingNames' | 'bindingPrefixes'> {
   databaseIdsEnv: string;
   primaryBindings?: readonly string[];
+  primaryOnlyBindings?: readonly string[];
   freshnessHeader?: string;
   ignoreRequestCacheControl?: boolean;
 }
@@ -217,12 +220,12 @@ function contextFor(): SessionContext | undefined {
 }
 
 function sessionFor(info: DatabaseInfo, context: SessionContext, write: boolean): D1DatabaseSession {
-  let session = context.sessions.get(info.id);
+  let session = info.primaryOnly ? undefined : context.sessions.get(info.id);
   const primary = primarySource.getStore();
   const reanchor = !!primary && !primary.has(info.id);
   if (reanchor) { primary.add(info.id); session = undefined; }
   if (!session) {
-    session = info.db.withSession(reanchor || write || info.primary || context.primary || context.primaryIds.has(info.id) ? 'first-primary' : context.input[info.id] ?? 'first-unconstrained');
+    session = info.db.withSession(info.primaryOnly || reanchor || write || info.primary || context.primary || context.primaryIds.has(info.id) ? 'first-primary' : context.input[info.id] ?? 'first-unconstrained');
     context.sessions.set(info.id, session);
   }
   return session;
@@ -468,9 +471,12 @@ function facade(info: DatabaseInfo): D1Database {
     dump: () => info.db.dump(),
     withSession: (constraint) => {
       const context = contextFor();
-      if (!context) return info.db.withSession(constraint);
+      if (!context) {
+        if (info.primaryOnly) throw new Error('Primary-only D1 sessions require an active scope');
+        return info.db.withSession(constraint);
+      }
       if (constraint && constraint !== 'first-unconstrained' && constraint !== context.input[info.id]) {
-        if (constraint === 'first-primary' && (!context.sessions.has(info.id) || context.primary || info.primary || context.primaryIds.has(info.id))) { context.primaryIds.add(info.id); return { prepare, batch, getBookmark: () => context.sessions.get(info.id)?.getBookmark() ?? null }; }
+        if (constraint === 'first-primary' && (!context.sessions.has(info.id) || context.primary || info.primary || info.primaryOnly || context.primaryIds.has(info.id))) { context.primaryIds.add(info.id); return { prepare, batch, getBookmark: () => context.sessions.get(info.id)?.getBookmark() ?? null }; }
         throw new Error('Explicit D1 session constraint conflicts with request session');
       }
       return { prepare, batch, getBookmark: () => context.sessions.get(info.id)?.getBookmark() ?? null };
@@ -492,6 +498,15 @@ export function sessionD1Env<Env extends object>(env: Env, options: D1ReadSessio
       return [name, id.toLowerCase()];
     }));
     const primaryIds = new Set((options.primaryBindings ?? []).map((name) => ids[name]).filter((id): id is string => typeof id === 'string'));
+    const primaryOnlyIds = new Set((options.primaryOnlyBindings ?? []).map((name) => {
+      const db: unknown = Reflect.get(env, name);
+      const id = ids[name];
+      if (!Object.prototype.propertyIsEnumerable.call(env, name) || !id ||
+          !db || typeof db !== 'object' || typeof Reflect.get(db, 'withSession') !== 'function') {
+        throw new Error(`Missing primary-only D1 identity or binding: ${name}`);
+      }
+      return id;
+    }));
     const scoped = { ...env };
     for (const name of options.bindingNames) if (!Reflect.has(env, name)) throw new Error(`Missing D1 binding: ${name}`);
     for (const [name, db] of Object.entries(env)) {
@@ -500,16 +515,17 @@ export function sessionD1Env<Env extends object>(env: Env, options: D1ReadSessio
       const id: string | undefined = ids[name];
       if (!id || !db || typeof db !== 'object' || typeof Reflect.get(db, 'withSession') !== 'function') throw new Error(`Missing D1 identity or binding: ${name}`);
       const primary = primaryIds.has(id);
+      const primaryOnly = primaryOnlyIds.has(id);
       const existing = sessionFacades.get(db);
       if (existing && existing.info.id !== id) throw new Error(`Conflicting D1 identity: ${name}`);
-      if (existing && existing.info.primary === primary) { Reflect.set(scoped, name, db); continue; }
+      if (existing && existing.info.primary === primary && existing.info.primaryOnly === primaryOnly) { Reflect.set(scoped, name, db); continue; }
       if (existing?.alias) throw new Error(`Conflicting D1 session policy: ${name}`);
       const source = existing?.info.db ?? db;
       let variants = facades.get(source);
       if (!variants) { variants = new Map(); facades.set(source, variants); }
-      const key = `${id}:${primary}`;
+      const key = `${id}:${primary}:${primaryOnly}`;
       let wrapped = variants.get(key);
-      if (!wrapped) { wrapped = facade({ id, db: source as D1Database, primary }); variants.set(key, wrapped); }
+      if (!wrapped) { wrapped = facade({ id, db: source as D1Database, primary, primaryOnly }); variants.set(key, wrapped); }
       Reflect.set(scoped, name, wrapped);
     }
     return scoped;

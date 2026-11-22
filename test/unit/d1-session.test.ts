@@ -5,17 +5,17 @@ import { cacheRegionalResponse } from '../../src/d1/regional-response';
 import { createCacheExtension } from '../../src/core/extension';
 import { CONFIG_FORMAT } from '../../src/core/limits';
 import type { CacheStore, GeneratedCacheConfig } from '../../src/core/types';
-import { prismaD1SessionDatabase, registerD1SessionAlias, runD1SessionOperation, runD1PrismaScope, d1SessionCacheHooks, sessionD1Env, wrapD1ReadSessionHandler } from '../../src/d1/session';
+import { D1_PRIMARY_ONLY_BINDINGS_SUPPORTED, prismaD1SessionDatabase, registerD1SessionAlias, runD1SessionOperation, runD1PrismaScope, d1SessionCacheHooks, sessionD1Env, wrapD1ReadSessionHandler } from '../../src/d1/session';
 import { D1_BOOKMARK_HEADER } from '../../src/d1/bookmarks';
 
 const id = '00000000-0000-0000-0000-000000000001';
 const options = { bindingNames:['DB'], bindingPrefixes:['SITE_'], databaseIdsEnv:'IDS', primaryBindings:['DB'] };
 
-function mockDatabase() {
+function mockDatabase(sourceForRead?: (sessionQuery: number) => string) {
   let version = 0;
   const anchors: string[] = [];
   const meta = { duration:0, size_after:0, rows_read:0, rows_written:0, last_row_id:0, changed_db:false, changes:0 };
-  const statement = (source: string, bookmark: () => void): D1PreparedStatement => {
+  const statement = (source: string | (() => string), bookmark: () => void): D1PreparedStatement => {
     function raw<T = unknown[]>(options: { columnNames: true }): Promise<[string[], ...T[]]>;
     function raw<T = unknown[]>(options?: { columnNames?: false }): Promise<T[]>;
     async function raw<T = unknown[]>(options?: { columnNames?: boolean }): Promise<T[] | [string[], ...T[]]> {
@@ -24,8 +24,8 @@ function mockDatabase() {
     }
     return {
       bind: () => statement(source, bookmark),
-      async first<T = Record<string, unknown>>() { bookmark(); return { source } as T; },
-      async all<T = Record<string, unknown>>() { bookmark(); return { results:[{ source } as T], success:true, meta }; },
+      async first<T = Record<string, unknown>>() { bookmark(); return { source: typeof source === 'function' ? source() : source } as T; },
+      async all<T = Record<string, unknown>>() { bookmark(); return { results:[{ source: typeof source === 'function' ? source() : source } as T], success:true, meta }; },
       async run<T = Record<string, unknown>>() { bookmark(); return { results:[] as T[], success:true, meta }; },
       raw,
     };
@@ -38,8 +38,9 @@ function mockDatabase() {
     withSession: (anchor = 'first-unconstrained') => {
       anchors.push(anchor);
       let current: string | null = null;
+      let queries = 0;
       const note = () => { current = String(++version).padStart(8, '0'); };
-      return { prepare: () => statement(anchor, note), batch: async () => { note(); return []; }, getBookmark: () => current };
+      return { prepare: () => statement(sourceForRead ? () => sourceForRead(++queries) : anchor, note), batch: async () => { note(); return []; }, getBookmark: () => current };
     },
   };
   return { db, anchors };
@@ -429,4 +430,159 @@ it('anchors a generic cache fill on primary after an earlier replica read', asyn
   const result = await handler(new Request('https://example.test/'), env, null);
   expect(await result.json()).toEqual({ source:'first-primary' });
   expect(anchors).toEqual(['first-unconstrained', 'first-primary']);
+});
+
+
+describe('strict primary-only session admission', () => {
+  const strict = { ...options, primaryBindings:[], primaryOnlyBindings:['DB'] };
+
+  it('advertises the additive strict-primary capability', () => {
+    expect(D1_PRIMARY_ONLY_BINDINGS_SUPPORTED).toBe(true);
+  });
+
+  it('reanchors every terminal read across an intervening authority revocation', async () => {
+    let authority = 'allowed';
+    const { db, anchors } = mockDatabase((sessionQuery) => sessionQuery === 1 ? authority : 'allowed');
+    const env = { DB:db, IDS:JSON.stringify({ DB:id }) };
+    const handler = wrapD1ReadSessionHandler(async (_request, scoped: typeof env) => {
+      const before = await scoped.DB.prepare('SELECT permission').first<{ source:string }>();
+      authority = 'revoked';
+      const after = await scoped.DB.prepare('SELECT permission').first<{ source:string }>();
+      return Response.json([before?.source, after?.source]);
+    }, strict);
+    expect(await (await handler(new Request('https://example.test/'), env, null)).json()).toEqual(['allowed', 'revoked']);
+    expect(anchors).toEqual(['first-primary', 'first-primary']);
+  });
+
+  it('reanchors repeated prepared-statement terminal methods and explicit session facades', async () => {
+    const { db, anchors } = mockDatabase();
+    const env = { DB:db, IDS:JSON.stringify({ DB:id }) };
+    const handler = wrapD1ReadSessionHandler(async (_request, scoped: typeof env) => {
+      const statement = scoped.DB.prepare('SELECT 1');
+      await statement.first();
+      await statement.all();
+      await statement.raw();
+      await statement.run();
+      await scoped.DB.withSession('first-primary').prepare('SELECT 2').first();
+      return new Response('ok');
+    }, strict);
+    await handler(new Request('https://example.test/'), env, null);
+    expect(anchors).toEqual(Array(5).fill('first-primary'));
+  });
+
+  it('preserves ordinary primaryBindings first-query semantics at the same lag seam', async () => {
+    let authority = 'allowed';
+    const { db, anchors } = mockDatabase((sessionQuery) => sessionQuery === 1 ? authority : 'allowed');
+    const env = { DB:db, IDS:JSON.stringify({ DB:id }) };
+    const handler = wrapD1ReadSessionHandler(async (_request, scoped: typeof env) => {
+      const before = await scoped.DB.prepare('SELECT permission').first<{ source:string }>();
+      authority = 'revoked';
+      const after = await scoped.DB.prepare('SELECT permission').first<{ source:string }>();
+      return Response.json([before?.source, after?.source]);
+    }, options);
+    expect(await (await handler(new Request('https://example.test/'), env, null)).json()).toEqual(['allowed', 'allowed']);
+    expect(anchors).toEqual(['first-primary']);
+  });
+
+  it('coalesces the strict policy by physical UUID across differently named aliases', async () => {
+    const { db, anchors } = mockDatabase();
+    const env = { DB:db, SITE_alias:db, IDS:JSON.stringify({ DB:id, SITE_alias:id }) };
+    const handler = wrapD1ReadSessionHandler(async (_request, scoped: typeof env) => {
+      await scoped.DB.prepare('SELECT 1').first();
+      await scoped.SITE_alias.prepare('SELECT 2').first();
+      await scoped.DB.prepare('SELECT 3').first();
+      return new Response('ok');
+    }, { ...strict, primaryOnlyBindings:['SITE_alias'] });
+    await handler(new Request('https://example.test/'), env, null);
+    expect(anchors).toEqual(['first-primary', 'first-primary', 'first-primary']);
+  });
+
+  it('retains separate facade variants and refuses registered alias policy changes', () => {
+    const { db } = mockDatabase();
+    const env = { DB:db, IDS:JSON.stringify({ DB:id }) };
+    const ordinary = sessionD1Env(env, options);
+    const primaryOnly = sessionD1Env(ordinary, { ...options, primaryOnlyBindings:['DB'] });
+    expect(primaryOnly.DB).not.toBe(ordinary.DB);
+    expect(sessionD1Env(primaryOnly, options).DB).toBe(ordinary.DB);
+    const alias = prismaD1SessionDatabase(primaryOnly.DB);    expect(sessionD1Env({ ...env, DB:alias }, { ...options, primaryOnlyBindings:['DB'] }).DB).toBe(alias);
+    expect(() => sessionD1Env({ ...env, DB:alias }, options)).toThrow('Conflicting D1 session policy');
+  });
+
+  it('keeps a multi-statement batch in one native primary session and one atomic batch call', async () => {
+    const { db, anchors } = mockDatabase();
+    const nativeWithSession = db.withSession;
+    const batchCalls: Array<() => number> = [];
+    const batchSizes: Array<() => number | undefined> = [];
+    vi.spyOn(db, 'withSession').mockImplementation((constraint) => {
+      const session = nativeWithSession(constraint);
+      const nativeBatch = vi.spyOn(session, 'batch');
+      batchCalls.push(() => nativeBatch.mock.calls.length);
+      batchSizes.push(() => nativeBatch.mock.calls[0]?.[0].length);
+      return session;
+    });
+    const env = { DB:db, IDS:JSON.stringify({ DB:id }) };
+    const handler = wrapD1ReadSessionHandler(async (_request, scoped: typeof env) => {
+      await scoped.DB.batch([
+        scoped.DB.prepare('UPDATE authority SET active = 0'),
+        scoped.DB.prepare('INSERT INTO audit VALUES (1)'),
+      ]);
+      await scoped.DB.prepare('SELECT active FROM authority').first();
+      return new Response('ok');
+    }, strict);
+    const response = await handler(new Request('https://example.test/'), env, null);
+    expect(batchCalls.map((count) => count())).toEqual([1, 0]);
+    expect(batchSizes.map((size) => size())).toEqual([2, undefined]);
+    expect(anchors).toEqual(['first-primary', 'first-primary']);
+    expect(JSON.parse(response.headers.get(D1_BOOKMARK_HEADER) ?? '{}')).toEqual({ [id]:'00000002' });
+  });
+
+  it('reanchors admitted Prisma facade operations without replacing the existing admission path', async () => {
+    const { db, anchors } = mockDatabase();
+    const env = { DB:db, IDS:JSON.stringify({ DB:id }) };
+    const handler = wrapD1ReadSessionHandler(async (_request, scoped: typeof env) => {
+      const prisma = prismaD1SessionDatabase(scoped.DB);
+      await runD1SessionOperation(scoped.DB, () => prisma.prepare('SELECT 1').first());
+      await runD1SessionOperation(scoped.DB, () => prisma.prepare('SELECT 2').first());
+      return new Response('ok');
+    }, strict);
+    const response = await handler(new Request('https://example.test/'), env, null);
+    expect(anchors).toEqual(['first-primary', 'first-primary']);
+    expect(JSON.parse(response.headers.get(D1_BOOKMARK_HEADER) ?? '{}')).toEqual({ [id]:'00000002' });
+  });
+});
+
+
+describe('strict primary-only configuration boundaries', () => {
+  it('refuses a selected missing binding or identity before the handler runs', async () => {
+    const { db, anchors } = mockDatabase();
+    let calls = 0;
+    for (const env of [
+      { DB:db, IDS:JSON.stringify({ DB:id }) },
+      { DB:db, IDS:JSON.stringify({ DB:id, SITE_missing:id }) },
+      { DB:db, SITE_missing:db, IDS:JSON.stringify({ DB:id }) },
+    ]) {
+      const handler = wrapD1ReadSessionHandler(async () => { calls++; return new Response('unexpected'); }, {
+        ...options, primaryOnlyBindings:['SITE_missing'],
+      });
+      await expect(handler(new Request('https://example.test/'), env, null)).rejects.toThrow('Missing primary-only D1 identity or binding');
+    }
+    expect(calls).toBe(0);
+    expect(anchors).toEqual([]);
+  });
+
+  it('refuses unscoped explicit sessions but retains ordinary primary raw operations', async () => {
+    const { db, anchors } = mockDatabase();
+    const env = { DB:db, IDS:JSON.stringify({ DB:id }) };
+    const primaryOnly = sessionD1Env(env, { ...options, primaryOnlyBindings:['DB'] }).DB;
+    for (const constraint of [undefined, 'first-unconstrained', 'first-primary', '00000001'])
+      expect(() => primaryOnly.withSession(constraint)).toThrow('Primary-only D1 sessions require an active scope');
+    expect((await primaryOnly.prepare('SELECT 1').first<{ source:string }>())?.source).toBe('raw');
+    const batch = vi.spyOn(db, 'batch');
+    await primaryOnly.batch([primaryOnly.prepare('UPDATE authority SET active = 0')]);
+    expect(batch).toHaveBeenCalledTimes(1);
+    expect(anchors).toEqual([]);
+    const ordinary = sessionD1Env(env, options).DB;
+    expect((await ordinary.withSession('first-unconstrained').prepare('SELECT 2').first<{ source:string }>())?.source).toBe('first-unconstrained');
+    expect(anchors).toEqual(['first-unconstrained']);
+  });
 });
