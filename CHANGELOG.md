@@ -1,3 +1,10 @@
+# [2.4.0](https://github.com/dee-wan-cms/cache/compare/v2.3.0...v2.4.0) (2026-11-22)
+
+
+### Features
+
+* **d1:** add primary-only session bindings ([c8c3666](https://github.com/dee-wan-cms/cache/commit/c8c3666310b604e79827fc8078a837fa2a320d3f))
+
 # [2.3.0](https://github.com/dee-wan-cms/cache/compare/v2.2.0...v2.3.0) (2026-11-16)
 
 
