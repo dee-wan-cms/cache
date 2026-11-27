@@ -51,6 +51,10 @@
       "types": "./dist/generator/config.d.ts",
       "import": "./dist/generator/config.js",
       "default": "./dist/generator/config.js"
+    },
+    "./durable-public": {
+      "types": "./dist/durable-public.d.ts",
+      "import": "./dist/durable-public.js"
     }
   },
   "bin": {

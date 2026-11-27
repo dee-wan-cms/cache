@@ -262,14 +262,17 @@ disabled reads, pending write or coordinator failure returns `null`; bypass exte
 cache reads and fills in that case. Old in-flight fills retain their old namespace.
 This does not authorize a request or invalidate downstream browser caches.
 
-`cacheD1Read(database, { key, scope, dependencies, ttlMs, cacheable }, load)` caches an
+`cacheD1Read(database, { key, scope, dependencies, ttlMs, maxTtlMs, cacheable }, load)` caches an
 explicitly selected read after the caller has completed authorization. Include the full
 actor, site, current permissions and all query inputs in `scope` and `key`, and list every
 physical D1 binding read by the loader in `dependencies`. The helper inspects each unique
 binding's global fence before lookup, includes its generation and epoch in the key, and
 checks again before serving a hit or storing a fill. A pending write, unknown runtime,
 older coordinator, inspection failure, or disabled reads bypasses the cache. Default TTL
-is 30 seconds, with a maximum of five minutes. Values and keys are bounded; unsupported
+is 30 seconds, with a maximum of five minutes. Explicit `maxTtlMs` permits a different ceiling,
+up to 366 days; `ttlMs` must fit that positive integer ceiling. This policy has separate
+coordinator, local-fill and regional identities. Omit it to preserve existing keys. The
+same option applies to `yandexCacheRead` and buffered JSON reads. Values and keys are bounded; unsupported
 objects bypass caching. Date, bigint and byte arrays use the existing value codec.
 
 `cacheD1JsonRead(database, { key, scope, dependencies, ttlMs, request, buffered: true }, load)`

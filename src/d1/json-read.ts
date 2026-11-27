@@ -74,6 +74,7 @@ export async function cacheD1JsonRead(database: D1Database, options: D1JsonReadO
     scope: options.scope,
     ...(options.dependencies ? { dependencies: options.dependencies } : {}),
     ...(options.ttlMs !== undefined ? { ttlMs: options.ttlMs } : {}),
+    ...(options.maxTtlMs !== undefined ? { maxTtlMs: options.maxTtlMs } : {}),
     cacheable: (value) => value !== null,
   }, async () => {
     original = await load();

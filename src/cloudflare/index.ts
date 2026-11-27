@@ -5,3 +5,7 @@ export type { RegionalStoreOptions } from "./regional-store";
 export { createResponseWarmup } from "../response-warmup";
 export type { ReadResponseWarmupOptions, ReadResponseWarmupTarget, ReadResponseWarmupContext } from "../response-warmup";
 export type { CoordinatorLocationHint, DurableObjectStoreOptions } from "./store-options";
+export { createDurablePublicStore, reservePublicMutation, takeoverPublicMutation, attachPublicGeneration, finishPublicMutation, cancelPublicMutation, recoverPublicMutation } from "./durable-public";
+export type { DurableAuthority, AuthorityRecord, PublicGeneration } from "./durable-public";
+export { createPublicSiteFence } from "./durable-public";
+export type { PublicSiteFence, PublicSiteFenceRecord } from "./durable-public";

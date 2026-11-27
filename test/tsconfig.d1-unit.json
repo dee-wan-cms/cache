@@ -14,6 +14,7 @@
     "unit/d1-session.test.ts",
     "unit/d1-write-deadline.test.ts",
     "unit/d1-regional.test.ts",
+    "unit/read-ttl-policy.test.ts",
     "unit/regional-response.test.ts",
     "unit/d1-read-response-lease.test.ts",
     "unit/response-lease.test.ts",

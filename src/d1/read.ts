@@ -2,7 +2,7 @@ import { CacheFillTimeoutError, waitForFill, localFillOwner, trackLocalFill } fr
 import { boundedValue } from '../core/bounded-value';
 import type { D1Database } from '@cloudflare/workers-types';
 import { decode, encode, sha256Hex, stableStringify } from '../core/codec';
-import { MAX_VALUE_BYTES } from '../core/limits';
+import { MAX_TTL_MS, MAX_VALUE_BYTES } from '../core/limits';
 import { d1CacheRuntime, type D1CacheRuntime } from './env';
 import { regionalKey, regionalRead, regionalWrite } from './regional';
 import { limitRegionalDataUntil } from './regional-deadline';
@@ -10,7 +10,7 @@ import { wrapD1SessionCacheValue, unwrapD1SessionCacheValue, advanceD1SessionBoo
 
 const FENCES = ['g'];
 const DEFAULT_TTL_MS = 30_000;
-const MAX_TTL_MS = 300_000;
+const DEFAULT_MAX_TTL_MS = 300_000;
 const MAX_IDENTITY_BYTES = 32_768;
 const MAX_VALUE_SIZE = Math.min(1_500_000, MAX_VALUE_BYTES);
 
@@ -19,6 +19,7 @@ export interface D1ReadOptions<T> {
   scope: unknown;
   dependencies?: readonly D1Database[];
   ttlMs?: number;
+  maxTtlMs?: number;
   ttlJitterRatio?: number;
   regionalTtlMs?: number;
   cacheable?: (value: T) => boolean;
@@ -86,15 +87,17 @@ export function cacheD1Read<T>(database: D1Database, options: D1ReadOptions<T>, 
 async function cacheD1ReadInternal<T>(database: D1Database, options: D1ReadOptions<T>, load: () => Promise<T>, fallbackOwner: boolean, waitDeadline?: number, pendingOwner = false): Promise<T> {
   const primary = d1CacheRuntime(database);
   const ceiling = options.ttlMs ?? DEFAULT_TTL_MS;
+  const maxTtl = options.maxTtlMs === undefined ? DEFAULT_MAX_TTL_MS : options.maxTtlMs;
+  const ttlPolicy = options.maxTtlMs === undefined ? [] : [['maxTtlMs', maxTtl], ['ttlMs', ceiling]];
   const jitter = options.ttlJitterRatio ?? 0.1;
   const ttl = Math.max(1, Math.floor(ceiling * (1 - Math.random() * jitter)));
-  if (!primary || !primary.readsEnabled || !Number.isFinite(ceiling) || ceiling < 1 || ceiling > MAX_TTL_MS || !Number.isFinite(jitter) || jitter < 0 || jitter > 1 || options.scope === undefined || options.scope === null || !boundedValue(options.scope, MAX_IDENTITY_BYTES, true) || !boundedValue(options.key, MAX_IDENTITY_BYTES, true)) return load();
+  if (!primary || !primary.readsEnabled || !Number.isSafeInteger(maxTtl) || maxTtl < 1 || maxTtl > MAX_TTL_MS || !Number.isFinite(ceiling) || ceiling < 1 || ceiling > maxTtl || !Number.isFinite(jitter) || jitter < 0 || jitter > 1 || options.scope === undefined || options.scope === null || !boundedValue(options.scope, MAX_IDENTITY_BYTES, true) || !boundedValue(options.key, MAX_IDENTITY_BYTES, true)) return load();
   const source = () => runPrimaryD1SessionSource(load);
   const runtimes = dependencyRuntimes(database, options.dependencies ?? []);
   if (!runtimes) return source();
   const regionalIdentities = [primary, ...runtimes].map((runtime) => [runtime.databaseId, runtime.generation, runtime.coordinatorName, runtime.regionalIdentity]);
   const regional = regionalIdentities.every((identity) => identity[3])
-    ? await regionalKey(options.regionalTtlMs, ['d1-read', d1SessionBookmarkFloor() ? 'session-v1' : null, options.regionalTtlMs, regionalIdentities, options.scope, options.key]) : null;
+    ? await regionalKey(options.regionalTtlMs, ['d1-read', d1SessionBookmarkFloor() ? 'session-v1' : null, options.regionalTtlMs, regionalIdentities, options.scope, options.key, ...ttlPolicy]) : null;
   const hit = await regionalRead(regional, options.regionalTtlMs);
   if (hit) {
     const cached = unwrapD1SessionCacheValue(hit.value, [primary, ...runtimes].map((runtime) => runtime.databaseId));
@@ -108,7 +111,7 @@ async function cacheD1ReadInternal<T>(database: D1Database, options: D1ReadOptio
       return source();
     }
     let fallbackKey: string;
-    try { fallbackKey = `dependency:${await sha256Hex(stableStringify([primary.databaseId, primary.generation, regionalIdentities, options.scope, options.key]))}`; }
+    try { fallbackKey = `dependency:${await sha256Hex(stableStringify([primary.databaseId, primary.generation, regionalIdentities, options.scope, options.key, ...ttlPolicy]))}`; }
     catch { return source(); }
     const deadline = waitDeadline ?? Date.now() + 30_000;
     const remaining = deadline - Date.now();
@@ -117,7 +120,7 @@ async function cacheD1ReadInternal<T>(database: D1Database, options: D1ReadOptio
   }
   let key: string;
   try {
-    const identity = stableStringify(['d1-read-v1', d1SessionBookmarkFloor() ? 'session-v1' : null, primary.databaseId, primary.generation, options.scope, options.key, snapshot.map(({ runtime, epoch }) => [runtime.databaseId, runtime.generation, epoch])]);
+    const identity = stableStringify(['d1-read-v1', d1SessionBookmarkFloor() ? 'session-v1' : null, primary.databaseId, primary.generation, options.scope, options.key, snapshot.map(({ runtime, epoch }) => [runtime.databaseId, runtime.generation, epoch]), ...ttlPolicy]);
     if (new TextEncoder().encode(identity).byteLength > MAX_IDENTITY_BYTES) return load();
     key = `d1:${await sha256Hex(identity)}`;
   } catch { return load(); }

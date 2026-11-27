@@ -2,8 +2,9 @@ import { CacheFillTimeoutError, waitForFill, localFillOwner, trackLocalFill } fr
 import type { CacheStore } from '../core/types';
 import { boundedValue } from '../core/bounded-value';
 import { decode, encode, sha256Hex, stableStringify } from '../core/codec';
+import { MAX_TTL_MS } from '../core/limits';
 
-type YandexReadOptions<T> = { key: unknown; scope: unknown; ttlMs?: number; ttlJitterRatio?: number; cacheable?: (value: T) => boolean };
+type YandexReadOptions<T> = { key: unknown; scope: unknown; ttlMs?: number; maxTtlMs?: number; ttlJitterRatio?: number; cacheable?: (value: T) => boolean };
 
 export function yandexCacheRead<T>(store: CacheStore, options: YandexReadOptions<T>, load: () => Promise<T>): Promise<T> {
   return yandexCacheReadInternal(store, options, load, false);
@@ -11,12 +12,14 @@ export function yandexCacheRead<T>(store: CacheStore, options: YandexReadOptions
 
 async function yandexCacheReadInternal<T>(store: CacheStore, options: YandexReadOptions<T>, load: () => Promise<T>, fallbackOwner: boolean, waitDeadline?: number, pendingOwner = false): Promise<T> {
   const ceiling = options.ttlMs ?? 30000;
+  const maxTtl = options.maxTtlMs === undefined ? 300000 : options.maxTtlMs;
+  const ttlPolicy = options.maxTtlMs === undefined ? [] : [['maxTtlMs', maxTtl], ['ttlMs', ceiling]];
   const jitter = options.ttlJitterRatio ?? 0.1;
   const ttl = Math.max(1, Math.floor(ceiling * (1 - Math.random() * jitter)));
-  if (!Number.isFinite(ceiling) || ceiling < 1 || ceiling > 300000 || !Number.isFinite(jitter) || jitter < 0 || jitter > 1 || options.scope === null || options.scope === undefined || !boundedValue(options.scope, 32768, true) || !boundedValue(options.key, 32768, true)) return load();
+  if (!Number.isSafeInteger(maxTtl) || maxTtl < 1 || maxTtl > MAX_TTL_MS || !Number.isFinite(ceiling) || ceiling < 1 || ceiling > maxTtl || !Number.isFinite(jitter) || jitter < 0 || jitter > 1 || options.scope === null || options.scope === undefined || !boundedValue(options.scope, 32768, true) || !boundedValue(options.key, 32768, true)) return load();
   let identity: string;
   let key: string;
-  try { identity = stableStringify([options.scope, options.key]); key = `read:${await sha256Hex(identity)}`; } catch { return load(); }
+  try { identity = stableStringify([options.scope, options.key, ...ttlPolicy]); key = `read:${await sha256Hex(identity)}`; } catch { return load(); }
   const localIdentity = store.coordinationIdentity ?? store;
   const localKey = JSON.stringify(['', key]);
   const deadline = waitDeadline ?? Date.now() + 30000;
