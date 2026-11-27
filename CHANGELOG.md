@@ -1,3 +1,10 @@
+# [2.5.0](https://github.com/dee-wan-cms/cache/compare/v2.4.0...v2.5.0) (2026-11-27)
+
+
+### Features
+
+* **cache:** add public fences and TTL policy ([8d1a1c4](https://github.com/dee-wan-cms/cache/commit/8d1a1c44012659d9b391220449afba82b5a9bbf6))
+
 # [2.4.0](https://github.com/dee-wan-cms/cache/compare/v2.3.0...v2.4.0) (2026-11-22)
 
 
